@@ -293,6 +293,12 @@ def detect_hardware_profile(
         props = torch.cuda.get_device_properties(device)
         vram_gb = float(props.total_memory) / float(1024**3)
         name = str(props.name)
+        # Unified-memory Grace Blackwell (e.g. DGX Spark GB10) fallback if driver reports 0 VRAM
+        if vram_gb < 1.0 and hasattr(os, "sysconf"):
+            try:
+                vram_gb = float(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / float(1024**3)
+            except Exception:
+                pass
         bf16_ok = bool(torch.cuda.is_bf16_supported())
         return select_hardware_tier(
             device_type="cuda",

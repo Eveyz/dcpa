@@ -16,6 +16,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from dcpa.config import DCPAConfig
 from dcpa.modules.bcg_pc import BCGPC, ConceptGraphState
@@ -126,6 +127,39 @@ class DCPAModel(nn.Module):
         # Document-dimension bucketing (multiples of 16) enabled automatically under torch.compile
         self.enable_doc_bucketing: bool = False
         self.doc_bucket_size: int = 16
+        # Per-step activation checkpointing across unrolled BCG-PC concept steps cuts Stage 2-4
+        # VRAM by ~20-40x (prevents 60+ GB activation OOM at 128 KB/step on 48M & 210M-MoE).
+        self.bcg_grad_checkpointing: bool = True
+
+    def _bcg_step_checkpointed_fn(
+        self,
+        in_slots: torch.Tensor,
+        in_edges: torch.Tensor,
+        in_sal: torch.Tensor,
+        c_fused: torch.Tensor,
+        prec_bu: torch.Tensor,
+        ach: torch.Tensor,
+        tau_m_t: torch.Tensor,
+        active_mask: torch.Tensor,
+        mix_t: torch.Tensor,
+        slot0_pinned: torch.Tensor,
+        trig_step: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        return self.bcg_pc(
+            in_slots,
+            in_edges,
+            in_sal,
+            c_fused,
+            prec_bu,
+            ach,
+            tau_m_t,
+            active_mask,
+            mix_t,
+            slot0_pinned,
+            trig_step,
+            use_gumbel=True,
+            update_c0_ema=False,
+        )
 
     def count_parameters(self) -> dict[str, int]:
         def _count(m: nn.Module) -> int:
@@ -764,6 +798,41 @@ class DCPAModel(nn.Module):
                         in_sal = g_state.salience
                     assert g_state.slot0_pinned is not None
 
+                    if self.training and torch.is_grad_enabled() and self.bcg_grad_checkpointing:
+                        bcg_step_out = torch_checkpoint(
+                            self._bcg_step_checkpointed_fn,
+                            in_slots,
+                            in_edges,
+                            in_sal,
+                            hip_read.c_fused,
+                            hip_read.prec_bu,
+                            hip_read.ach_signal,
+                            tau_m_t,
+                            active_mask,
+                            mix_t,
+                            g_state.slot0_pinned,
+                            trig_step,
+                            use_reentrant=False,
+                            preserve_rng_state=True,
+                        )
+                        # Update neutral concept center c_0 ONCE outside checkpoint (never doubled on bwd!)
+                        self.bcg_pc.update_c0_from_slots(bcg_step_out[6], active_mask)
+                    else:
+                        bcg_step_out = self.bcg_pc(
+                            in_slots,
+                            in_edges,
+                            in_sal,
+                            hip_read.c_fused,
+                            hip_read.prec_bu,
+                            hip_read.ach_signal,
+                            tau_m_t,
+                            active_mask,
+                            mix_t,
+                            g_state.slot0_pinned,
+                            trig_step,
+                            use_gumbel=self.training,
+                            update_c0_ema=self.training,
+                        )
                     (
                         z_star_step,
                         g_ctx_step,
@@ -782,21 +851,7 @@ class DCPAModel(nn.Module):
                         merge_alpha_step,
                         slot0_pinned_next,
                         moe_bal_step,
-                    ) = self.bcg_pc(
-                        in_slots,
-                        in_edges,
-                        in_sal,
-                        hip_read.c_fused,
-                        hip_read.prec_bu,
-                        hip_read.ach_signal,
-                        tau_m_t,
-                        active_mask,
-                        mix_t,
-                        g_state.slot0_pinned,
-                        trig_step,
-                        use_gumbel=self.training,
-                        update_c0_ema=self.training,
-                    )
+                    ) = bcg_step_out
                     g_state = ConceptGraphState(
                         slots=s_next,
                         edges=a_next,

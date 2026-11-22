@@ -304,16 +304,31 @@ class BCGPC(nn.Module):
         slot0_pinned = torch.zeros((batch_size,), device=dev, dtype=torch.float32)
         return ConceptGraphState(slots=slots, edges=edges, salience=salience, slot0_pinned=slot0_pinned)
 
-    def message_pass(self, slots: torch.Tensor, edges: torch.Tensor, salience: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute edge-aggregated node states S_bar [B, K, D] and context readout g [B, D]."""
+    def _message_pass_with_eproj(
+        self, slots: torch.Tensor, e_proj: torch.Tensor, salience: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         w_attn = F.softmax(salience.float(), dim=-1)  # [B, K] fp32
-        e_proj = torch.tanh(self.w_e(edges))  # [B, K, K, D], bounded in (-1, 1) for stable multi-step recurrence
-        # S_bar_i = S_i + sum_j w_attn[j] * (tanh(W_e A_{i,j}) * S_j)
         weighted_s = slots.to(e_proj.dtype) * w_attn.unsqueeze(-1).to(e_proj.dtype)  # [B, K, D]
         agg = torch.einsum("bijd,bjd->bid", e_proj, weighted_s)
         s_bar = slots + agg.to(slots.dtype)
         g_ctx = torch.einsum("bk,bkd->bd", w_attn.to(s_bar.dtype), s_bar)
         return s_bar, g_ctx
+
+    def message_pass(self, slots: torch.Tensor, edges: torch.Tensor, salience: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute edge-aggregated node states S_bar [B, K, D] and context readout g [B, D]."""
+        e_proj = torch.tanh(self.w_e(edges))  # [B, K, K, D], bounded in (-1, 1) for stable multi-step recurrence
+        return self._message_pass_with_eproj(slots, e_proj, salience)
+
+    def update_c0_from_slots(self, s_new: torch.Tensor, active_mask: torch.Tensor) -> None:
+        """Update neutral concept center c_0 via EMA strictly over active docs (safe outside activation checkpointing)."""
+        with torch.no_grad():
+            B = s_new.shape[0]
+            K = self.cfg.k_slots
+            am_f = active_mask.float().view(B, 1, 1)
+            denom_c0 = (am_f.sum() * float(K)).clamp_min(1.0)
+            batch_mean = (s_new.detach().float() * am_f).sum(dim=(0, 1)) / denom_c0
+            m = self.cfg.c0_ema_momentum
+            self.c0.mul_(m).add_(batch_mean * (1.0 - m))
 
     def forward(
         self,
@@ -573,7 +588,9 @@ class BCGPC(nn.Module):
 
         # 6. Branchless Slot-0 Thesis Latch on SCRATCH_END (`\x1dE\n`) or first `\x1fA\n` (Spec 2)
         # S_{m,0} <- RMSNorm(g_m), omega_{m,0} <- max(omega_{m,0}, 2.0), slot0_pinned <- 1.0
-        s_bar_post, g_post = self.message_pass(s_new, a_new, omega_new)
+        # Reuse `e_proj_post = tanh(W_e(a_new))` once across pre-latch g_post and post-latch s_bar_post!
+        e_proj_post = torch.tanh(self.w_e(a_new))  # [B, K, K, D]
+        _, g_post = self._message_pass_with_eproj(s_new, e_proj_post, omega_new)
         do_pin = active_mask.bool() & (trig_cur > 0.5) & (pinned_cur < 0.5)  # [B]
         g_post_f = g_post.float()
         thesis_vec = (
@@ -587,14 +604,9 @@ class BCGPC(nn.Module):
 
         # Update neutral concept center c_0 via EMA strictly over active docs
         if self.training and update_c0_ema:
-            with torch.no_grad():
-                am_f = active_mask.float().view(B, 1, 1)
-                denom_c0 = (am_f.sum() * float(K)).clamp_min(1.0)
-                batch_mean = (s_new.detach().float() * am_f).sum(dim=(0, 1)) / denom_c0
-                m = self.cfg.c0_ema_momentum
-                self.c0.mul_(m).add_(batch_mean * (1.0 - m))
+            self.update_c0_from_slots(s_new, active_mask)
 
-        s_bar_post, _ = self.message_pass(s_new, a_new, omega_new)
+        s_bar_post, _ = self._message_pass_with_eproj(s_new, e_proj_post, omega_new)
 
         return (
             z_star,

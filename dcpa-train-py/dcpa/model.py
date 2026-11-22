@@ -144,6 +144,10 @@ class DCPAModel(nn.Module):
         mix_t: torch.Tensor,
         slot0_pinned: torch.Tensor,
         trig_step: torch.Tensor,
+        w_gu1: torch.Tensor,
+        w_d1: torch.Tensor,
+        w_gu2: torch.Tensor,
+        w_d2: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         return self.bcg_pc(
             in_slots,
@@ -159,6 +163,10 @@ class DCPAModel(nn.Module):
             trig_step,
             use_gumbel=True,
             update_c0_ema=False,
+            packed_moe_w_gu1=w_gu1,
+            packed_moe_w_d1=w_d1,
+            packed_moe_w_gu2=w_gu2,
+            packed_moe_w_d2=w_d2,
         )
 
     def count_parameters(self) -> dict[str, int]:
@@ -794,7 +802,31 @@ class DCPAModel(nn.Module):
                 zero_idx = torch.zeros_like(seg_offsets_i64)
                 f_out_chunks: list[torch.Tensor] = []
                 delta_syn_chunks: list[torch.Tensor] = []
+                z_star_chunks: list[torch.Tensor] = []
+                g_ctx_chunks: list[torch.Tensor] = []
                 flat_idx_chunks: list[torch.Tensor] = []
+
+                # Pre-pack MoE expert weights into 4 batched-GEMM tensors ONCE per forward()!
+                # Saves E*6 sequential GEMMs & eliminates m_max * L_max redundant fp32->bf16 weight casts.
+                w_gu1, w_d1, w_gu2, w_d2 = self.bcg_pc.moe.pack_weights(dtype=sgsc_out.c_slow.dtype)
+
+                # Hoist cortical bottom-up precision pi_cort ONCE across all m_total segments when
+                # Hippocampus is disabled (Stages B/C): skips m_max dead dg_lex + topk(4096, 32) calls!
+                pi_cort_all: Optional[torch.Tensor] = None
+                if not hip_enabled and m_total > 0:
+                    with fp32_island(device):
+                        pi_cort_all = (
+                            F.softplus(
+                                F.linear(
+                                    sgsc_out.c_slow.float(),
+                                    self.hippocampus.f_prec_cort.weight.float(),
+                                    self.hippocampus.f_prec_cort.bias.float()
+                                    if self.hippocampus.f_prec_cort.bias is not None
+                                    else None,
+                                )
+                            )
+                            + 1e-4
+                        )  # [m_total, D] fp32
 
                 seg_counts_cpu = seg_counts_ord.detach().cpu().tolist() if use_prefix_shrink else []
                 n_active_prefix = sum(1 for c in seg_counts_cpu if c > 0) if use_prefix_shrink else V
@@ -845,24 +877,35 @@ class DCPAModel(nn.Module):
                     flat_idx = seg_off_cur[active_b] + m_step  # [V_act]
                     safe_idx = torch.where(active_mask, seg_off_cur + m_step, zero_cur)
 
-                    am_col_f = active_f.unsqueeze(-1).to(sgsc_out.f_stem.dtype)
                     am_col_c = active_f.unsqueeze(-1).to(sgsc_out.c_slow.dtype)
-                    f_step = sgsc_out.f_stem[safe_idx] * am_col_f
                     c_step = sgsc_out.c_slow[safe_idx] * am_col_c
-                    sn_step = sgsc_out.sem_norm[safe_idx] * active_f
-                    mi_step = sgsc_out.mean_info[safe_idx] * active_f
                     trig_step = seg_pin_trigger[safe_idx] * active_f
 
-                    # Module 3 Read Path
-                    hip_read = self.hippocampus.read_comprehension(
-                        f_stem=f_step,
-                        c_slow=c_step,
-                        sem_norm=sn_step,
-                        mean_info=mi_step,
-                        fast_state=f_state,
-                        enabled=hip_enabled,
-                        ach_override=ach_override,
-                    )
+                    # Module 3 Read Path (hoisted zero-overhead cortical pass-through in Stages B/C!)
+                    if hip_enabled:
+                        am_col_f = active_f.unsqueeze(-1).to(sgsc_out.f_stem.dtype)
+                        f_step = sgsc_out.f_stem[safe_idx] * am_col_f
+                        sn_step = sgsc_out.sem_norm[safe_idx] * active_f
+                        mi_step = sgsc_out.mean_info[safe_idx] * active_f
+                        hip_read = self.hippocampus.read_comprehension(
+                            f_stem=f_step,
+                            c_slow=c_step,
+                            sem_norm=sn_step,
+                            mean_info=mi_step,
+                            fast_state=f_state,
+                            enabled=True,
+                            ach_override=ach_override,
+                        )
+                        c_fused_step = hip_read.c_fused
+                        prec_bu_step = hip_read.prec_bu
+                        ach_step = hip_read.ach_signal
+                    else:
+                        hip_read = None
+                        f_step = None
+                        c_fused_step = c_step
+                        assert pi_cort_all is not None
+                        prec_bu_step = pi_cort_all[safe_idx] * active_f.unsqueeze(-1)
+                        ach_step = torch.zeros_like(active_f)
 
                     # Module 2 BCG-PC Step via Hotspot A (`self.bcg_pc(...)` routes through torch.compile!)
                     if self.training and m_step > 0:
@@ -884,14 +927,18 @@ class DCPAModel(nn.Module):
                             in_slots,
                             in_edges,
                             in_sal,
-                            hip_read.c_fused,
-                            hip_read.prec_bu,
-                            hip_read.ach_signal,
+                            c_fused_step,
+                            prec_bu_step,
+                            ach_step,
                             tau_m_t,
                             active_mask,
                             mix_t,
                             g_state.slot0_pinned,
                             trig_step,
+                            w_gu1,
+                            w_d1,
+                            w_gu2,
+                            w_d2,
                             use_reentrant=False,
                             preserve_rng_state=True,
                         )
@@ -902,9 +949,9 @@ class DCPAModel(nn.Module):
                             in_slots,
                             in_edges,
                             in_sal,
-                            hip_read.c_fused,
-                            hip_read.prec_bu,
-                            hip_read.ach_signal,
+                            c_fused_step,
+                            prec_bu_step,
+                            ach_step,
                             tau_m_t,
                             active_mask,
                             mix_t,
@@ -912,6 +959,10 @@ class DCPAModel(nn.Module):
                             trig_step,
                             use_gumbel=self.training,
                             update_c0_ema=self.training,
+                            packed_moe_w_gu1=w_gu1,
+                            packed_moe_w_d1=w_d1,
+                            packed_moe_w_gu2=w_gu2,
+                            packed_moe_w_d2=w_d2,
                         )
                     (
                         z_star_step,
@@ -953,6 +1004,7 @@ class DCPAModel(nn.Module):
 
                     # Module 3 Eligibility Inheritance & Three-Factor Gated Delta Write (Stage D)
                     if hip_enabled and f_state is not None and e_state is not None:
+                        assert hip_read is not None and f_step is not None
                         e_next = self.hippocampus.inherit_eligibility_on_merge(
                             elig=e_state,
                             cand_idx=hip_read.psi_idx,
@@ -991,7 +1043,7 @@ class DCPAModel(nn.Module):
                     # Precision Island #4 (Red Line #1): Accumulate L_PC strictly in float32
                     # with STRICT stop_gradient on c_fused!
                     with fp32_island(device):
-                        c_target_sg = hip_read.c_fused[active_b].detach().float()
+                        c_target_sg = c_fused_step[active_b].detach().float()
                         c_pred = c_hat_step[active_b].float()
                         pi_act = pi_m_step[active_b].float()
                         err_sq = (c_target_sg - c_pred).pow(2)
@@ -1005,7 +1057,9 @@ class DCPAModel(nn.Module):
                         moe_bal_steps += 1
                     total_valid_steps += int(active_b.numel())
 
-                    # Expressive stem retrieval for active steps (align batch dim V_eff with f_state in Stage D!)
+                    # Expressive stem retrieval & delta_syn:
+                    # - In Stage D (hip_enabled): fast_state mutates per step, so retrieve per step.
+                    # - In Stages B/C (not hip_enabled): hoist into ONE single batched matmul after the loop!
                     if hip_enabled:
                         f_out_all, _ = self.hippocampus.read_expression(
                             z_out=z_star_step,
@@ -1014,28 +1068,40 @@ class DCPAModel(nn.Module):
                             enabled=True,
                         )
                         f_out_step = f_out_all[active_b]
-                    else:
-                        f_out_step, _ = self.hippocampus.read_expression(
-                            z_out=z_star_step[active_b],
+                        delta_syn_step = self.pmd.compute_streaming_delta_syn(
+                            g_ctx=g_ctx_step[active_b],
+                            z_star=z_star_step[active_b],
                             l_reg=l_reg_cur[active_b],
-                            fast_state=None,
-                            enabled=False,
                         )
-                    delta_syn_step = self.pmd.compute_streaming_delta_syn(
-                        g_ctx=g_ctx_step[active_b],
-                        z_star=z_star_step[active_b],
-                        l_reg=l_reg_cur[active_b],
-                    )
-
-                    f_out_chunks.append(f_out_step.to(sgsc_out.f_stem.dtype))
-                    delta_syn_chunks.append(delta_syn_step.to(sgsc_out.f_stem.dtype))
+                        f_out_chunks.append(f_out_step.to(sgsc_out.f_stem.dtype))
+                        delta_syn_chunks.append(delta_syn_step.to(sgsc_out.f_stem.dtype))
+                    else:
+                        z_star_chunks.append(z_star_step[active_b])
+                        g_ctx_chunks.append(g_ctx_step[active_b])
                     flat_idx_chunks.append(flat_idx)
 
                 if flat_idx_chunks:
                     order = torch.cat(flat_idx_chunks, dim=0)
                     inv_perm = torch.argsort(order)
-                    f_out_flat = torch.cat(f_out_chunks, dim=0)[inv_perm]
-                    delta_syn_flat = torch.cat(delta_syn_chunks, dim=0)[inv_perm]
+                    if hip_enabled:
+                        f_out_flat = torch.cat(f_out_chunks, dim=0)[inv_perm]
+                        delta_syn_flat = torch.cat(delta_syn_chunks, dim=0)[inv_perm]
+                    else:
+                        z_star_flat = torch.cat(z_star_chunks, dim=0)[inv_perm]
+                        g_ctx_flat = torch.cat(g_ctx_chunks, dim=0)[inv_perm]
+                        f_out_all_flat, _ = self.hippocampus.read_expression(
+                            z_out=z_star_flat,
+                            l_reg=l_reg_seg,
+                            fast_state=None,
+                            enabled=False,
+                        )
+                        delta_syn_all_flat = self.pmd.compute_streaming_delta_syn(
+                            g_ctx=g_ctx_flat,
+                            z_star=z_star_flat,
+                            l_reg=l_reg_seg,
+                        )
+                        f_out_flat = f_out_all_flat.to(sgsc_out.f_stem.dtype)
+                        delta_syn_flat = delta_syn_all_flat.to(sgsc_out.f_stem.dtype)
 
                 # Reassemble shrunk active-prefix tails back to [V_eff, ...]
                 if finished_slots:

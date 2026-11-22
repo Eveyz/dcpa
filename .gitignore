@@ -1,0 +1,21 @@
+# Python
+dcpa-train-py/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+
+# Rust
+target/
+Cargo.lock
+
+# Artifacts / checkpoints / generated test data
+checkpoints/
+data/
+artifacts/
+*.safetensors
+*.bin
+*.idx
+.DS_Store

@@ -118,8 +118,18 @@ impl DcpaEngine {
         let d_s = cfg.d_s;
         let d_c = cfg.d_concept;
 
-        // 1. Strictly causal prior p_t = Softmax(W_out @ h_{t-1}) in float32 BEFORE updating h_t!
-        linear_f32(&self.sgsc.h, &self.weights.sgsc_w_out, None, &mut self.scratch.logits_256);
+        // 1. Strictly causal scale-invariant cosine prior p_t = Softmax(8 * norm(W_out) @ norm(h_{t-1}))
+        //    Strictly weight-tied to W_out while decoupling PMD logit scale growth from SGSC surprisal.
+        let h_norm = sqrtf(dot_f32(&self.sgsc.h, &self.sgsc.h) + 1e-2);
+        let inv_h = 8.0 / h_norm;
+        for i in 0..d_s {
+            self.scratch.vec_ds_a[i] = self.sgsc.h[i] * inv_h;
+        }
+        for b_i in 0..256 {
+            let row = &self.weights.sgsc_w_out[b_i * d_s..(b_i + 1) * d_s];
+            let w_norm = sqrtf(dot_f32(row, row) + 1e-6);
+            self.scratch.logits_256[b_i] = dot_f32(&self.scratch.vec_ds_a, row) / w_norm;
+        }
         let mut max_l = f32::NEG_INFINITY;
         for &v in self.scratch.logits_256.iter() {
             if v > max_l {
@@ -321,7 +331,7 @@ impl DcpaEngine {
                 let sj = &slots[j * d..(j + 1) * d];
                 let wj = w_attn[j];
                 for m in 0..d {
-                    dst[m] += wj * tmp_e[m] * sj[m];
+                    dst[m] += wj * tanhf(tmp_e[m]) * sj[m];
                 }
             }
         }
@@ -441,7 +451,8 @@ impl DcpaEngine {
             &mut self.scratch.vec_d_c, // pi_m
         );
         for v in self.scratch.vec_d_c.iter_mut() {
-            *v = softplus(*v) + 1e-4;
+            let p = softplus(*v) + 1e-4;
+            *v = 2.0 * tanhf(p * 0.5);
         }
 
         // eps_0 -> scratch.vec_d_d, z_cur -> scratch.vec_d_g
@@ -490,9 +501,18 @@ impl DcpaEngine {
             }
             linear_f32(&self.scratch.vec_d_f, &self.weights.bcg_ca_wo, None, &mut self.scratch.vec_d_e);
 
-            // MoE input = eps_cur + r_a -> scratch.vec_d_f
-            for i in 0..d {
-                self.scratch.vec_d_f[i] = self.scratch.vec_d_d[i] + self.scratch.vec_d_e[i];
+            // MoE input = Pre-RMSNorm(eps_cur + r_a) -> scratch.vec_d_f
+            {
+                let mut sum_sq = 0.0f32;
+                for i in 0..d {
+                    let v = self.scratch.vec_d_d[i] + self.scratch.vec_d_e[i];
+                    self.scratch.vec_d_f[i] = v;
+                    sum_sq += v * v;
+                }
+                let inv_rms = 1.0 / sqrtf(sum_sq / (d as f32) + cfg.eps);
+                for i in 0..d {
+                    self.scratch.vec_d_f[i] *= inv_rms;
+                }
             }
 
             // Top-2 SparseMoE routing
@@ -525,7 +545,7 @@ impl DcpaEngine {
             self.scratch.expert_out.fill(0.0);
             for t_i in 0..2 {
                 let exp = &self.weights.bcg_experts[top_idx[t_i]];
-                // Layer 1 SwiGLU
+                // Layer 1 SwiGLU (input vec_d_f is unit-RMS normalized)
                 linear_f32(&self.scratch.vec_d_f, &exp.w_gate1, None, &mut self.scratch.expert_h1);
                 linear_f32(&self.scratch.vec_d_f, &exp.w_up1, None, &mut self.scratch.expert_h2);
                 for h_i in 0..cfg.expert_hidden {
@@ -533,12 +553,19 @@ impl DcpaEngine {
                         silu(self.scratch.expert_h1[h_i]) * self.scratch.expert_h2[h_i];
                 }
                 linear_f32(&self.scratch.expert_h1, &exp.w_down1, None, &mut self.scratch.vec_d_e);
+                let mut sum_sq2 = 0.0f32;
                 for i in 0..d {
-                    self.scratch.vec_d_e[i] += self.scratch.vec_d_f[i];
+                    let v = self.scratch.vec_d_e[i] + self.scratch.vec_d_f[i];
+                    self.scratch.vec_d_e[i] = v;
+                    sum_sq2 += v * v;
                 }
-                // Layer 2 SwiGLU
-                linear_f32(&self.scratch.vec_d_e, &exp.w_gate2, None, &mut self.scratch.expert_h1);
-                linear_f32(&self.scratch.vec_d_e, &exp.w_up2, None, &mut self.scratch.expert_h2);
+                let inv_rms2 = 1.0 / sqrtf(sum_sq2 / (d as f32) + cfg.eps);
+                for i in 0..d {
+                    self.scratch.vec_d_b[i] = self.scratch.vec_d_e[i] * inv_rms2;
+                }
+                // Layer 2 Pre-RMSNorm SwiGLU
+                linear_f32(&self.scratch.vec_d_b, &exp.w_gate2, None, &mut self.scratch.expert_h1);
+                linear_f32(&self.scratch.vec_d_b, &exp.w_up2, None, &mut self.scratch.expert_h2);
                 for h_i in 0..cfg.expert_hidden {
                     self.scratch.expert_h1[h_i] =
                         silu(self.scratch.expert_h1[h_i]) * self.scratch.expert_h2[h_i];
@@ -582,7 +609,7 @@ impl DcpaEngine {
             linear_f32(si, &self.weights.bcg_w_r, None, &mut self.scratch.wr_all[i * d_m..(i + 1) * d_m]);
         }
 
-        // Populate a_tilde: copy KxK from graph.edges, fill row K and col K via SiLU(src * dst)
+        // Populate a_tilde: copy KxK from graph.edges, fill row K and col K via tanh(src * dst)
         for i in 0..k {
             for j in 0..k {
                 let dst_off = (i * kp1 + j) * d_r;
@@ -594,7 +621,7 @@ impl DcpaEngine {
             let dst_off = (i * kp1 + k) * d_r;
             for r in 0..d_r {
                 self.scratch.a_tilde[dst_off + r] =
-                    silu(self.scratch.src_all[i * d_r + r] * self.scratch.dst_all[k * d_r + r]);
+                    tanhf(self.scratch.src_all[i * d_r + r] * self.scratch.dst_all[k * d_r + r]);
             }
         }
         // row K: edge K -> 0..=K
@@ -602,7 +629,7 @@ impl DcpaEngine {
             let dst_off = (k * kp1 + j) * d_r;
             for r in 0..d_r {
                 self.scratch.a_tilde[dst_off + r] =
-                    silu(self.scratch.src_all[k * d_r + r] * self.scratch.dst_all[j * d_r + r]);
+                    tanhf(self.scratch.src_all[k * d_r + r] * self.scratch.dst_all[j * d_r + r]);
             }
         }
 
@@ -975,6 +1002,18 @@ impl DcpaEngine {
             None,
             &mut self.scratch.vec_ds_a, // f_slow
         );
+        // Unit-RMS normalize cortical stem readout to match SGSC.f_stem scale
+        {
+            let mut sum_sq = 0.0f32;
+            for i in 0..d_s {
+                let v = self.scratch.vec_ds_a[i];
+                sum_sq += v * v;
+            }
+            let inv_rms = 1.0 / sqrtf(sum_sq / (d_s as f32) + cfg.eps);
+            for i in 0..d_s {
+                self.scratch.vec_ds_a[i] *= inv_rms;
+            }
+        }
 
         linear_f32(&self.scratch.pmd_z_out, &self.weights.hip_r_sem, None, &mut self.scratch.dg_scores);
         Self::topk_relu_unit_norm(
@@ -1104,8 +1143,18 @@ impl DcpaEngine {
             }
         }
 
-        // 4. Dual Motor Charge Depletion Gate
-        self.scratch.vec_3ds[..d_s].copy_from_slice(&self.motor.m);
+        // 4. Dual Motor Charge Depletion Gate (unit-RMS normalize m so it matches d_drive scale)
+        {
+            let mut sum_sq = 0.0f32;
+            for i in 0..d_s {
+                let v = self.motor.m[i];
+                sum_sq += v * v;
+            }
+            let inv_rms = 1.0 / sqrtf(sum_sq / (d_s as f32) + cfg.eps);
+            for i in 0..d_s {
+                self.scratch.vec_3ds[i] = self.motor.m[i] * inv_rms;
+            }
+        }
         self.scratch.vec_3ds[d_s..2 * d_s].copy_from_slice(&self.scratch.vec_ds_c);
         let drain_raw = dot_f32(&self.weights.pmd_w_drain_w, &self.scratch.vec_3ds[..2 * d_s])
             + self.weights.pmd_w_drain_b;

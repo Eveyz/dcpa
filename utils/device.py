@@ -26,6 +26,10 @@ import random
 from dataclasses import asdict, dataclass
 from typing import Any, ContextManager, Optional
 
+# Must be configured BEFORE importing torch so PyTorch's C++ MPS dispatcher reads it on macOS.
+if platform.system() == "Darwin":
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 import numpy as np
 import torch
 
@@ -128,13 +132,66 @@ def amp_autocast(
     """Cross-platform AMP autocast context manager.
 
     Strictly activates `torch.amp.autocast('cuda', ...)` only when `device.type == 'cuda'`.
+    When `enabled=False` on CUDA, explicitly returns `torch.amp.autocast(device_type='cuda', enabled=False)`
+    so nested float32 precision islands genuinely override an outer bfloat16 autocast block.
     Safely falls back to `contextlib.nullcontext()` (pure float32) on MPS and CPU.
     """
-    if not enabled or device.type != "cuda" or not is_cuda_available():
+    if device.type != "cuda" or not is_cuda_available():
         return contextlib.nullcontext()
+    if not enabled:
+        return torch.amp.autocast(device_type="cuda", enabled=False)
     if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
         return contextlib.nullcontext()
     return torch.amp.autocast(device_type="cuda", dtype=dtype, enabled=True)
+
+
+def fp32_island(device: torch.device) -> ContextManager[Any]:
+    """Explicit float32 precision island context manager overriding outer CUDA bfloat16 autocast."""
+    return amp_autocast(device, enabled=False)
+
+
+def configure_cuda_tf32(device: torch.device, allow: bool = True) -> None:
+    """Safely configure CUDA TF32 matmul/cuDNN flags without touching CUDA APIs on non-CUDA hosts."""
+    if device.type == "cuda" and is_cuda_available():
+        torch.backends.cuda.matmul.allow_tf32 = bool(allow)
+        torch.backends.cudnn.allow_tf32 = bool(allow)
+
+
+def reset_peak_memory_stats(device: torch.device) -> None:
+    """Reset peak device memory tracking statistics safely across CUDA, MPS, and CPU."""
+    if device.type == "cuda" and is_cuda_available():
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def get_peak_memory_gb(device: torch.device) -> float:
+    """Return peak allocated accelerator memory in GB (or host process RSS GB on CPU/MPS fallback)."""
+    if device.type == "cuda" and is_cuda_available():
+        return float(torch.cuda.max_memory_allocated(device)) / float(1024**3)
+    if device.type == "mps" and is_mps_available():
+        if hasattr(torch, "mps") and hasattr(torch.mps, "driver_allocated_memory"):
+            try:
+                val = float(torch.mps.driver_allocated_memory()) / float(1024**3)
+                if val > 0.0:
+                    return val
+            except Exception:
+                pass
+        if hasattr(torch, "mps") and hasattr(torch.mps, "current_allocated_memory"):
+            try:
+                val = float(torch.mps.current_allocated_memory()) / float(1024**3)
+                if val > 0.0:
+                    return val
+            except Exception:
+                pass
+    try:
+        import resource
+
+        rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # macOS ru_maxrss is in bytes; Linux ru_maxrss is in KiB.
+        if platform.system() == "Darwin":
+            return rss / float(1024**3)
+        return rss / float(1024**2)
+    except Exception:
+        return 0.0
 
 
 def synchronize(device: torch.device) -> None:
@@ -339,6 +396,23 @@ def restore_rng_state(rng_state: Optional[dict[str, Any]]) -> None:
                     torch.mps.set_rng_state(mps_state.to(device="cpu", dtype=torch.uint8))
             except Exception:
                 pass
+
+
+def seed_everything(seed: int, device: Optional[torch.device] = None) -> random.Random:
+    """Seed Python, NumPy, CPU Torch, and CUDA/MPS accelerators safely across platforms."""
+    s = int(seed) & 0x7FFFFFFF
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    if (device is None or device.type == "cuda") and is_cuda_available():
+        torch.cuda.manual_seed_all(s)
+    if (device is None or device.type == "mps") and is_mps_available():
+        if hasattr(torch, "mps") and hasattr(torch.mps, "manual_seed"):
+            try:
+                torch.mps.manual_seed(s)
+            except Exception:
+                pass
+    return random.Random(s)
 
 
 def describe_hardware_profile(profile: HardwareProfile) -> str:

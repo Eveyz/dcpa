@@ -199,26 +199,44 @@ class PMD(nn.Module):
         l_reg: torch.Tensor,
         m_init: Optional[torch.Tensor] = None,
         xi_init: Optional[torch.Tensor] = None,
+        doc_cu_seqlens: Optional[torch.Tensor] = None,
     ) -> PMDDecodeOutput:
         """Fully parallel O(log T) teacher-forced byte decoding across all segments in a batch!
 
         Zero Python loops over sequence length T (Commandment #3) and zero segment padding (Commandment #4).
-
-        Args:
-          target_bytes:  [B, T] uint8 ground-truth UTF-8 bytes to predict (x_1..x_T).
-          cu_seqlens:    [M_total + 1] int32 segment boundaries over flattened B*T stream.
-          f_out_seg:     [M_total, d_s] stem prototype vector per segment.
-          delta_syn_seg: [M_total, d_s] syntactic role vector per segment.
-          l_reg:         [B, d_l] language/register vector per batch item.
+        Supports optional packed varlen `doc_cu_seqlens` (resetting BOS byte, pushdown stack Xi, and
+        motor micro-core hidden state m cleanly at every document boundary).
         """
         B, T = target_bytes.shape
         device = target_bytes.device
         d_s = self.cfg.d_s
         N = B * T
 
-        # Previous emitted byte y_{t-1} (BOS byte = 0x00 at t=0)
+        doc_reset_mask: Optional[torch.Tensor] = None
+        doc_max_span: Optional[int] = None
+        if doc_cu_seqlens is not None:
+            if B != 1:
+                raise ValueError(f"Packed varlen doc_cu_seqlens requires B=1, got B={B}")
+            doc_reset_mask = torch.zeros((1, T), device=device, dtype=torch.bool)
+            doc_starts = doc_cu_seqlens[:-1].to(dtype=torch.int64, device=device)
+            doc_ends = doc_cu_seqlens[1:].to(dtype=torch.int64, device=device)
+            doc_lens = doc_ends - doc_starts
+            num_docs = doc_lens.numel()
+            if num_docs > 0:
+                doc_reset_mask[0, doc_starts] = True
+                doc_max_span = int(doc_lens.max().item())
+            doc_id_flat = torch.repeat_interleave(
+                torch.arange(num_docs, device=device, dtype=torch.int64),
+                doc_lens,
+            )  # [N]
+        else:
+            doc_id_flat = torch.arange(B, device=device, dtype=torch.int64).unsqueeze(1).expand(B, T).reshape(N)
+
+        # Previous emitted byte y_{t-1} (BOS byte = 0x00 at t=0 and at every doc_start!)
         bos = torch.zeros((B, 1), device=device, dtype=torch.long)
         prev_bytes = torch.cat([bos, target_bytes[:, :-1].long()], dim=1)  # [B, T]
+        if doc_reset_mask is not None:
+            prev_bytes = torch.where(doc_reset_mask, torch.zeros_like(prev_bytes), prev_bytes)
         u_prev = self.embed(prev_bytes)  # [B, T, d_s]
 
         # Ragged local step tau in {1..l_m} & segment ID for every byte in [0..N-1]
@@ -244,14 +262,16 @@ class PMD(nn.Module):
         d_drive = d_drive_flat.view(B, T, d_s)
 
         # 2. 128B Differentiable Pushdown Stack via O(log T) parallel associative scan (float32!)
-        l_reg_bt = l_reg.unsqueeze(1).expand(B, T, self.cfg.d_l)
+        l_reg_bt = l_reg[doc_id_flat].view(B, T, self.cfg.d_l)
         act_probs = F.softmax(self.w_act(torch.cat([u_prev, l_reg_bt], dim=-1)).float(), dim=-1)  # [B, T, 3]
         p_push = act_probs[..., 0]
         p_pop = act_probs[..., 1]
         p_hold = act_probs[..., 2]
         v_tag = torch.tanh(self.w_tag(u_prev).float())  # [B, T, 4]
 
-        stack_xi = parallel_stack_scan(p_push, p_pop, p_hold, v_tag, xi_init=xi_init)  # [B, T, 16, 4] fp32
+        stack_xi = parallel_stack_scan(
+            p_push, p_pop, p_hold, v_tag, xi_init=xi_init, reset_mask=doc_reset_mask, max_span=doc_max_span
+        )  # [B, T, 16, 4] fp32
         # Top-2 stack slice xi_t = vec(Xi_{t, 0:2}) in R^8
         xi_top2 = stack_xi[:, :, :2, :].reshape(B, T, 2 * self.cfg.stack_tag_dim).to(u_prev.dtype)
 
@@ -260,23 +280,27 @@ class PMD(nn.Module):
         alpha_mot = torch.sigmoid(self.w_alpha_mot(x_in))
         b_mot = (1.0 - alpha_mot) * F.silu(self.w_m(x_in))
         m_start = self.m0 if m_init is None else m_init
-        m_seq = parallel_diag_scan(alpha_mot, b_mot, h0=m_start)  # [B, T, d_s]
+        m_seq = parallel_diag_scan(
+            alpha_mot, b_mot, h0=m_start, reset_mask=doc_reset_mask, max_span=doc_max_span
+        )  # [B, T, d_s]
 
         # Shared output classification head (float32 logits)
         byte_logits = F.linear(m_seq.float(), self.w_out.weight.float())  # [B, T, 256] fp32
 
-        # 4. Dual Motor Charge Depletion Gate E_{n,tau} via O(1)-depth segmented cumsum (float32!)
-        # Map each segment to its batch item's l_reg
-        batch_id_flat = torch.arange(B, device=device, dtype=torch.int64).unsqueeze(1).expand(B, T).reshape(N)
+        # 4. Dual Motor Charge Depletion Gate E_{n,tau} via segmented associative scan (zero float32 bleed!)
         seg_start_idx = cu_seqlens[:-1].to(torch.int64)
-        seg_batch_id = batch_id_flat[seg_start_idx]  # [M_total]
-        l_reg_seg = l_reg[seg_batch_id]  # [M_total, d_l]
+        seg_doc_id = doc_id_flat[seg_start_idx]  # [M_total]
+        l_reg_seg = l_reg[seg_doc_id]  # [M_total, d_l]
 
+        e_in = torch.cat([f_out_seg, delta_syn_seg, l_reg_seg], dim=-1).float()
         e_init_seg = F.softplus(
-            self.w_e_init(torch.cat([f_out_seg, delta_syn_seg, l_reg_seg], dim=-1)).squeeze(-1).float()
-        )  # [M_total] fp32 > 0
+            (e_in * self.w_e_init.weight.float()).sum(dim=-1) + self.w_e_init.bias.float()
+        )  # [M_total] fp32 > 0 (row-independent dot product avoids BLAS sgemv row-offset drift)
+        m_flat = m_seq.reshape(N, d_s).float()
+        m_norm = m_flat * torch.rsqrt(m_flat.pow(2).mean(dim=-1, keepdim=True) + self.cfg.eps)
+        drain_in = torch.cat([m_norm, d_drive_flat.float()], dim=-1)
         drain_flat = F.softplus(
-            self.w_drain(torch.cat([m_seq.reshape(N, d_s), d_drive_flat], dim=-1)).squeeze(-1).float()
+            (drain_in * self.w_drain.weight.float()).sum(dim=-1) + self.w_drain.bias.float()
         )  # [N] fp32 > 0
         cum_drain = ragged_segment_cumsum(drain_flat, cu_seqlens, seg_id)  # [N] fp32
         charge_e = (e_init_seg[seg_id] - cum_drain).view(B, T)  # [B, T] fp32
@@ -350,7 +374,12 @@ class PMD(nn.Module):
         m_new = alpha_mot * m_prev + (1.0 - alpha_mot) * F.silu(self.w_m(x_in))
 
         logits = F.linear(m_new.float(), self.w_out.weight.float())
-        drain = F.softplus(self.w_drain(torch.cat([m_new, d_drive], dim=-1)).squeeze(-1).float())
+        m_f = m_new.float()
+        m_norm = m_f * torch.rsqrt(m_f.pow(2).mean(dim=-1, keepdim=True) + self.cfg.eps)
+        drain_in = torch.cat([m_norm, d_drive.float()], dim=-1)
+        drain = F.softplus(
+            (drain_in * self.w_drain.weight.float()).sum(dim=-1) + self.w_drain.bias.float()
+        )
         charge_new = charge_prev.float() - drain
         p_end = torch.sigmoid(-charge_new / max(self.cfg.tau_e, 1e-4))
         return logits, m_new, xi_new, charge_new, p_end
@@ -361,6 +390,7 @@ class PMD(nn.Module):
         delta_syn: torch.Tensor,
         l_reg: torch.Tensor,
     ) -> torch.Tensor:
+        e_in = torch.cat([f_out, delta_syn, l_reg], dim=-1).float()
         return F.softplus(
-            self.w_e_init(torch.cat([f_out, delta_syn, l_reg], dim=-1)).squeeze(-1).float()
+            (e_in * self.w_e_init.weight.float()).sum(dim=-1) + self.w_e_init.bias.float()
         )

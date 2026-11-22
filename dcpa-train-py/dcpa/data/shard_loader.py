@@ -1,10 +1,11 @@
-"""Zero-copy memory-mapped binary shard reader matching dcpa-data-forge layout (Section 4.1).
+"""Zero-copy memory-mapped binary shard reader matching DCPA 16-byte `.idx` layout.
 
-Binary index record layout (exact 16 bytes, little-endian):
-  startOffset  : uint64 (8 bytes)
-  byteLength   : uint32 (4 bytes)
-  langDomainId : uint16 (2 bytes: 0=zh, 1=en, 2=ja, 3=python, 4=rust, 5=synthetic)
-  stageMask    : uint16 (2 bytes: bitmask bit 0=A, bit 1=B, bit 2=C, bit 3=D)
+Binary index record layout (exact 16 bytes, little-endian `<QIBBH`):
+  offset    : uint64 (8 bytes, start offset in .bin)
+  length    : uint32 (4 bytes, exact UTF-8 byte length > 0)
+  lang_id   : uint8  (1 byte: 0=en, 1=zh, 2=ja, 3=python, 4=rust)
+  source_id : uint8  (1 byte: sub-source identifier)
+  max_depth : uint16 (2 bytes: max bracket nesting depth for code; 0 for natural language)
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-IDX_RECORD_FMT = "<QIHH"
+IDX_RECORD_FMT = "<QIBBH"
 IDX_RECORD_SIZE = struct.calcsize(IDX_RECORD_FMT)  # 16 bytes
 
 
@@ -54,9 +55,9 @@ class BinaryShardDataset(Dataset):
             struct.unpack_from(IDX_RECORD_FMT, raw_idx, i * IDX_RECORD_SIZE)
             for i in range(num_records)
         ]
-        if stage_bit is not None:
-            mask = 1 << stage_bit
-            records = [r for r in records if (r[3] & mask) != 0]
+        if stage_bit is not None and stage_bit == 3:
+            # Stage D uses natural language contexts + Wug episodes
+            records = [r for r in records if r[2] in (0, 1, 2)]
         self.records = records
 
         self._bin_file = self.bin_path.open("rb")
@@ -66,8 +67,14 @@ class BinaryShardDataset(Dataset):
         return len(self.records)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        start_off, byte_len, lang_id, _ = self.records[idx]
+        start_off, byte_len, lang_id, _, _ = self.records[idx]
         take = min(byte_len, self.seq_len)
+        # Step back over UTF-8 continuation bytes so sliced chunk stays valid UTF-8
+        if take < byte_len:
+            steps = 0
+            while take > 0 and steps < 4 and (self._mmap[start_off + take] & 0xC0) == 0x80:
+                take -= 1
+                steps += 1
         buf = bytearray(self._mmap[start_off : start_off + take])
         if len(buf) < self.seq_len:
             # Pad with LF (0x0A) newline separator to fixed batch length T without corrupting UTF-8

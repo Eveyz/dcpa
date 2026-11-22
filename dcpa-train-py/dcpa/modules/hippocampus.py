@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from dcpa.config import DCPAConfig
+from dcpa.ops.fp32 import fp32_island
 
 
 def deterministic_orthogonal_projection(rows: int, cols: int, seed: int) -> torch.Tensor:
@@ -203,31 +204,34 @@ class CompactHouseholderState:
         if float(beta.detach().max().item()) <= write_threshold:
             return
 
-        beta_f = beta.float().unsqueeze(-1)  # [B, 1]
-        # Comprehension write: delta_c = beta * (s_bar - M^{C<-L} @ e)
-        old_c = self.read_c_from_l(e_idx, e_val)
-        delta_c = beta_f * (s_bar.float() - old_c)
-        self.c_from_l_traces.append((e_idx.detach(), e_val.detach().float(), delta_c, self.step_count))
-        if len(self.c_from_l_traces) > self.w_max:
-            self.c_from_l_traces.pop(0)
+        # Precision Island #5 (Red Line #1): s=32 active sparse column Householder Gated Delta
+        # erase/write & familiarity accumulation strictly in float32 (zero residual ghosting!).
+        with fp32_island(beta.device):
+            beta_f = beta.float().unsqueeze(-1)  # [B, 1]
+            # Comprehension write: delta_c = beta * (s_bar - M^{C<-L} @ e)
+            old_c = self.read_c_from_l(e_idx, e_val)
+            delta_c = beta_f * (s_bar.float() - old_c)
+            self.c_from_l_traces.append((e_idx.detach(), e_val.detach().float(), delta_c, self.step_count))
+            if len(self.c_from_l_traces) > self.w_max:
+                self.c_from_l_traces.pop(0)
 
-        # Expression write: delta_l = beta * (f_tilde - M^{L<-C} @ phi)
-        old_l = self.read_l_from_c(phi_idx, phi_val)
-        delta_l = beta_f * (f_tilde.float() - old_l)
-        self.l_from_c_traces.append((phi_idx.detach(), phi_val.detach().float(), delta_l, self.step_count))
-        if len(self.l_from_c_traces) > self.w_max:
-            self.l_from_c_traces.pop(0)
+            # Expression write: delta_l = beta * (f_tilde - M^{L<-C} @ phi)
+            old_l = self.read_l_from_c(phi_idx, phi_val)
+            delta_l = beta_f * (f_tilde.float() - old_l)
+            self.l_from_c_traces.append((phi_idx.detach(), phi_val.detach().float(), delta_l, self.step_count))
+            if len(self.l_from_c_traces) > self.w_max:
+                self.l_from_c_traces.pop(0)
 
-        # Familiarity trace updates (out-of-place for clean autograd)
-        active_e = (e_val.float() > 0).float()
-        u_lex_cur = self.u_lex.gather(1, e_idx)
-        u_lex_add = beta_f * (1.0 - u_lex_cur) * active_e
-        self.u_lex = self.u_lex.scatter_add(1, e_idx, u_lex_add).clamp(0.0, 1.0)
+            # Familiarity trace updates (out-of-place for clean autograd)
+            active_e = (e_val.float() > 0).float()
+            u_lex_cur = self.u_lex.gather(1, e_idx)
+            u_lex_add = beta_f * (1.0 - u_lex_cur) * active_e
+            self.u_lex = self.u_lex.scatter_add(1, e_idx, u_lex_add).clamp(0.0, 1.0)
 
-        active_phi = (phi_val.float() > 0).float()
-        u_sem_cur = self.u_sem.gather(1, phi_idx)
-        u_sem_add = beta_f * (1.0 - u_sem_cur) * active_phi
-        self.u_sem = self.u_sem.scatter_add(1, phi_idx, u_sem_add).clamp(0.0, 1.0)
+            active_phi = (phi_val.float() > 0).float()
+            u_sem_cur = self.u_sem.gather(1, phi_idx)
+            u_sem_add = beta_f * (1.0 - u_sem_cur) * active_phi
+            self.u_sem = self.u_sem.scatter_add(1, phi_idx, u_sem_add).clamp(0.0, 1.0)
 
 
 class ColumnMajorFastWeights:
@@ -328,29 +332,31 @@ class ColumnMajorFastWeights:
         if b_val <= write_threshold:
             return
 
-        # Comprehension column-major sparse Householder update (in float32 accumulator)
-        ei = e_idx[0]
-        ev = e_val[0].float()
-        self._sync_lex_cols(ei)
-        cols_c = self.m_c_from_l[ei].float()  # [s, D]
-        proj_c = torch.einsum("s,sd->d", ev, cols_c)
-        err_c = b_val * (s_bar[0].float() - proj_c)
-        cols_c_new = cols_c + torch.outer(ev, err_c)
-        self.m_c_from_l[ei] = cols_c_new.to(self.storage_dtype)
-        active_e = (ev > 0).float()
-        self.u_lex[ei] = (self.u_lex[ei] + b_val * (1.0 - self.u_lex[ei]) * active_e).clamp(0.0, 1.0)
+        # Precision Island #5 (Red Line #1): local sparse column Gated Delta update strictly in float32
+        with fp32_island(beta.device):
+            # Comprehension column-major sparse Householder update (in float32 accumulator)
+            ei = e_idx[0]
+            ev = e_val[0].float()
+            self._sync_lex_cols(ei)
+            cols_c = self.m_c_from_l[ei].float()  # [s, D]
+            proj_c = torch.einsum("s,sd->d", ev, cols_c)
+            err_c = b_val * (s_bar[0].float() - proj_c)
+            cols_c_new = cols_c + torch.outer(ev, err_c)
+            self.m_c_from_l[ei] = cols_c_new.to(self.storage_dtype)
+            active_e = (ev > 0).float()
+            self.u_lex[ei] = (self.u_lex[ei] + b_val * (1.0 - self.u_lex[ei]) * active_e).clamp(0.0, 1.0)
 
-        # Expression column-major sparse Householder update
-        pi = phi_idx[0]
-        pv = phi_val[0].float()
-        self._sync_sem_cols(pi)
-        cols_l = self.m_l_from_c[pi].float()  # [s, d_s]
-        proj_l = torch.einsum("s,sd->d", pv, cols_l)
-        err_l = b_val * (f_tilde[0].float() - proj_l)
-        cols_l_new = cols_l + torch.outer(pv, err_l)
-        self.m_l_from_c[pi] = cols_l_new.to(self.storage_dtype)
-        active_p = (pv > 0).float()
-        self.u_sem[pi] = (self.u_sem[pi] + b_val * (1.0 - self.u_sem[pi]) * active_p).clamp(0.0, 1.0)
+            # Expression column-major sparse Householder update
+            pi = phi_idx[0]
+            pv = phi_val[0].float()
+            self._sync_sem_cols(pi)
+            cols_l = self.m_l_from_c[pi].float()  # [s, d_s]
+            proj_l = torch.einsum("s,sd->d", pv, cols_l)
+            err_l = b_val * (f_tilde[0].float() - proj_l)
+            cols_l_new = cols_l + torch.outer(pv, err_l)
+            self.m_l_from_c[pi] = cols_l_new.to(self.storage_dtype)
+            active_p = (pv > 0).float()
+            self.u_sem[pi] = (self.u_sem[pi] + b_val * (1.0 - self.u_sem[pi]) * active_p).clamp(0.0, 1.0)
 
 
 HippocampusStateType = Union[CompactHouseholderState, ColumnMajorFastWeights]
@@ -367,6 +373,13 @@ class HippocampusDualMemory(nn.Module):
         # Frozen deterministic random orthogonal projections (NEVER trainable!)
         self.register_buffer("r_lex", deterministic_orthogonal_projection(d_h, d_s, cfg.dg_seed_lex))
         self.register_buffer("r_sem", deterministic_orthogonal_projection(d_h, D, cfg.dg_seed_sem))
+
+        # Non-persistent fast hippocampal state buffers (Commandment #7: NEVER optimizer parameters,
+        # requires_grad=False strictly enforced, excluded from slow-weight safetensors state_dict!)
+        self.register_buffer("m_c_from_l", torch.zeros((d_h, D), dtype=torch.float32), persistent=False)
+        self.register_buffer("m_l_from_c", torch.zeros((d_h, d_s), dtype=torch.float32), persistent=False)
+        self.register_buffer("u_lex", torch.zeros((d_h,), dtype=torch.float32), persistent=False)
+        self.register_buffer("u_sem", torch.zeros((d_h,), dtype=torch.float32), persistent=False)
 
         # Scalar gating parameters (dedicated optimizer group: lr=1e-4, weight_decay=0.0)
         self.alpha_1 = nn.Parameter(torch.tensor(2.0, dtype=torch.float32))
@@ -472,38 +485,39 @@ class HippocampusDualMemory(nn.Module):
           fast_state: HippocampusStateType (if None or not enabled, behaves as Stage B/C cortical pass-through)
         """
         orig_dtype = c_slow.dtype
-        psi_idx, psi_val = self.dg_lex(f_stem)
+        # Precision Island #5 (Red Line #1): DG orthogonal sparse read, familiarity, & ACh gating in fp32
+        with fp32_island(c_slow.device):
+            psi_idx, psi_val = self.dg_lex(f_stem)
+            pi_cort = F.softplus(self.f_prec_cort(c_slow).float()) + 1e-4  # [B, D] fp32
 
-        pi_cort = F.softplus(self.f_prec_cort(c_slow).float()) + 1e-4  # [B, D] fp32
+            if (not enabled) or (fast_state is None):
+                B = c_slow.shape[0]
+                zeros = torch.zeros((B,), device=c_slow.device, dtype=torch.float32)
+                ones = torch.ones((B,), device=c_slow.device, dtype=torch.float32)
+                return HippocampusReadOutput(
+                    c_fused=c_slow,
+                    prec_bu=pi_cort,
+                    psi_idx=psi_idx,
+                    psi_val=psi_val,
+                    ach_signal=zeros,
+                    gamma_slow=ones,
+                    gamma_hip=zeros,
+                    c_hip=torch.zeros_like(c_slow, dtype=torch.float32),
+                )
 
-        if (not enabled) or (fast_state is None):
-            B = c_slow.shape[0]
-            zeros = torch.zeros((B,), device=c_slow.device, dtype=torch.float32)
-            ones = torch.ones((B,), device=c_slow.device, dtype=torch.float32)
-            return HippocampusReadOutput(
-                c_fused=c_slow,
-                prec_bu=pi_cort,
-                psi_idx=psi_idx,
-                psi_val=psi_val,
-                ach_signal=zeros,
-                gamma_slow=ones,
-                gamma_hip=zeros,
-                c_hip=torch.zeros_like(c_slow, dtype=torch.float32),
-            )
+            # Cortical & hippocampal familiarity in float32
+            gamma_slow = torch.sigmoid(
+                self.alpha_1 * (self.theta_i - mean_info.float())
+                + self.alpha_2 * (sem_norm.float() - self.theta_n)
+            )  # [B] fp32
+            gamma_hip = fast_state.read_familiarity_lex(psi_idx, psi_val)  # [B] fp32
+            ach = (1.0 - gamma_slow) * (1.0 - gamma_hip)  # [B] fp32
 
-        # Cortical & hippocampal familiarity in float32
-        gamma_slow = torch.sigmoid(
-            self.alpha_1 * (self.theta_i - mean_info.float())
-            + self.alpha_2 * (sem_norm.float() - self.theta_n)
-        )  # [B] fp32
-        gamma_hip = fast_state.read_familiarity_lex(psi_idx, psi_val)  # [B] fp32
-        ach = (1.0 - gamma_slow) * (1.0 - gamma_hip)  # [B] fp32
+            c_hip = fast_state.read_c_from_l(psi_idx, psi_val)  # [B, D] fp32
+            mu = gamma_hip / (gamma_slow + gamma_hip + self.cfg.eps)  # [B] fp32
 
-        c_hip = fast_state.read_c_from_l(psi_idx, psi_val)  # [B, D] fp32
-        mu = gamma_hip / (gamma_slow + gamma_hip + self.cfg.eps)  # [B] fp32
-
-        c_fused = ((1.0 - mu).unsqueeze(-1) * c_slow.float() + mu.unsqueeze(-1) * c_hip).to(orig_dtype)
-        prec_bu = (1.0 - ach).unsqueeze(-1) * pi_cort  # [B, D] fp32
+            c_fused = ((1.0 - mu).unsqueeze(-1) * c_slow.float() + mu.unsqueeze(-1) * c_hip).to(orig_dtype)
+            prec_bu = (1.0 - ach).unsqueeze(-1) * pi_cort  # [B, D] fp32
 
         return HippocampusReadOutput(
             c_fused=c_fused,
@@ -592,48 +606,50 @@ class HippocampusDualMemory(nn.Module):
         B, K, _ = s_bar_post.shape
         fast_state.advance_step()
 
-        # Semantic crystallization q_{m,i} (Theory Doc Part 3.II.2)
-        c0_norm = c0.float().view(1, 1, -1)
-        cos_sim = F.cosine_similarity(s_bar_post.float(), c0_norm.expand_as(s_bar_post), dim=-1, eps=1e-8)
-        edge_norm_sum = edges_post.float().norm(dim=-1).sum(dim=-1)  # [B, K] sum_j ||A_{m,i,j}||_2
-        q_cryst = torch.sigmoid(
-            self.alpha_q * ((1.0 - cos_sim) + self.gamma_e * edge_norm_sum - self.theta_q)
-        )  # [B, K] fp32
+        # Precision Island #5 (Red Line #1): crystallization gate & sparse delta write strictly in float32
+        with fp32_island(s_bar_post.device):
+            # Semantic crystallization q_{m,i} (Theory Doc Part 3.II.2)
+            c0_norm = c0.float().view(1, 1, -1)
+            cos_sim = F.cosine_similarity(s_bar_post.float(), c0_norm.expand_as(s_bar_post), dim=-1, eps=1e-8)
+            edge_norm_sum = edges_post.float().norm(dim=-1).sum(dim=-1)  # [B, K] sum_j ||A_{m,i,j}||_2
+            q_cryst = torch.sigmoid(
+                self.alpha_q * ((1.0 - cos_sim) + self.gamma_e * edge_norm_sum - self.theta_q)
+            )  # [B, K] fp32
 
-        beta = elig.eta.float() * q_cryst  # [B, K] fp32
+            beta = elig.eta.float() * q_cryst  # [B, K] fp32
 
-        thresh = (
-            self.cfg.householder_write_threshold
-            if write_threshold is None and isinstance(fast_state, CompactHouseholderState)
-            else (0.0 if write_threshold is None else write_threshold)
-        )
-
-        # Compute semantic sparse addresses for slots that will write
-        for slot_i in range(K):
-            beta_i = beta[:, slot_i]
-            if float(beta_i.detach().max().item()) <= thresh:
-                continue
-            s_bar_i = s_bar_post[:, slot_i, :]
-            phi_idx_i, phi_val_i = self.dg_sem(s_bar_i)
-            fast_state.write_slot(
-                beta=beta_i,
-                e_idx=elig.e_idx[:, slot_i, :],
-                e_val=elig.e_val[:, slot_i, :],
-                s_bar=s_bar_i,
-                phi_idx=phi_idx_i,
-                phi_val=phi_val_i,
-                f_tilde=elig.f_tilde[:, slot_i, :],
-                write_threshold=thresh,
+            thresh = (
+                self.cfg.householder_write_threshold
+                if write_threshold is None and isinstance(fast_state, CompactHouseholderState)
+                else (0.0 if write_threshold is None else write_threshold)
             )
 
-        # Quench consumed eligibility traces
-        new_eta = (1.0 - self.cfg.kappa_quench * beta.detach()) * elig.eta
-        new_elig = EligibilityState(
-            e_idx=elig.e_idx,
-            e_val=elig.e_val,
-            f_tilde=elig.f_tilde,
-            eta=new_eta.clamp(0.0, 1.0),
-        )
+            # Compute semantic sparse addresses for slots that will write
+            for slot_i in range(K):
+                beta_i = beta[:, slot_i]
+                if float(beta_i.detach().max().item()) <= thresh:
+                    continue
+                s_bar_i = s_bar_post[:, slot_i, :]
+                phi_idx_i, phi_val_i = self.dg_sem(s_bar_i)
+                fast_state.write_slot(
+                    beta=beta_i,
+                    e_idx=elig.e_idx[:, slot_i, :],
+                    e_val=elig.e_val[:, slot_i, :],
+                    s_bar=s_bar_i,
+                    phi_idx=phi_idx_i,
+                    phi_val=phi_val_i,
+                    f_tilde=elig.f_tilde[:, slot_i, :],
+                    write_threshold=thresh,
+                )
+
+            # Quench consumed eligibility traces
+            new_eta = (1.0 - self.cfg.kappa_quench * beta.detach()) * elig.eta
+            new_elig = EligibilityState(
+                e_idx=elig.e_idx,
+                e_val=elig.e_val,
+                f_tilde=elig.f_tilde,
+                eta=new_eta.clamp(0.0, 1.0),
+            )
         return new_elig, q_cryst, beta
 
     def read_expression(
@@ -646,15 +662,20 @@ class HippocampusDualMemory(nn.Module):
         """Expressive retrieval: Concept + l_reg -> stem prototype f_out [B, d_s] & gate rho_out [B]."""
         orig_dtype = z_out.dtype
         f_slow = self.w_lex_slow(z_out + self.w_lang_lex(l_reg))  # [B, d_s]
+        # Unit-RMS normalize cortical stem readout to match SGSC.f_stem scale cleanly
+        f_slow = (
+            f_slow.float() * torch.rsqrt(f_slow.float().pow(2).mean(dim=-1, keepdim=True) + self.cfg.eps)
+        ).to(orig_dtype)
 
         if (not enabled) or (fast_state is None):
             rho_zero = torch.zeros((z_out.shape[0],), device=z_out.device, dtype=torch.float32)
             return f_slow, rho_zero
 
-        phi_idx, phi_val = self.dg_sem(z_out)
-        gamma_sem = fast_state.read_familiarity_sem(phi_idx, phi_val)  # [B] fp32
-        rho_out = torch.sigmoid(self.alpha_out * (gamma_sem - self.theta_out))  # [B] fp32
-        f_hip = fast_state.read_l_from_c(phi_idx, phi_val)  # [B, d_s] fp32
+        with fp32_island(z_out.device):
+            phi_idx, phi_val = self.dg_sem(z_out)
+            gamma_sem = fast_state.read_familiarity_sem(phi_idx, phi_val)  # [B] fp32
+            rho_out = torch.sigmoid(self.alpha_out * (gamma_sem - self.theta_out))  # [B] fp32
+            f_hip = fast_state.read_l_from_c(phi_idx, phi_val)  # [B, d_s] fp32
 
-        f_out = ((1.0 - rho_out).unsqueeze(-1) * f_slow.float() + rho_out.unsqueeze(-1) * f_hip).to(orig_dtype)
+            f_out = ((1.0 - rho_out).unsqueeze(-1) * f_slow.float() + rho_out.unsqueeze(-1) * f_hip).to(orig_dtype)
         return f_out, rho_out

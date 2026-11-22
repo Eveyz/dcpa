@@ -170,11 +170,18 @@ for name in names:
         raise SystemExit(f"ERROR: Forbidden artifact leaked into bundle: {name}")
 
 required = [
+    "configs/dcpa_48m_train.yaml",
     "utils/device.py",
     "data/build_corpus.py",
+    "data/ragged_dataloader.py",
+    "data/wug_generator.py",
     "train/colab_drive_sync.py",
+    "train/curriculum_state_machine.py",
+    "train/watchdog_and_ckpt.py",
+    "train/visual_probe.py",
     "train/train_dcpa.py",
     "smoke_overfit_64.py",
+    "tests/smoke_overfit_64.py",
     "tests/test_sanity.py",
     "tests/test_data_pipeline.py",
     "tests/test_trainer_lifecycle.py",

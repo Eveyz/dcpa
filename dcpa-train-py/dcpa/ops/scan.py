@@ -156,35 +156,32 @@ if HAS_TRITON:
             seg_len = tl.where(fire, 0, seg_len)
 
 
-def _blelloch_scan_pytorch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Vectorized Blelloch work-efficient O(log T) parallel associative scan in PyTorch.
+def _blelloch_scan_pytorch(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    max_span: Optional[int] = None,
+) -> torch.Tensor:
+    """Vectorized Kogge-Stone O(log T) parallel associative scan in PyTorch (zero pow2 padding).
 
     Computes h_t = a_t * h_{t-1} + b_t for t = 0..T-1 (with h_{-1} = 0) in float32.
-    Input shapes: a, b of shape [B, T, D]. Zero Python loop over T (only O(log2 T) tree levels).
+    When `max_span` is given (upper bound on distance between reset boundaries where a=0),
+    caps tree depth at ceil(log2(max_span)) with exact bit-level equivalence.
     """
-    B, T, D = a.shape
-    if T == 0:
-        return b.float()
-    if T == 1:
+    _, T, _ = a.shape
+    if T <= 1:
         return b.float()
 
-    # Pad to power of 2 ONLY along the tree-reduction dimension (a=1, b=0 identity elements)
-    n_pow2 = 1 << (T - 1).bit_length()
-    if n_pow2 != T:
-        pad = n_pow2 - T
-        a_work = torch.cat([a.float(), torch.ones((B, pad, D), device=a.device, dtype=torch.float32)], dim=1)
-        b_work = torch.cat([b.float(), torch.zeros((B, pad, D), device=b.device, dtype=torch.float32)], dim=1)
-    else:
-        a_work = a.float().clone()
-        b_work = b.float().clone()
+    span = T if max_span is None else min(T, max(1, int(max_span)))
+    if span <= 1:
+        return b.float()
 
-    # Hillis-Steele / Kogge-Stone parallel prefix in log2(n_pow2) parallel steps
-    # (On SIMD/MPS/CUDA, out-of-place tensor slice ops are fully autograd-friendly and O(log T) depth!)
-    levels = int(math.log2(n_pow2))
-    cur_a = a_work
-    cur_b = b_work
+    cur_a = a.float()
+    cur_b = b.float()
+    levels = (span - 1).bit_length()
     for level in range(levels):
         stride = 1 << level
+        if stride >= T:
+            break
         a_prev = cur_a[:, :-stride, :]
         b_prev = cur_b[:, :-stride, :]
         a_curr = cur_a[:, stride:, :]
@@ -196,7 +193,7 @@ def _blelloch_scan_pytorch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         cur_a = torch.cat([cur_a[:, :stride, :], new_a_tail], dim=1)
         cur_b = torch.cat([cur_b[:, :stride, :], new_b_tail], dim=1)
 
-    return cur_b[:, :T, :]
+    return cur_b
 
 
 class _TritonDiagScanFn(torch.autograd.Function):
@@ -261,13 +258,17 @@ def parallel_diag_scan(
     a: torch.Tensor,
     b: torch.Tensor,
     h0: Optional[torch.Tensor] = None,
+    reset_mask: Optional[torch.Tensor] = None,
+    max_span: Optional[int] = None,
 ) -> torch.Tensor:
-    """Parallel associative scan for h_t = a_t * h_{t-1} + b_t.
+    """Parallel associative scan for h_t = a_t * h_{t-1} + b_t with optional doc-start reset_mask.
 
     Args:
       a: [B, T, D] decay/gate tensor in (0, 1)
       b: [B, T, D] input injection tensor
       h0: optional [D] or [B, D] initial hidden state (defaults to zeros)
+      reset_mask: optional [B, T] bool; where True, h_{t-1} is reset to h0 before step t.
+      max_span: optional upper bound on distance between reset positions for exact depth capping.
 
     Returns:
       h: [B, T, D] hidden states for t = 1..T
@@ -284,13 +285,34 @@ def parallel_diag_scan(
         h0_b = h0.float()
         h0_vec = h0_b
 
+    a_f32 = a.float()
+    b_f32 = b.float()
+
+    if reset_mask is not None and T > 0:
+        rm = reset_mask.bool().unsqueeze(-1)  # [B, T, 1]
+        h0_exp = h0_b.unsqueeze(1)  # [1 or B, 1, D]
+        b_f32 = torch.where(rm, a_f32 * h0_exp + b_f32, b_f32)
+        a_f32 = torch.where(rm, torch.zeros_like(a_f32), a_f32)
+        # Also fold t=0 if reset_mask[:, 0] was False
+        if not bool(reset_mask[:, 0].all().item()):
+            b0 = torch.where(
+                reset_mask[:, 0:1].unsqueeze(-1),
+                b_f32[:, 0:1, :],
+                a_f32[:, 0:1, :] * h0_exp + b_f32[:, 0:1, :],
+            )
+            b_f32 = torch.cat([b0, b_f32[:, 1:, :]], dim=1) if T > 1 else b0
+        if HAS_TRITON and a.is_cuda and T <= 4096:
+            return _TritonDiagScanFn.apply(
+                a_f32, b_f32, torch.zeros((D,), device=a.device, dtype=torch.float32)
+            ).to(orig_dtype)
+        h_f32 = _blelloch_scan_pytorch(a_f32, b_f32, max_span=max_span)
+        return h_f32.to(orig_dtype)
+
     # Dispatch to Triton fused CUDA kernel when available and T <= 4096 (single-block associative_scan)
     if HAS_TRITON and a.is_cuda and T <= 4096 and (h0 is None or h0.ndim == 1):
         return _TritonDiagScanFn.apply(a, b, h0_vec)
 
     # Vectorized O(log T) parallel associative scan in PyTorch (float32 accumulator)
-    a_f32 = a.float()
-    b_f32 = b.float()
     if T > 0:
         b_first = a_f32[:, 0:1, :] * h0_b.unsqueeze(1) + b_f32[:, 0:1, :]
         if T > 1:
@@ -299,7 +321,7 @@ def parallel_diag_scan(
             b_folded = b_first
     else:
         b_folded = b_f32
-    h_f32 = _blelloch_scan_pytorch(a_f32, b_folded)
+    h_f32 = _blelloch_scan_pytorch(a_f32, b_folded, max_span=max_span)
     return h_f32.to(orig_dtype)
 
 
@@ -370,21 +392,13 @@ def lif_membrane_scan(
     beta2: float,
     theta: torch.Tensor,
     max_seg_len: int = 16,
+    doc_cu_seqlens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Leaky Integrate-and-Fire membrane potential scan in float32 with UTF-8 & maxSegLen guard.
+    """Leaky Integrate-and-Fire membrane potential scan in float32 with UTF-8, maxSegLen & doc-boundary guard.
 
     Returns:
       v_tilde: [B, T] float32 pre-reset membrane potential (differentiable w.r.t. info, delta_info!)
-      spikes:  [B, T] bool hard discrete spikes (with spikes[:, T-1] == True always)
-
-    Note on autograd:
-      Within each segment [t_{m-1}+1 .. t_m], v_tilde_t satisfies the exact linear recurrence
-      v_tilde_t = lambda * v_tilde_{t-1} + drive_t (with reset to 0 at segment boundaries!).
-      Therefore, once hard spike boundaries are determined in float32 (via Triton register kernel on CUDA
-      or fast C/numpy scalar scan on CPU/MPS), v_tilde is recomputed differentiably across ALL T steps
-      in O(log T) via parallel_diag_scan with a_t = lambda * (1 - s_{t-1})!
-      This preserves exact autograd gradients from s_tilde -> v_tilde -> I_t -> h -> SGSC weights
-      with ZERO Python autograd loop over T!
+      spikes:  [B, T] bool hard discrete spikes (with spikes forced True at every doc end & T-1)
     """
     B, T = info.shape
     device = info.device
@@ -394,7 +408,22 @@ def lif_membrane_scan(
 
     theta_val = float(theta.detach().float().item())
 
-    if HAS_TRITON and info.is_cuda:
+    is_doc_start = torch.zeros((B, T), device=device, dtype=torch.bool)
+    is_doc_end = torch.zeros((B, T), device=device, dtype=torch.bool)
+    if T > 0:
+        is_doc_start[:, 0] = True
+        is_doc_end[:, T - 1] = True
+
+    if doc_cu_seqlens is not None:
+        if B != 1:
+            raise ValueError(f"doc_cu_seqlens packed varlen mode expects B=1, got B={B}")
+        starts = doc_cu_seqlens[:-1].to(dtype=torch.int64, device=device)
+        ends = doc_cu_seqlens[1:].to(dtype=torch.int64, device=device)
+        if starts.numel() > 0:
+            is_doc_start[0, starts] = True
+            is_doc_end[0, ends - 1] = True
+
+    if HAS_TRITON and info.is_cuda and doc_cu_seqlens is None:
         v_tilde_det = torch.empty((B, T), device=device, dtype=torch.float32)
         spikes = torch.empty((B, T), device=device, dtype=torch.bool)
         _triton_lif_scan_kernel[(B,)](
@@ -414,6 +443,8 @@ def lif_membrane_scan(
         # Fast scalar scan in NumPy for hard spike indices (no autograd graph bloat!)
         drive_np = drive.detach().to("cpu", dtype=torch.float32).numpy()
         raw_np = raw_bytes.detach().to("cpu", dtype=torch.uint8).numpy()
+        start_np = is_doc_start.detach().to("cpu").numpy()
+        end_np = is_doc_end.detach().to("cpu").numpy()
         spikes_cpu = torch.zeros((B, T), dtype=torch.bool)
         spikes_np = spikes_cpu.numpy()
 
@@ -423,8 +454,14 @@ def lif_membrane_scan(
             utf8_rem = 0
             d_row = drive_np[b]
             r_row = raw_np[b]
+            st_row = start_np[b]
+            en_row = end_np[b]
             s_row = spikes_np[b]
             for t in range(T):
+                if st_row[t]:
+                    v = 0.0
+                    seg_len = 0
+                    utf8_rem = 0
                 bv = int(r_row[t])
                 if bv < 0x80:
                     utf8_rem = 0
@@ -443,7 +480,7 @@ def lif_membrane_scan(
                 v_t = lif_lambda * v + float(d_row[t])
                 seg_len += 1
                 can_spike = utf8_rem == 0
-                is_last = t == (T - 1)
+                is_last = bool(en_row[t])
                 fire = is_last or (can_spike and (v_t >= theta_val or seg_len >= max_seg_len))
                 s_row[t] = fire
                 if fire:
@@ -454,8 +491,7 @@ def lif_membrane_scan(
 
         spikes = spikes_cpu.to(device)
 
-    # Recompute v_tilde differentiably via O(log T) parallel scan with exact segment resets!
-    # At step t: if spikes[:, t-1] was True, v_{t-1} was reset to 0, so decay a_t = 0; else a_t = lif_lambda.
+    # Recompute v_tilde differentiably via O(log T) parallel scan with exact segment & doc resets!
     if T > 1:
         prev_spikes = torch.cat(
             [torch.zeros((B, 1), device=device, dtype=torch.bool), spikes[:, :-1]],
@@ -464,12 +500,15 @@ def lif_membrane_scan(
     else:
         prev_spikes = torch.zeros((B, T), device=device, dtype=torch.bool)
 
+    reset_prev = prev_spikes | is_doc_start
     decay_a = torch.where(
-        prev_spikes,
+        reset_prev,
         torch.zeros((B, T), device=device, dtype=torch.float32),
         torch.full((B, T), lif_lambda, device=device, dtype=torch.float32),
     )
-    v_tilde = parallel_diag_scan(decay_a.unsqueeze(-1), drive.unsqueeze(-1)).squeeze(-1)
+    v_tilde = parallel_diag_scan(
+        decay_a.unsqueeze(-1), drive.unsqueeze(-1), max_span=max_seg_len
+    ).squeeze(-1)
     return v_tilde, spikes
 
 
@@ -479,27 +518,13 @@ def parallel_stack_scan(
     p_hold: torch.Tensor,
     v_tag: torch.Tensor,
     xi_init: Optional[torch.Tensor] = None,
+    reset_mask: Optional[torch.Tensor] = None,
+    max_span: Optional[int] = None,
 ) -> torch.Tensor:
     """Exact O(log T) parallel associative scan for the 128B differentiable pushdown stack Xi_t.
 
-    Recurrence (Theory Doc Part 4.III.1):
-      Xi_t = p_hold_t * Xi_{t-1}
-           + p_push_t * [v_tag_t^T; Xi_{t-1, 0:L-1}]
-           + p_pop_t  * [Xi_{t-1, 1:L}; 0^T]
-           = S_t @ Xi_{t-1} + B_t
-    where S_t in R^{L x L} is tridiagonal (diag=p_hold, subdiag=p_push, superdiag=p_pop)
-    and B_t in R^{L x d_tag} has row 0 = p_push_t * v_tag_t, rows 1..L-1 = 0.
-
-    Associative operator: (S1, B1) (+) (S2, B2) = (S2 @ S1, S2 @ B1 + B2).
-    Computed strictly in float32 with zero Python loop over T!
-
-    Args:
-      p_push, p_pop, p_hold: [B, T] float32 probabilities summing to 1.
-      v_tag: [B, T, d_tag] float32 delimiter tag vectors.
-      xi_init: optional [B, L, d_tag] initial stack state (default zeros).
-
-    Returns:
-      xi_seq: [B, T, L, d_tag] float32 stack state at every byte step t = 1..T.
+    Supports optional `reset_mask [B, T]` bool: wherever True (document start), the incoming stack
+    state Xi_{t-1} is zeroed (or reset to xi_init) so documents never bleed across cu_seqlens!
     """
     B, T, d_tag = v_tag.shape
     L = 16
@@ -524,7 +549,15 @@ def parallel_stack_scan(
     B_mat = torch.zeros((B, T, L, d_tag), device=device, dtype=torch.float32)
     B_mat[:, :, 0, :] = p_push_f.unsqueeze(-1) * v_tag_f
 
-    if xi_init is not None and T > 0:
+    if reset_mask is not None and T > 0:
+        rm = reset_mask.bool()
+        if xi_init is not None:
+            xi_init_exp = xi_init.float().unsqueeze(1)  # [B, 1, L, d_tag]
+            B_reset = torch.matmul(S, xi_init_exp) + B_mat
+            B_mat = torch.where(rm[..., None, None], B_reset, B_mat)
+        # Zero transition S at every doc start so previous document's stack is strictly erased
+        S = torch.where(rm[..., None, None], torch.zeros_like(S), S)
+    elif xi_init is not None and T > 0:
         B_first = torch.matmul(S[:, 0], xi_init.float()) + B_mat[:, 0]
         if T > 1:
             B_mat = torch.cat([B_first.unsqueeze(1), B_mat[:, 1:]], dim=1)
@@ -534,20 +567,17 @@ def parallel_stack_scan(
     if T <= 1:
         return B_mat
 
-    n_pow2 = 1 << (T - 1).bit_length()
-    if n_pow2 != T:
-        pad = n_pow2 - T
-        eye_pad = eye.view(1, 1, L, L).expand(B, pad, L, L)
-        zero_pad = torch.zeros((B, pad, L, d_tag), device=device, dtype=torch.float32)
-        cur_S = torch.cat([S, eye_pad], dim=1)
-        cur_B = torch.cat([B_mat, zero_pad], dim=1)
-    else:
-        cur_S = S
-        cur_B = B_mat
+    span = T if max_span is None else min(T, max(1, int(max_span)))
+    if span <= 1:
+        return B_mat
 
-    levels = int(math.log2(n_pow2))
+    cur_S = S
+    cur_B = B_mat
+    levels = (span - 1).bit_length()
     for level in range(levels):
         stride = 1 << level
+        if stride >= T:
+            break
         S_prev = cur_S[:, :-stride]
         B_prev = cur_B[:, :-stride]
         S_curr = cur_S[:, stride:]
@@ -559,4 +589,4 @@ def parallel_stack_scan(
         cur_S = torch.cat([cur_S[:, :stride], new_S_tail], dim=1)
         cur_B = torch.cat([cur_B[:, :stride], new_B_tail], dim=1)
 
-    return cur_B[:, :T]
+    return cur_B

@@ -65,7 +65,8 @@ class DCPAConfig:
     lif_beta1: float = 0.25
     lif_beta2: float = 0.75
     lif_theta_init: float = 2.2
-    lif_theta_min: float = 0.5
+    lif_theta_min: float = 0.05
+    lif_theta_scale: float = 12.0
     max_seg_len: int = 16
     target_spike_rate: float = 0.10
     lambda_rate: float = 8.0
@@ -132,8 +133,52 @@ class DCPAConfig:
 
     @classmethod
     def base(cls) -> DCPAConfig:
-        """DCPA-Base (~152M slow weights, ~22M active per step)."""
+        """DCPA-Base (~95M slow weights, standard engineering blueprint reference)."""
         return cls()
+
+    @classmethod
+    def standard_152m(cls) -> DCPAConfig:
+        """DCPA-152M Standard Preset (~152.0M slow weights, ~22M active per step)."""
+        return cls(
+            d_s=192,
+            d_concept=768,
+            k_slots=8,
+            d_r=32,
+            d_merge=256,
+            d_h=4096,
+            s_active=32,
+            d_l=64,
+            num_experts=16,
+            top_k_experts=2,
+            expert_hidden=1920,
+            l_max=4,
+        )
+
+    @classmethod
+    def proto_48m(cls) -> DCPAConfig:
+        """DCPA-48M Prototype Preset (~47.6M slow weights: d_s=192, D=512, K=8, d_h=4096, s=32)."""
+        return cls(
+            d_s=192,
+            d_concept=512,
+            k_slots=8,
+            d_r=32,
+            d_merge=256,
+            d_h=4096,
+            s_active=32,
+            d_l=64,
+            num_experts=8,
+            top_k_experts=2,
+            expert_hidden=1728,
+            l_max=4,
+            target_spike_rate=1.0 / 9.5,
+            lambda_rate=2.0,
+            lambda_var=1.0,
+            lambda_halt=1.0,
+            lambda_act=0.04,
+            lr_micro=6e-4,
+            lr_concept=6e-4,
+            lr_scalar_gate=1.2e-3,
+        )
 
     @classmethod
     def tiny(cls) -> DCPAConfig:

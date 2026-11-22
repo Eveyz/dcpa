@@ -39,12 +39,16 @@ def extract_flat_state_dict(model: DCPAModel, dtype: torch.dtype = torch.float32
         "bcg_pc.pair_j",
         "bcg_pc.pair_u",
         "bcg_pc.pair_v",
+        "bcg_pc.pair_u_onehot",
     }
     tensors: dict[str, torch.Tensor] = {}
     for name, tensor in model.state_dict().items():
         if name in skip_keys:
             continue
         t = tensor.detach().to(device="cpu", dtype=dtype).contiguous()
+        if name == "sgsc.theta_raw":
+            # Fold dimensionless lif_theta_scale so Rust core evaluates softplus(sgsc_theta_raw) verbatim
+            t = (tensor.detach().float() * model.cfg.lif_theta_scale).to(device="cpu", dtype=dtype).contiguous()
         tensors[name] = t
     return tensors
 

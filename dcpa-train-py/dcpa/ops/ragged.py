@@ -71,13 +71,20 @@ def ragged_segment_softmax(
 ) -> torch.Tensor:
     """Numerically stable 1D ragged segmented softmax strictly in float32."""
     scores_f32 = scores.float()
-    max_per_seg = torch.full(
-        (num_segments,),
-        float("-inf"),
-        device=scores.device,
-        dtype=torch.float32,
-    )
-    max_per_seg.scatter_reduce_(0, seg_id, scores_f32, reduce="amax", include_self=False)
+    if scores_f32.device.type == "mps":
+        # PyTorch 2.5 MPS lacks aten::scatter_reduce amax; compute stability shift on CPU
+        # (constant shift inside softmax is mathematically gradient-invariant).
+        max_cpu = torch.full((num_segments,), float("-inf"), dtype=torch.float32)
+        max_cpu.scatter_reduce_(0, seg_id.detach().cpu(), scores_f32.detach().cpu(), reduce="amax", include_self=False)
+        max_per_seg = max_cpu.to(scores_f32.device)
+    else:
+        max_per_seg = torch.full(
+            (num_segments,),
+            float("-inf"),
+            device=scores.device,
+            dtype=torch.float32,
+        )
+        max_per_seg.scatter_reduce_(0, seg_id, scores_f32.detach(), reduce="amax", include_self=False)
     shifted = scores_f32 - max_per_seg[seg_id]
     exp_s = torch.exp(shifted)
     sum_exp = torch.zeros((num_segments,), device=scores.device, dtype=torch.float32)
@@ -112,16 +119,23 @@ def ragged_segment_cumsum(
     cu_seqlens: torch.Tensor,
     seg_id: torch.Tensor,
 ) -> torch.Tensor:
-    """Parallel O(1)-depth intra-segment inclusive prefix sum via global cumsum subtraction.
+    """Parallel O(log N) segmented inclusive prefix sum with ZERO cross-segment float32 cancellation.
 
-    For flat 1D values [N], returns inclusive cumsum reset at each cu_seqlens boundary.
-    Computed strictly in float32 (used for motor charge depletion E_{n,tau}).
+    For flat 1D values [N], returns inclusive cumsum strictly reset at each cu_seqlens boundary
+    using an associative segmented scan (a[seg_start] = 0, a[other] = 1) so earlier documents
+    cannot introduce floating-point cancellation noise into later documents.
     """
+    from dcpa.ops.scan import parallel_diag_scan
+
     v_f32 = values.float()
-    global_cs = torch.cumsum(v_f32, dim=0)
+    n = v_f32.numel()
+    if n == 0:
+        return v_f32
+    reset = torch.zeros((n,), device=v_f32.device, dtype=torch.bool)
     starts = cu_seqlens[:-1].to(torch.int64)
-    # Value immediately preceding each segment start (0 for segment 0)
-    prev_cs = torch.zeros_like(starts, dtype=torch.float32)
-    if starts.numel() > 1:
-        prev_cs[1:] = global_cs[starts[1:] - 1]
-    return global_cs - prev_cs[seg_id]
+    ends = cu_seqlens[1:].to(torch.int64)
+    max_seg = int((ends - starts).max().item()) if starts.numel() > 0 else n
+    if starts.numel() > 0:
+        reset[starts] = True
+    a = torch.where(reset, torch.zeros_like(v_f32), torch.ones_like(v_f32))
+    return parallel_diag_scan(a.view(1, n, 1), v_f32.view(1, n, 1), max_span=max_seg).view(n)

@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from dcpa.config import DCPAConfig
+from dcpa.ops.fp32 import fp32_island
 from dcpa.ops.rmsnorm import RMSNorm
 
 
@@ -46,6 +47,7 @@ class BCGPCStepOutput:
     win_i: torch.Tensor             # [B] int64 i* of winning pair
     win_j: torch.Tensor             # [B] int64 j* of winning pair
     merge_probs: torch.Tensor       # [B, 72] float32 pre-hard softmax probabilities (for entropy monitor/KL)
+    merge_alpha: torch.Tensor       # [B, 72] float32 hard one-hot forward STE merge selection
 
 
 def build_perm_bank(k_slots: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -91,10 +93,11 @@ def build_perm_bank(k_slots: int) -> tuple[torch.Tensor, torch.Tensor, torch.Ten
 
 
 class TwoLayerSwiGLUExpert(nn.Module):
-    """Two-layer SwiGLU residual micro-expert with hidden dimension 1.5*D (Table 5.2)."""
+    """Two-layer Pre-RMSNorm SwiGLU residual micro-expert with hidden dimension 1.5*D (Table 5.2)."""
 
-    def __init__(self, d_model: int, hidden_dim: int) -> None:
+    def __init__(self, d_model: int, hidden_dim: int, eps: float = 1e-6) -> None:
         super().__init__()
+        self.eps = eps
         self.w_gate1 = nn.Linear(d_model, hidden_dim, bias=False)
         self.w_up1 = nn.Linear(d_model, hidden_dim, bias=False)
         self.w_down1 = nn.Linear(hidden_dim, d_model, bias=False)
@@ -103,36 +106,56 @@ class TwoLayerSwiGLUExpert(nn.Module):
         self.w_up2 = nn.Linear(d_model, hidden_dim, bias=False)
         self.w_down2 = nn.Linear(hidden_dim, d_model, bias=False)
 
+        # Residual output projections initialized small so 4-step pondering stays well-conditioned
+        nn.init.normal_(self.w_down1.weight, std=0.02)
+        nn.init.normal_(self.w_down2.weight, std=0.02)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Input x is already unit-RMS normalized by SparseMicroMoE; pre-norm Layer 2 prevents x^4 SwiGLU blowup.
         h1 = F.silu(self.w_gate1(x)) * self.w_up1(x)
         x = x + self.w_down1(h1)
-        h2 = F.silu(self.w_gate2(x)) * self.w_up2(x)
+        x_n2 = (x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)).to(x.dtype)
+        h2 = F.silu(self.w_gate2(x_n2)) * self.w_up2(x_n2)
         return x + self.w_down2(h2)
 
 
 class SparseMicroMoE(nn.Module):
     """Top-2 sparse micro-experts dispatched strictly on active high-surprisal samples."""
 
-    def __init__(self, d_model: int, hidden_dim: int, num_experts: int, top_k: int = 2) -> None:
+    def __init__(self, d_model: int, hidden_dim: int, num_experts: int, top_k: int = 2, eps: float = 1e-6) -> None:
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
+        self.eps = eps
         self.router = nn.Linear(d_model, num_experts, bias=False)
         self.experts = nn.ModuleList(
-            [TwoLayerSwiGLUExpert(d_model, hidden_dim) for _ in range(num_experts)]
+            [TwoLayerSwiGLUExpert(d_model, hidden_dim, eps=eps) for _ in range(num_experts)]
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [N_active, D] -> [N_active, D]."""
+        """x: [N_active, D] -> [N_active, D] with zero GPU-CPU sync stalls on MPS/small batches."""
         if x.shape[0] == 0:
             return x
+        # Pre-RMSNorm input to router + Layer-1 SwiGLU so deep pondering recurrence cannot diverge
+        x = (x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)).to(x.dtype)
         logits = self.router(x).float()  # [N, E]
         top_vals, top_idx = torch.topk(logits, k=self.top_k, dim=-1)  # [N, top_k]
         gates = F.softmax(top_vals, dim=-1).to(x.dtype)  # [N, top_k]
 
+        # On Apple MPS, avoid nonzero()/.any()/index_add_ GPU-CPU sync stalls by masking top-k
+        # router weights directly over fixed-shape expert GEMMs (100% mathematically identical!).
+        if x.device.type == "mps":
+            # Build exact [N, E] sparse top-k gate matrix (strictly 0 for non-top-k experts!)
+            gate_full = torch.zeros((x.shape[0], self.num_experts), device=x.device, dtype=x.dtype)
+            gate_full.scatter_add_(1, top_idx, gates)
+            out = torch.zeros_like(x)
+            for e_id, expert in enumerate(self.experts):
+                w_e = gate_full[:, e_id : e_id + 1]
+                out = out + w_e * expert(x)
+            return out
+
         out = torch.zeros_like(x)
         for e_id, expert in enumerate(self.experts):
-            # Find which (sample, slot) picked expert e_id
             mask = top_idx == e_id  # [N, top_k]
             if not mask.any():
                 continue
@@ -181,6 +204,8 @@ class BCGPC(nn.Module):
         self.register_buffer("pair_j", pair_j)
         self.register_buffer("pair_u", pair_u)
         self.register_buffer("pair_v", pair_v)
+        # Prebuilt scatter matrix [72, K] mapping each pair p -> target slot u = min(i, j) (avoids MPS index_add fallback)
+        self.register_buffer("pair_u_onehot", F.one_hot(pair_u, num_classes=K).float())
 
         # Learnable initial working memory graph G_0
         self.s0 = nn.Parameter(torch.randn(K, D) * 0.02)
@@ -206,6 +231,7 @@ class BCGPC(nn.Module):
             hidden_dim=cfg.expert_hidden,
             num_experts=cfg.num_experts,
             top_k=cfg.top_k_experts,
+            eps=cfg.eps,
         )
         self.norm_ponder = RMSNorm(D, eps=cfg.eps)
 
@@ -230,9 +256,10 @@ class BCGPC(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        # Initialize f_prec bias so Softplus(bias) ~ 1.0
+        # Initialize f_prec bias so Softplus(bias) ~ 1.0 and w_gen near identity so pondering
+        # residual (c_fused - W_gen z) measures true reconstruction error from Step 0.
         nn.init.constant_(self.f_prec_2.bias, 0.5413)
-        nn.init.xavier_uniform_(self.w_gen.weight)
+        nn.init.eye_(self.w_gen.weight)
         nn.init.xavier_uniform_(self.w_fast.weight)
 
     def init_state(self, batch_size: int, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> ConceptGraphState:
@@ -246,8 +273,8 @@ class BCGPC(nn.Module):
     def message_pass(self, slots: torch.Tensor, edges: torch.Tensor, salience: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute edge-aggregated node states S_bar [B, K, D] and context readout g [B, D]."""
         w_attn = F.softmax(salience.float(), dim=-1)  # [B, K] fp32
-        e_proj = self.w_e(edges)  # [B, K, K, D]
-        # S_bar_i = S_i + sum_j w_attn[j] * (W_e A_{i,j} * S_j)
+        e_proj = torch.tanh(self.w_e(edges))  # [B, K, K, D], bounded in (-1, 1) for stable multi-step recurrence
+        # S_bar_i = S_i + sum_j w_attn[j] * (tanh(W_e A_{i,j}) * S_j)
         weighted_s = slots * w_attn.unsqueeze(-1).to(slots.dtype)  # [B, K, D]
         agg = torch.einsum("bijd,bjd->bid", e_proj, weighted_s)
         s_bar = slots + agg
@@ -263,6 +290,7 @@ class BCGPC(nn.Module):
         tau_m: float = 1.0,
         use_gumbel: bool = True,
         update_c0_ema: bool = True,
+        merge_uniform_mix: float = 0.0,
     ) -> BCGPCStepOutput:
         """Execute one concept-step closed loop (Prior -> Masked Pondering -> K+1 -> K Merge).
 
@@ -279,10 +307,11 @@ class BCGPC(nn.Module):
         d_r = self.cfg.d_r
         orig_dtype = c_fused.dtype
 
-        # 1. Top-down prior prediction & precision-weighted residual
+        # 1. Top-down prior prediction & smoothly bounded precision-weighted residual
         s_bar_prev, g_ctx = self.message_pass(state.slots, state.edges, state.salience)
         c_hat = self.f_pred_2(F.silu(self.f_pred_1(g_ctx)))  # [B, D]
-        pi_m = F.softplus(self.f_prec_2(F.silu(self.f_prec_1(g_ctx))).float()) + 1e-4  # [B, D] fp32
+        pi_raw = F.softplus(self.f_prec_2(F.silu(self.f_prec_1(g_ctx))).float()) + 1e-4  # [B, D] fp32
+        pi_m = 2.0 * torch.tanh(pi_raw * 0.5)  # smooth precision cap in (1e-4, 2.0) prevents prior domination/noise blowup
 
         ach_f32 = ach.float().clamp(0.0, 1.0)
         prec_bu_f32 = prec_bu.float().clamp_min(0.0)
@@ -316,31 +345,44 @@ class BCGPC(nn.Module):
             ponder_steps = ponder_steps + ste_act
 
             if active.any():
-                act_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
-                z_a = z_cur[act_idx]
-                eps_a = eps_cur[act_idx]
-                s_bar_a = s_bar_prev[act_idx]
+                if c_fused.device.type == "mps":
+                    # Avoid MPS index_put_ backward CPU fallback while still skipping when ~active.any()!
+                    r_all = self.cross_attn(z_cur, s_bar_prev)
+                    delta_all = self.moe(eps_cur + r_all)
+                    z_cand = self.norm_ponder(z_cur + self.cfg.ponder_eta * delta_all)
+                    act_col = active.unsqueeze(-1)
+                    z_cur = torch.where(act_col, z_cand, z_cur)
 
-                r_a = self.cross_attn(z_a, s_bar_a)
-                delta_a = self.moe(eps_a + r_a)
-                z_next_a = self.norm_ponder(z_a + self.cfg.ponder_eta * delta_a)
+                    eps_cand = (
+                        pi_eff * (c_fused.float() - self.w_gen(z_cand).float())
+                    ).to(orig_dtype)
+                    eps_cur = torch.where(act_col, eps_cand, eps_cur)
+                    surp_cand = eps_cand.float().norm(dim=-1) / math.sqrt(D)
+                    surp_cur = torch.where(active, surp_cand, surp_cur)
+                else:
+                    act_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
+                    z_a = z_cur[act_idx]
+                    eps_a = eps_cur[act_idx]
+                    s_bar_a = s_bar_prev[act_idx]
 
-                # Scatter back inactive-pass-through
-                z_next = z_cur.clone()
-                z_next[act_idx] = z_next_a
-                z_cur = z_next
+                    r_a = self.cross_attn(z_a, s_bar_a)
+                    delta_a = self.moe(eps_a + r_a)
+                    z_next_a = self.norm_ponder(z_a + self.cfg.ponder_eta * delta_a)
 
-                # Recompute residual strictly for active samples
-                eps_next_a = (
-                    pi_eff[act_idx] * (c_fused[act_idx].float() - self.w_gen(z_next_a).float())
-                ).to(orig_dtype)
-                eps_next = eps_cur.clone()
-                eps_next[act_idx] = eps_next_a
-                eps_cur = eps_next
+                    z_next = z_cur.clone()
+                    z_next[act_idx] = z_next_a
+                    z_cur = z_next
 
-                surp_next = surp_cur.clone()
-                surp_next[act_idx] = eps_next_a.float().norm(dim=-1) / math.sqrt(D)
-                surp_cur = surp_next
+                    eps_next_a = (
+                        pi_eff[act_idx] * (c_fused[act_idx].float() - self.w_gen(z_next_a).float())
+                    ).to(orig_dtype)
+                    eps_next = eps_cur.clone()
+                    eps_next[act_idx] = eps_next_a
+                    eps_cur = eps_next
+
+                    surp_next = surp_cur.clone()
+                    surp_next[act_idx] = eps_next_a.float().norm(dim=-1) / math.sqrt(D)
+                    surp_cur = surp_next
 
         z_star = z_cur  # [B, D]
 
@@ -349,9 +391,10 @@ class BCGPC(nn.Module):
         src_all = self.u_src(s_tilde)  # [B, K+1, d_r]
         dst_all = self.u_dst(s_tilde)  # [B, K+1, d_r]
 
-        # New edges for i == K or k == K; preserve existing K x K edges verbatim from state.edges
-        new_row = F.silu(src_all[:, K : K + 1, :] * dst_all)  # [B, K+1, d_r] (from K to 0..K)
-        new_col = F.silu(src_all[:, :K, :] * dst_all[:, K : K + 1, :])  # [B, K, d_r] (from 0..K-1 to K)
+        # New edges for i == K or k == K; preserve existing K x K edges verbatim from state.edges.
+        # Bounded via tanh so bilinear products src * dst stay in (-1, 1) and never diverge across steps.
+        new_row = torch.tanh(src_all[:, K : K + 1, :] * dst_all)  # [B, K+1, d_r] (from K to 0..K)
+        new_col = torch.tanh(src_all[:, :K, :] * dst_all[:, K : K + 1, :])  # [B, K, d_r] (from 0..K-1 to K)
         top_part = torch.cat([state.edges, new_col.unsqueeze(2)], dim=2)  # [B, K, K+1, d_r]
         a_tilde = torch.cat([top_part, new_row.unsqueeze(1)], dim=1)  # [B, K+1, K+1, d_r]
 
@@ -360,30 +403,43 @@ class BCGPC(nn.Module):
         pj_idx = self.pair_j  # [72]
         pu_idx = self.pair_u  # [72]
 
-        s_i = s_tilde[:, pi_idx, :]  # [B, 72, D]
-        s_j = s_tilde[:, pj_idx, :]  # [B, 72, D]
         a_ij = a_tilde[:, pi_idx, pj_idx, :]  # [B, 72, d_r]
 
-        # Merge affinity score strictly in float32
-        h_merge = torch.tanh(self.w_l(s_i) + self.w_r(s_j) + self.w_edge_score(a_ij))
+        # Exact 9-slot factorization of W_L s_i + W_R s_j (8x fewer FLOPs than 72-pair matmul!)
+        wl_all = self.w_l(s_tilde)  # [B, K+1, d_m]
+        wr_all = self.w_r(s_tilde)  # [B, K+1, d_m]
+        h_merge = torch.tanh(wl_all[:, pi_idx, :] + wr_all[:, pj_idx, :] + self.w_edge_score(a_ij))
         m_score = self.w_merge(h_merge).squeeze(-1).float()  # [B, 72] fp32
 
-        merge_probs = F.softmax(m_score / max(tau_m, 1e-4), dim=-1)  # [B, 72] fp32
+        # Precision Island #3 (Red Line #1): Gumbel-Softmax -log(-log(U + 1e-7) + 1e-7)
+        # and exact merge probability / exploration mixing strictly in float32!
+        with fp32_island(c_fused.device):
+            m_score_f = m_score.float()
+            merge_probs = F.softmax(m_score_f / max(tau_m, 1e-4), dim=-1)  # [B, 72] fp32
+            if merge_uniform_mix > 0.0:
+                eps_u = min(max(float(merge_uniform_mix), 0.0), 0.99)
+                uniform_p = 1.0 / float(m_score_f.shape[-1])
+                merge_probs = (1.0 - eps_u) * merge_probs + eps_u * uniform_p
 
-        if self.training:
-            if use_gumbel:
-                # Sample Gumbel(0, 1) noise in float32
-                u_rand = torch.rand_like(m_score).clamp(1e-6, 1.0 - 1e-6)
-                gumbel = -torch.log(-torch.log(u_rand))
-                y_soft = F.softmax((m_score + gumbel) / max(tau_m, 1e-4), dim=-1)
+            if self.training:
+                if use_gumbel:
+                    # Temperature-annealed Gumbel-Max with explicit Red Line #1 numerical guard:
+                    # -log(-log(U + 1e-7) + 1e-7) strictly in float32.
+                    u_rand = torch.rand_like(m_score_f)
+                    gumbel = -torch.log(-torch.log(u_rand + 1e-7) + 1e-7)
+                    if merge_uniform_mix > 0.0:
+                        logits_eff = torch.log(merge_probs.clamp_min(1e-8))
+                    else:
+                        logits_eff = m_score_f / max(tau_m, 1e-4)
+                    y_soft = F.softmax(logits_eff + gumbel, dim=-1)
+                else:
+                    y_soft = merge_probs
+                win_idx = y_soft.argmax(dim=-1)  # [B]
+                y_hard = F.one_hot(win_idx, num_classes=m_score_f.shape[-1]).float()
+                alpha = (y_hard - y_soft).detach() + y_soft  # Gumbel-STE [B, 72] fp32
             else:
-                y_soft = merge_probs
-            win_idx = y_soft.argmax(dim=-1)  # [B]
-            y_hard = F.one_hot(win_idx, num_classes=m_score.shape[-1]).float()
-            alpha = (y_hard - y_soft).detach() + y_soft  # Gumbel-STE [B, 72] fp32
-        else:
-            win_idx = m_score.argmax(dim=-1)  # [B]
-            alpha = F.one_hot(win_idx, num_classes=m_score.shape[-1]).float()
+                win_idx = m_score_f.argmax(dim=-1)  # [B]
+                alpha = F.one_hot(win_idx, num_classes=m_score_f.shape[-1]).float()
 
         win_i = pi_idx[win_idx]  # [B]
         win_j = pj_idx[win_idx]  # [B]
@@ -392,29 +448,26 @@ class BCGPC(nn.Module):
         p_mat = torch.einsum("bp,pka->bka", alpha, self.perm_bank)  # [B, K, K+1] fp32
         p_mat_dt = p_mat.to(orig_dtype)
 
-        # Parent node composition & exact in-place slot update
-        if self.training:
-            # Vectorized over all 72 pairs so Gumbel-STE passes gradients cleanly to W_comp, W_g, M_score
-            g_ij = torch.sigmoid(self.w_g(torch.cat([s_i, s_j, a_ij], dim=-1)))  # [B, 72, D]
-            comp_ij = self.w_comp(torch.cat([s_i, s_j], dim=-1))  # [B, 72, D]
-            s_merged = self.norm_merge(g_ij * comp_ij + (1.0 - g_ij) * s_i)  # [B, 72, D]
+        # Parent node composition & exact in-place slot update (O(B*D) winning-pair composition +
+        # full 72-way Gumbel-STE P_m contraction: bit-exact forward, bit-exact W_g/W_comp gradients,
+        # and 72x lower autograd activation memory vs materializing [B, 72, D]!)
+        b_arange = torch.arange(B, device=c_fused.device)
+        s_i_win = s_tilde[b_arange, win_i]  # [B, D]
+        s_j_win = s_tilde[b_arange, win_j]  # [B, D]
+        a_ij_win = a_tilde[b_arange, win_i, win_j]  # [B, d_r]
+        g_win = torch.sigmoid(self.w_g(torch.cat([s_i_win, s_j_win, a_ij_win], dim=-1)))  # [B, D]
+        comp_win = self.w_comp(torch.cat([s_i_win, s_j_win], dim=-1))  # [B, D]
+        s_merged_win = self.norm_merge(g_win * comp_win + (1.0 - g_win) * s_i_win)  # [B, D]
 
-            # (P^{(i,j)} S_tilde)_{min(i,j)} == 0.5 * (S_tilde_i + S_tilde_j) identically
-            base_merged = 0.5 * (s_i + s_j)
-            corr = alpha.to(orig_dtype).unsqueeze(-1) * (s_merged - base_merged)  # [B, 72, D]
-            slot_corr = torch.zeros((B, K, D), device=c_fused.device, dtype=orig_dtype)
-            slot_corr.index_add_(1, pu_idx, corr)
+        if self.training:
+            # (P^{(i*,j*)} S_tilde)_{u*} == 0.5 * (s_i_win + s_j_win); add STE-weighted nonlinear residual
+            # exclusively at u* = min(i*, j*) while P_m passes full 72-way Gumbel-STE gradients to M_score.
+            alpha_win = alpha[b_arange, win_idx].to(orig_dtype)  # [B], forward value == 1.0
+            corr_win = alpha_win.unsqueeze(-1) * (s_merged_win - 0.5 * (s_i_win + s_j_win))  # [B, D]
+            win_u_oh = self.pair_u_onehot[win_idx].to(orig_dtype)  # [B, K]
+            slot_corr = win_u_oh.unsqueeze(-1) * corr_win.unsqueeze(1)  # [B, K, D]
             s_new = torch.einsum("bka,bad->bkd", p_mat_dt, s_tilde) + slot_corr
         else:
-            # O(D) inference path: compute s_merged ONLY for the single winning pair (i*, j*)
-            b_arange = torch.arange(B, device=c_fused.device)
-            s_i_win = s_tilde[b_arange, win_i]  # [B, D]
-            s_j_win = s_tilde[b_arange, win_j]  # [B, D]
-            a_ij_win = a_tilde[b_arange, win_i, win_j]  # [B, d_r]
-            g_win = torch.sigmoid(self.w_g(torch.cat([s_i_win, s_j_win, a_ij_win], dim=-1)))
-            comp_win = self.w_comp(torch.cat([s_i_win, s_j_win], dim=-1))
-            s_merged_win = self.norm_merge(g_win * comp_win + (1.0 - g_win) * s_i_win)
-
             win_u = pu_idx[win_idx]
             win_v = self.pair_v[win_idx]
             s_new = state.slots.clone()
@@ -424,8 +477,9 @@ class BCGPC(nn.Module):
                 b_cb = b_arange[case_b]
                 s_new[b_cb, win_v[case_b]] = z_star[b_cb]
 
-        # Edge tensor contraction A_m = einsum('ab,cd,bdr->acr', P_m, P_m, A_tilde)
-        a_new = torch.einsum("bka,blc,bacr->bklr", p_mat_dt, p_mat_dt, a_tilde)
+        # Factored two-stage edge tensor contraction: P_m @ A_tilde @ P_m^T (9x smaller intermediates!)
+        a_tmp = torch.einsum("bka,bacr->bkcr", p_mat_dt, a_tilde)
+        a_new = torch.einsum("blc,bkcr->bklr", p_mat_dt, a_tmp)
 
         # 5. Exact LogSumExp Slot Salience Conservation Equation in float32 (Engineering Doc 2.3)
         omega_old_decayed = state.salience.float() - self.cfg.delta_decay  # [B, K]
@@ -437,8 +491,7 @@ class BCGPC(nn.Module):
         w_merged = torch.logaddexp(w_i, w_j)  # [B, 72]
         w_base = 0.5 * (w_i + w_j)
         w_corr_pairs = alpha * (w_merged - w_base)  # [B, 72]
-        w_corr = torch.zeros((B, K), device=c_fused.device, dtype=torch.float32)
-        w_corr.index_add_(1, pu_idx, w_corr_pairs)
+        w_corr = torch.einsum("pk,bp->bk", self.pair_u_onehot, w_corr_pairs)
         omega_new = torch.einsum("bka,ba->bk", p_mat, omega_tilde) + w_corr
 
         # Update neutral concept center c_0 via EMA during training
@@ -464,4 +517,5 @@ class BCGPC(nn.Module):
             win_i=win_i,
             win_j=win_j,
             merge_probs=merge_probs,
+            merge_alpha=alpha,
         )

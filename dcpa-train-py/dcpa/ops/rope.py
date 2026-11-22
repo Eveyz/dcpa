@@ -13,6 +13,8 @@ import math
 
 import torch
 
+from dcpa.ops.fp32 import fp32_island
+
 
 def build_rope_freqs(
     dim: int,
@@ -47,21 +49,22 @@ def apply_holographic_rope(
     """
     orig_dtype = x.dtype
     dim = x.shape[-1]
-    freqs = build_rope_freqs(dim, period=period, num_harmonics=num_harmonics, device=x.device)
-    pos = positions.to(dtype=torch.float32)
-    if inverse:
-        pos = -pos
-    angles = pos.unsqueeze(-1) * freqs  # [..., dim // 2]
-    cos_a = torch.cos(angles)
-    sin_a = torch.sin(angles)
+    with fp32_island(x.device):
+        freqs = build_rope_freqs(dim, period=period, num_harmonics=num_harmonics, device=x.device)
+        pos = positions.to(dtype=torch.float32)
+        if inverse:
+            pos = -pos
+        angles = pos.unsqueeze(-1) * freqs  # [..., dim // 2]
+        cos_a = torch.cos(angles)
+        sin_a = torch.sin(angles)
 
-    x_f32 = x.float()
-    x_even = x_f32[..., 0::2]
-    x_odd = x_f32[..., 1::2]
-    y_even = x_even * cos_a - x_odd * sin_a
-    y_odd = x_even * sin_a + x_odd * cos_a
+        x_f32 = x.float()
+        x_even = x_f32[..., 0::2]
+        x_odd = x_f32[..., 1::2]
+        y_even = x_even * cos_a - x_odd * sin_a
+        y_odd = x_even * sin_a + x_odd * cos_a
 
-    out = torch.empty_like(x_f32)
-    out[..., 0::2] = y_even
-    out[..., 1::2] = y_odd
+        out = torch.empty_like(x_f32)
+        out[..., 0::2] = y_even
+        out[..., 1::2] = y_odd
     return out.to(orig_dtype)

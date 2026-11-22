@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-IDX_RECORD_FMT = "<QIBBH"
+IDX_RECORD_FMT = "<QIBBBB"
 IDX_RECORD_SIZE = struct.calcsize(IDX_RECORD_FMT)  # 16 bytes
 
 
@@ -67,7 +67,7 @@ class BinaryShardDataset(Dataset):
         return len(self.records)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        start_off, byte_len, lang_id, _, _ = self.records[idx]
+        start_off, byte_len, lang_id, _, _, _ = self.records[idx]
         take = min(byte_len, self.seq_len)
         # Step back over UTF-8 continuation bytes so sliced chunk stays valid UTF-8
         if take < byte_len:

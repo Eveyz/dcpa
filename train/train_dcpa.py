@@ -42,6 +42,7 @@ for _p in (str(_REPO_ROOT), str(_TRAIN_PY)):
 
 from data.ragged_dataloader import RaggedByteDataset
 from data.wug_generator import sample_wug_episode_fast
+from dcpa.compile_utils import configure_model_compile
 from dcpa.config import DCPAConfig
 from dcpa.data.synthetic import generate_dyck_sequence, generate_grid_physics_episode
 from dcpa.export import extract_flat_state_dict
@@ -123,6 +124,8 @@ def build_dcpa_config(preset: str, yaml_cfg: Mapping[str, Any]) -> DCPAConfig:
         "48m": DCPAConfig.proto_48m,
         "standard_152m": DCPAConfig.standard_152m,
         "152m": DCPAConfig.standard_152m,
+        "moe_210m": DCPAConfig.moe_210m,
+        "210m": DCPAConfig.moe_210m,
         "base": DCPAConfig.base,
         "tiny": DCPAConfig.tiny,
         "micro": DCPAConfig.micro,
@@ -297,12 +300,26 @@ class _DynamicRaggedCursorStream:
         bin_path: Optional[Path],
         idx_path: Optional[Path],
         seed: int,
+        cap_data_dir: Optional[Path] = None,
+        stage3_cap_mix_ratio: float = 0.35,
     ) -> None:
         self.bin_path = bin_path if (bin_path is not None and bin_path.exists()) else None
         self.idx_path = idx_path if (idx_path is not None and idx_path.exists()) else None
         self.has_shards = self.bin_path is not None and self.idx_path is not None
         self._ds: Optional[RaggedByteDataset] = None
         self._ds_key: Optional[tuple[Any, ...]] = None
+        self._cap_shards: list[tuple[Path, Path]] = []
+        self._cap_datasets: list[Optional[RaggedByteDataset]] = []
+        self._cap_keys: list[Optional[tuple[Any, ...]]] = []
+        self.stage3_cap_mix_ratio = float(stage3_cap_mix_ratio)
+        if cap_data_dir is not None and cap_data_dir.exists():
+            for pref in ("cap_reasoning", "cap_writing"):
+                bp = cap_data_dir / f"{pref}_train.bin"
+                ip = cap_data_dir / f"{pref}_train.idx"
+                if bp.exists() and ip.exists():
+                    self._cap_shards.append((bp, ip))
+                    self._cap_datasets.append(None)
+                    self._cap_keys.append(None)
         self.cursor: dict[str, Any] = {
             "batch_idx": 0,
             "epoch": 0,
@@ -310,6 +327,33 @@ class _DynamicRaggedCursorStream:
             "consumed_bytes": 0,
         }
         self._corpus_bytes: int = int(self.bin_path.stat().st_size) if self.bin_path is not None else 1
+
+    def _ensure_cap_dataset(
+        self,
+        cap_idx: int,
+        *,
+        target_batch_bytes: int,
+        max_doc_bytes: int,
+    ) -> RaggedByteDataset:
+        key = (int(target_batch_bytes), int(max_doc_bytes), int(self.cursor["seed"]))
+        if self._cap_datasets[cap_idx] is not None and self._cap_keys[cap_idx] == key:
+            return self._cap_datasets[cap_idx]  # type: ignore[return-value]
+        if self._cap_datasets[cap_idx] is not None:
+            self._cap_datasets[cap_idx].close()  # type: ignore[union-attr]
+        bp, ip = self._cap_shards[cap_idx]
+        ds = RaggedByteDataset(
+            bin_path=bp,
+            idx_path=ip,
+            target_batch_bytes=int(target_batch_bytes),
+            max_doc_bytes=int(max_doc_bytes),
+            domain_weights=None,
+            wug_ratio=0.0,
+            num_batches=10_000_000,
+            seed=int(self.cursor["seed"]) + (cap_idx + 1) * 4099,
+        )
+        self._cap_datasets[cap_idx] = ds
+        self._cap_keys[cap_idx] = key
+        return ds
 
     def _ensure_dataset(
         self,
@@ -347,22 +391,37 @@ class _DynamicRaggedCursorStream:
         state: CurriculumStepState,
     ) -> dict[str, torch.Tensor]:
         b_idx = int(self.cursor["batch_idx"])
-        ds = self._ensure_dataset(
-            target_batch_bytes=target_batch_bytes,
-            max_doc_bytes=state.max_doc_bytes,
-            domain_weights=state.domain_weights,
-            wug_ratio=state.wug_ratio,
+        use_cap = (
+            state.stage_id == 3
+            and len(self._cap_shards) > 0
+            and self.stage3_cap_mix_ratio > 0.0
+            and ((b_idx * 37) % 100) < int(round(self.stage3_cap_mix_ratio * 100.0))
         )
-        if ds is not None:
-            batch = ds[b_idx]
-        else:
-            batch = _sample_synthetic_ragged_batch(
-                batch_idx=b_idx,
-                seed=int(self.cursor["seed"]),
-                target_bytes=target_batch_bytes,
+        if use_cap:
+            c_idx = b_idx % len(self._cap_shards)
+            cap_ds = self._ensure_cap_dataset(
+                c_idx,
+                target_batch_bytes=target_batch_bytes,
                 max_doc_bytes=state.max_doc_bytes,
+            )
+            batch = cap_ds[b_idx]
+        else:
+            ds = self._ensure_dataset(
+                target_batch_bytes=target_batch_bytes,
+                max_doc_bytes=state.max_doc_bytes,
+                domain_weights=state.domain_weights,
                 wug_ratio=state.wug_ratio,
             )
+            if ds is not None:
+                batch = ds[b_idx]
+            else:
+                batch = _sample_synthetic_ragged_batch(
+                    batch_idx=b_idx,
+                    seed=int(self.cursor["seed"]),
+                    target_bytes=target_batch_bytes,
+                    max_doc_bytes=state.max_doc_bytes,
+                    wug_ratio=state.wug_ratio,
+                )
         self.cursor["batch_idx"] = b_idx + 1
         self.cursor["consumed_bytes"] = int(self.cursor["consumed_bytes"]) + int(batch["x_bytes"].numel())
         self.cursor["epoch"] = int(self.cursor["consumed_bytes"]) // max(self._corpus_bytes, 1)
@@ -381,6 +440,11 @@ class _DynamicRaggedCursorStream:
             self._ds.close()
             self._ds = None
             self._ds_key = None
+        for i, cds in enumerate(self._cap_datasets):
+            if cds is not None:
+                cds.close()
+                self._cap_datasets[i] = None
+                self._cap_keys[i] = None
 
 
 def run_training(
@@ -393,6 +457,7 @@ def run_training(
     target_tokens_bytes_per_step: Optional[int] = None,
     micro_batch_bytes: Optional[int] = None,
     data_dir: Optional[str | Path] = None,
+    cap_data_dir: Optional[str | Path] = None,
     ckpt_dir: Optional[str | Path] = None,
     logs_dir: Optional[str | Path] = None,
     export_dir: Optional[str | Path] = None,
@@ -408,6 +473,8 @@ def run_training(
     heartbeat_seconds: float = 60.0,
     resume: str = "auto",
     device_str: str = "auto",
+    compile_mode: Optional[str] = None,
+    allow_cpu_compile: bool = False,
     deterministic: bool = False,
     seed: int = 1337,
     max_consecutive_meltdowns: int = 3,
@@ -459,6 +526,8 @@ def run_training(
     local_cache = assert_not_drive_path(local_cache_dir, role="--local-cache-dir")
     if data_dir is not None:
         assert_not_drive_path(data_dir, role="--data-dir")
+    if cap_data_dir is not None:
+        assert_not_drive_path(cap_data_dir, role="--cap-data-dir")
 
     eff_ckpt_dir = Path(ckpt_dir) if ckpt_dir is not None else Path(ck_cfg.get("ckpt_dir", local_cache / "checkpoints"))
     eff_logs_dir = Path(logs_dir) if logs_dir is not None else Path(vp_cfg.get("logs_dir", local_cache / "logs"))
@@ -516,6 +585,28 @@ def run_training(
     optimizer = create_dcpa_optimizer(model, optimizer_cfg=opt_cfg)
     grad_clip_norm = float(opt_cfg.get("grad_clip_norm", cfg.grad_clip_norm))
 
+    # Selective static-shape torch.compile on Hotspot A (BCG step) & Hotspot B (SGSC/PMD scans) ONLY
+    req_compile_mode = (
+        compile_mode
+        if compile_mode is not None
+        else str(hw_cfg.get("compile_mode", "none"))
+    )
+    compile_report = configure_model_compile(
+        model,
+        compile_mode=req_compile_mode,
+        device=device,
+        doc_bucket_size=int(hw_cfg.get("compile_doc_bucket_size", 16)),
+        cache_size_limit=int(hw_cfg.get("compile_cache_size_limit", 64)),
+        allow_cpu_compile=allow_cpu_compile,
+    )
+    print(
+        f"[Compile] requested={compile_report.requested_mode} -> effective={compile_report.effective_mode} "
+        f"| backend={compile_report.backend} | hotspots={list(compile_report.compiled_hotspots)} "
+        f"| doc_bucket={compile_report.doc_bucket_size} | cache_limit={compile_report.cache_size_limit}"
+        + (f" ({compile_report.fallback_reason})" if compile_report.fallback_reason else ""),
+        flush=True,
+    )
+
     controller = CurriculumController(curriculum_cfg=curr_cfg, stage_boundaries=eff_boundaries)
 
     if watchdog_warmup_steps is not None:
@@ -572,14 +663,28 @@ def run_training(
         clock=clock,
     )
 
-    # Hot NVMe Ragged byte stream
+    # Hot NVMe Ragged byte stream (+ optional Stage 3 cap_reasoning & cap_writing 35% mix)
     train_bin = (Path(data_dir) / "train.bin") if data_dir is not None else None
     train_idx = (Path(data_dir) / "train.idx") if data_dir is not None else None
     val_bin = (Path(data_dir) / "val.bin") if data_dir is not None else None
     val_idx = (Path(data_dir) / "val.idx") if data_dir is not None else None
-    stream = _DynamicRaggedCursorStream(train_bin, train_idx, seed=seed)
+    s3_cap_ratio = float(curr_cfg.get("stage3", {}).get("cap_mix_ratio", 0.35))
+    cap_dir_path = Path(cap_data_dir) if cap_data_dir is not None else None
+    stream = _DynamicRaggedCursorStream(
+        train_bin,
+        train_idx,
+        seed=seed,
+        cap_data_dir=cap_dir_path,
+        stage3_cap_mix_ratio=s3_cap_ratio,
+    )
     if stream.has_shards:
         print(f"[Data] Opened NVMe Ragged UTF-8 stream: {train_bin}", flush=True)
+    if stream._cap_shards:
+        print(
+            f"[Data] Stage 3 capability mix active ({s3_cap_ratio*100:.0f}%): "
+            f"{[p[0].name for p in stream._cap_shards]}",
+            flush=True,
+        )
 
     # Resume handling (auto: Colab A/B Ping-Pong first if configured, else local CheckpointManager)
     start_step = 0
@@ -703,6 +808,10 @@ def run_training(
                     x_bytes = batch["x_bytes"].to(device)
                     cu_seqlens = batch["cu_seqlens"].to(device)
                     doc_lang_ids = batch["doc_lang_ids"].to(device)
+                    doc_style_ids = batch.get("doc_style_ids")
+                    doc_style_ids_t = doc_style_ids.to(device) if doc_style_ids is not None else None
+                    doc_pts = batch.get("doc_ponder_tax_scale")
+                    doc_pts_t = doc_pts.to(device) if doc_pts is not None else None
                     byte_lang_ids = batch["byte_lang_ids"].to(device)
                     loss_mask = batch["loss_mask"].to(device)
                     wug_target_mask = batch["wug_target_mask"].to(device)
@@ -724,6 +833,8 @@ def run_training(
                         out = model(
                             raw_bytes=x_bytes.unsqueeze(0),
                             lang_ids=doc_lang_ids,
+                            style_ids=doc_style_ids_t,
+                            ponder_tax_scale=doc_pts_t,
                             stage=sc.model_stage,
                             tau_s=eff_tau_s,
                             tau_m=eff_tau_m,
@@ -1002,7 +1113,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--config", type=str, default=str(DEFAULT_CONFIG_PATH) if DEFAULT_CONFIG_PATH.exists() else None)
     ap.add_argument(
         "--preset",
-        choices=["micro", "tiny", "proto_48m", "48m", "base", "standard_152m", "152m"],
+        choices=["micro", "tiny", "proto_48m", "48m", "base", "standard_152m", "152m", "moe_210m", "210m"],
         default=None,
     )
     ap.add_argument("--total-steps", type=int, default=None)
@@ -1011,6 +1122,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--target-tokens-bytes-per-step", type=int, default=None)
     ap.add_argument("--micro-batch-bytes", type=int, default=None)
     ap.add_argument("--data-dir", type=str, default="artifacts/data")
+    ap.add_argument("--cap-data-dir", type=str, default=None, help="Optional Stage 3 capability shards dir (cap_reasoning/writing)")
     ap.add_argument("--ckpt-dir", type=str, default=None)
     ap.add_argument("--logs-dir", type=str, default=None)
     ap.add_argument("--export-dir", type=str, default=None)
@@ -1026,6 +1138,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--heartbeat-seconds", type=float, default=60.0)
     ap.add_argument("--resume", type=str, default="auto")
     ap.add_argument("--device", type=str, default="auto")
+    ap.add_argument(
+        "--compile-mode",
+        choices=["none", "auto", "reduce-overhead"],
+        default=None,
+        help="Selective torch.compile on static-shape hotspots (auto-falls back to none on cpu/mps).",
+    )
     ap.add_argument("--deterministic", action="store_true")
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--max-consecutive-meltdowns", type=int, default=3)
@@ -1048,6 +1166,7 @@ def main() -> None:
             target_tokens_bytes_per_step=args.target_tokens_bytes_per_step,
             micro_batch_bytes=args.micro_batch_bytes,
             data_dir=args.data_dir,
+            cap_data_dir=args.cap_data_dir,
             ckpt_dir=args.ckpt_dir,
             logs_dir=args.logs_dir,
             export_dir=args.export_dir,
@@ -1063,6 +1182,7 @@ def main() -> None:
             heartbeat_seconds=args.heartbeat_seconds,
             resume=args.resume,
             device_str=args.device,
+            compile_mode=args.compile_mode,
             deterministic=args.deterministic,
             seed=args.seed,
             max_consecutive_meltdowns=args.max_consecutive_meltdowns,

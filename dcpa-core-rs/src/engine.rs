@@ -896,7 +896,27 @@ impl DcpaEngine {
     ///   - `scratch.pmd_delta_syn [d_s]`
     ///   - `scratch.pmd_f_out [d_s]`
     /// Returns `(rho_out, queue_done)`. Strictly ZERO heap allocation!
+    /// Construct orthogonal 64D register control vector:
+    /// l_reg = [RMSNorm_32(lang_embed[lang_id]) || RMSNorm_32(style_embed[style_id])]
+    #[inline]
+    fn build_l_reg(&self, lang_id: usize, style_id: usize) -> [f32; 64] {
+        let cfg = &self.weights.cfg;
+        let half = cfg.d_l / 2;
+        let mut out = [0.0f32; 64];
+        let lid = lang_id.min(cfg.num_lang_domains.saturating_sub(1));
+        let sid = style_id.min(cfg.num_style_domains.saturating_sub(1));
+        let l_slice = &self.weights.pmd_lang_embed[lid * half..(lid + 1) * half];
+        let s_slice = &self.weights.pmd_style_embed[sid * half..(sid + 1) * half];
+        rmsnorm_f32(l_slice, &self.weights.pmd_norm_lang, cfg.eps, &mut out[..half]);
+        rmsnorm_f32(s_slice, &self.weights.pmd_norm_style, cfg.eps, &mut out[half..half * 2]);
+        out
+    }
+
     pub fn broca_cq_step_and_retrieve(&mut self, lang_id: usize) -> (f32, bool) {
+        self.broca_cq_step_and_retrieve_styled(lang_id, 0)
+    }
+
+    pub fn broca_cq_step_and_retrieve_styled(&mut self, lang_id: usize, style_id: usize) -> (f32, bool) {
         let cfg = &self.weights.cfg;
         let k = cfg.k_slots;
         let d = cfg.d_concept;
@@ -904,8 +924,8 @@ impl DcpaEngine {
         let d_l = cfg.d_l;
         let d_s = cfg.d_s;
 
-        let l_off = lang_id * d_l;
-        let l_reg = &self.weights.pmd_lang_embed[l_off..l_off + d_l];
+        let l_reg_arr = self.build_l_reg(lang_id, style_id);
+        let l_reg = &l_reg_arr[..d_l];
 
         // 1. Edge precedence matrix P^{ord}_{i,j}(l_reg) = tanh((W_ord l_reg)^T A_{i,j})
         linear_f32(l_reg, &self.weights.pmd_w_ord, None, &mut self.scratch.vec_dr_a);
@@ -1048,14 +1068,24 @@ impl DcpaEngine {
     /// Writes logits into `scratch.logits_256`. Returns `(greedy_byte, charge_e, p_seg_end)`.
     /// Strictly ZERO heap allocation!
     pub fn pmd_step_byte(&mut self, prev_byte: u8, lang_id: usize, tau_step: usize) -> (u8, f32, f32) {
+        self.pmd_step_byte_styled(prev_byte, lang_id, 0, tau_step)
+    }
+
+    pub fn pmd_step_byte_styled(
+        &mut self,
+        prev_byte: u8,
+        lang_id: usize,
+        style_id: usize,
+        tau_step: usize,
+    ) -> (u8, f32, f32) {
         let cfg = &self.weights.cfg;
         let d_s = cfg.d_s;
         let d_l = cfg.d_l;
 
         let u_off = (prev_byte as usize) * d_s;
         let u_prev = &self.weights.sgsc_embed[u_off..u_off + d_s];
-        let l_off = lang_id * d_l;
-        let l_reg = &self.weights.pmd_lang_embed[l_off..l_off + d_l];
+        let l_reg_arr = self.build_l_reg(lang_id, style_id);
+        let l_reg = &l_reg_arr[..d_l];
 
         // 1. RoPE inverse phase demodulation: d_stem = R_Theta(-tau)(U_demod f_out)
         linear_f32(&self.scratch.pmd_f_out, &self.weights.pmd_u_demod, None, &mut self.scratch.vec_ds_a);

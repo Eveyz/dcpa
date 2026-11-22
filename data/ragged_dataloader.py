@@ -24,19 +24,22 @@ from torch.utils.data import DataLoader, Dataset, Sampler, get_worker_info
 
 from data.wug_generator import sample_wug_episode_fast
 
-# Exact 16-byte little-endian structured record layout for {split}.idx
+# Exact 16-byte little-endian structured record layout for {split}.idx (Spec 3.2: 100% backward-compatible!)
+# Old `<QIBBH` files with max_depth in 0..16 store 0x00 in byte 15, which reads cleanly as style_id=0 (neutral).
 IDX_DTYPE = np.dtype(
     [
         ("offset", "<u8"),     # uint64 byte start offset in .bin
         ("length", "<u4"),     # uint32 exact UTF-8 byte length (> 0)
         ("lang_id", "<u1"),    # uint8 domain ID in 0..4 (0=en, 1=zh, 2=ja, 3=python, 4=rust)
-        ("source_id", "<u1"),  # uint8 sub-source identifier
-        ("max_depth", "<u2"),  # uint16 max bracket depth (0 for natural language, 1..16 for code)
+        ("source_id", "<u1"),  # uint8 sub-source identifier (11 = latent implicit reasoning -> ponder_tax_scale=0.0)
+        ("max_depth", "<u1"),  # uint8 max bracket depth (0 for natural language, 1..16 for code)
+        ("style_id", "<u1"),   # uint8 style subspace ID (0=neutral, 1=memo, 2=expository, 3=narrative, 4=strict_code_tool)
     ]
 )
-IDX_RECORD_FMT = "<QIBBH"
+IDX_RECORD_FMT = "<QIBBBB"
 IDX_RECORD_SIZE = int(IDX_DTYPE.itemsize)  # 16 bytes
 assert IDX_RECORD_SIZE == 16
+LATENT_REASONING_SOURCE_ID = 11
 
 
 def assert_not_drive_mmap(path: str | Path) -> None:
@@ -259,19 +262,27 @@ class RaggedByteDataset(Dataset):
         offsets = np.array(idx_mm["offset"], dtype=np.int64, copy=True)
         lengths = np.array(idx_mm["length"], dtype=np.int64, copy=True)
         lang_ids = np.array(idx_mm["lang_id"], dtype=np.int64, copy=True)
+        source_ids = np.array(idx_mm["source_id"], dtype=np.int64, copy=True)
+        style_ids = np.array(idx_mm["style_id"], dtype=np.int64, copy=True)
         del idx_mm
 
         self.num_docs = int(len(offsets))
         self._offsets = offsets
         self._lengths = lengths
         self._lang_ids = lang_ids
+        self._source_ids = source_ids
+        self._style_ids = style_ids
 
         self._lang_offsets: dict[int, np.ndarray] = {}
         self._lang_lengths: dict[int, np.ndarray] = {}
+        self._lang_sources: dict[int, np.ndarray] = {}
+        self._lang_styles: dict[int, np.ndarray] = {}
         for lid in sorted(set(lang_ids.tolist())):
             mask = lang_ids == lid
             self._lang_offsets[int(lid)] = offsets[mask]
             self._lang_lengths[int(lid)] = lengths[mask]
+            self._lang_sources[int(lid)] = source_ids[mask]
+            self._lang_styles[int(lid)] = style_ids[mask]
 
         self._langs, self._cum_weights = _normalize_domain_weights(
             list(self._lang_offsets.keys()), domain_weights
@@ -320,6 +331,8 @@ class RaggedByteDataset(Dataset):
         byte_langs = np.empty(total_t, dtype=np.int64)
         cu_seqlens = np.empty(n_docs + 1, dtype=np.int32)
         doc_langs = np.empty(n_docs, dtype=np.int64)
+        doc_styles = np.empty(n_docs, dtype=np.int64)
+        doc_pts = np.ones(n_docs, dtype=np.float32)
         is_doc_start = np.zeros(total_t, dtype=np.bool_)
 
         cu_seqlens[0] = 0
@@ -327,10 +340,14 @@ class RaggedByteDataset(Dataset):
         for i, (doc_idx, w_start, seg_len) in enumerate(specs):
             off = int(self._offsets[doc_idx]) + w_start
             lid = int(self._lang_ids[doc_idx])
+            sid = int(self._style_ids[doc_idx])
+            src = int(self._source_ids[doc_idx])
             x_buf[cursor : cursor + seg_len] = mm[off : off + seg_len]
             byte_langs[cursor : cursor + seg_len] = lid
             is_doc_start[cursor] = True
             doc_langs[i] = lid
+            doc_styles[i] = sid
+            doc_pts[i] = 0.0 if src == LATENT_REASONING_SOURCE_ID else 1.0
             cursor += seg_len
             cu_seqlens[i + 1] = cursor
 
@@ -339,6 +356,8 @@ class RaggedByteDataset(Dataset):
             "cu_seqlens": torch.from_numpy(cu_seqlens),
             "is_doc_start": torch.from_numpy(is_doc_start),
             "doc_lang_ids": torch.from_numpy(doc_langs),
+            "doc_style_ids": torch.from_numpy(doc_styles),
+            "doc_ponder_tax_scale": torch.from_numpy(doc_pts),
             "byte_lang_ids": torch.from_numpy(byte_langs),
             "loss_mask": torch.ones(total_t, dtype=torch.bool),
             "wug_target_mask": torch.zeros(total_t, dtype=torch.bool),
@@ -362,11 +381,15 @@ class RaggedByteDataset(Dataset):
 
         cu_list: list[int] = [0]
         doc_lang_list: list[int] = []
+        doc_style_list: list[int] = []
+        doc_pts_list: list[float] = []
 
         cursor = 0
         # Pre-bind hot attributes to locals for maximum Python loop speed
         lang_offsets = self._lang_offsets
         lang_lengths = self._lang_lengths
+        lang_sources = self._lang_sources
+        lang_styles = self._lang_styles
         langs = self._langs
         cum_weights = self._cum_weights
         n_langs = len(langs)
@@ -399,6 +422,8 @@ class RaggedByteDataset(Dataset):
                     loss_mask[cursor : cursor + t1_len] = False
                     wug_mask[cursor + tgt_s : cursor + tgt_e] = True
                     doc_lang_list.append(lid)
+                    doc_style_list.append(0)
+                    doc_pts_list.append(1.0)
                     cursor += ep_len
                     cu_list.append(cursor)
                     continue
@@ -408,6 +433,8 @@ class RaggedByteDataset(Dataset):
 
             offs = lang_offsets[lid]
             lens = lang_lengths[lid]
+            srcs = lang_sources[lid]
+            stys = lang_styles[lid]
             d_i = randrange_fn(len(offs))
             off = int(offs[d_i])
             doc_len = int(lens[d_i])
@@ -443,12 +470,16 @@ class RaggedByteDataset(Dataset):
             x_buf[cursor : cursor + seg_len] = doc_view[w_start:w_end]
             byte_langs[cursor : cursor + seg_len] = lid
             doc_lang_list.append(lid)
+            doc_style_list.append(int(stys[d_i]))
+            doc_pts_list.append(0.0 if int(srcs[d_i]) == LATENT_REASONING_SOURCE_ID else 1.0)
             cursor += seg_len
             cu_list.append(cursor)
 
         total_t = cursor
         cu_arr = np.asarray(cu_list, dtype=np.int32)
         doc_lang_arr = np.asarray(doc_lang_list, dtype=np.int64)
+        doc_style_arr = np.asarray(doc_style_list, dtype=np.int64)
+        doc_pts_arr = np.asarray(doc_pts_list, dtype=np.float32)
         is_doc_start = np.zeros(total_t, dtype=np.bool_)
         if len(cu_arr) > 1:
             is_doc_start[cu_arr[:-1]] = True
@@ -458,6 +489,8 @@ class RaggedByteDataset(Dataset):
             "cu_seqlens": torch.from_numpy(cu_arr),
             "is_doc_start": torch.from_numpy(is_doc_start),
             "doc_lang_ids": torch.from_numpy(doc_lang_arr),
+            "doc_style_ids": torch.from_numpy(doc_style_arr),
+            "doc_ponder_tax_scale": torch.from_numpy(doc_pts_arr),
             "byte_lang_ids": torch.from_numpy(byte_langs[:total_t].copy()),
             "loss_mask": torch.from_numpy(loss_mask[:total_t].copy()),
             "wug_target_mask": torch.from_numpy(wug_mask[:total_t].copy()),

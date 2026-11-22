@@ -21,13 +21,15 @@ model:
   s_active: 32
   d_l: 64
   num_lang_domains: 6
+  num_style_domains: 5
   num_experts: 8
   top_k_experts: 2
   expert_hidden: 1728
-  l_max: 4
+  l_max: 8
   tau_skip: 0.65
   tau_halt: 0.35
   ponder_eta: 0.5
+  lambda_moe_bal: 0.01
   max_seg_len: 16
   target_spike_rate: 0.10526315789473684  # 1 / 9.5 (rho_target = 9.5)
   lambda_rate: 2.0
@@ -54,7 +56,8 @@ presets:
     num_experts: 8
     top_k_experts: 2
     expert_hidden: 1728
-    l_max: 4
+    l_max: 8
+    lambda_moe_bal: 0.01
   standard_152m:
     d_s: 192
     d_concept: 768
@@ -67,7 +70,22 @@ presets:
     num_experts: 16
     top_k_experts: 2
     expert_hidden: 1920
-    l_max: 4
+    l_max: 8
+    lambda_moe_bal: 0.01
+  moe_210m:
+    d_s: 192
+    d_concept: 768
+    k_slots: 8
+    d_r: 32
+    d_merge: 256
+    d_h: 4096
+    s_active: 32
+    d_l: 64
+    num_experts: 32
+    top_k_experts: 2
+    expert_hidden: 1344
+    l_max: 8
+    lambda_moe_bal: 0.01
   micro:
     d_s: 64
     d_concept: 128
@@ -88,6 +106,9 @@ hardware:
   allow_tf32: true
   bf16_autocast: true                   # CUDA only; safely falls back to pure float32 on MPS/CPU
   use_grad_scaler: false                # RED LINE #1: NEVER enable GradScaler with bf16!
+  compile_mode: auto                    # none | auto | reduce-overhead (auto-falls back to none on cpu/mps)
+  compile_doc_bucket_size: 16           # Pad N_docs up to multiples of 16 to eliminate Dynamo recompiles
+  compile_cache_size_limit: 64          # torch._dynamo.config.cache_size_limit
   fp32_precision_islands:
     - sgsc_diag_scan_prior_log_softmax_and_lif_membrane
     - holographic_rope_forward_and_inverse_phase_rotation
@@ -192,6 +213,7 @@ curriculum:
     code_delimiter_focal_weight: 1.5
     code_delimiter_chars: "{}()[]:;\n"
     broca_cq_prob: 0.5
+    cap_mix_ratio: 0.35
   stage4:
     name: hippocampal_oneshot_meta_plasticity
     model_stage: D

@@ -55,10 +55,11 @@ class DCPAConfig:
     num_experts: int = 16
     top_k_experts: int = 2
     expert_hidden: int = 1152
-    l_max: int = 4
+    l_max: int = 8
     tau_skip: float = 0.65
     tau_halt: float = 0.35
     ponder_eta: float = 0.5
+    lambda_moe_bal: float = 0.01
 
     # SGSC LIF spike gate & segment bounds
     lif_lambda: float = 0.85
@@ -74,9 +75,10 @@ class DCPAConfig:
     # Slot salience conservation
     delta_decay: float = 0.05
 
-    # PMD pragmatic motor decoder
+    # PMD pragmatic motor decoder (32D lang ⊕ 32D style = 64D orthogonal register vector)
     d_l: int = 64
     num_lang_domains: int = 6
+    num_style_domains: int = 5
     stack_depth: int = 16
     stack_tag_dim: int = 4
     tau_e: float = 0.5
@@ -151,7 +153,34 @@ class DCPAConfig:
             num_experts=16,
             top_k_experts=2,
             expert_hidden=1920,
-            l_max=4,
+            l_max=8,
+        )
+
+    @classmethod
+    def moe_210m(cls) -> DCPAConfig:
+        """DCPA-210M Sparse Micro-MoE Preset (32 experts Top-2 active, ~210M total / ~22-24M active)."""
+        return cls(
+            d_s=192,
+            d_concept=768,
+            k_slots=8,
+            d_r=32,
+            d_merge=256,
+            d_h=4096,
+            s_active=32,
+            d_l=64,
+            num_experts=32,
+            top_k_experts=2,
+            expert_hidden=1344,
+            l_max=8,
+            lambda_moe_bal=0.01,
+            target_spike_rate=1.0 / 9.5,
+            lambda_rate=2.0,
+            lambda_var=1.0,
+            lambda_halt=1.0,
+            lambda_act=0.04,
+            lr_micro=5e-4,
+            lr_concept=4e-4,
+            lr_scalar_gate=1.0e-3,
         )
 
     @classmethod
@@ -169,7 +198,8 @@ class DCPAConfig:
             num_experts=8,
             top_k_experts=2,
             expert_hidden=1728,
-            l_max=4,
+            l_max=8,
+            lambda_moe_bal=0.01,
             target_spike_rate=1.0 / 9.5,
             lambda_rate=2.0,
             lambda_var=1.0,

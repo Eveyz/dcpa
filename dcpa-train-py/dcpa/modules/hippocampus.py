@@ -268,6 +268,35 @@ class ColumnMajorFastWeights:
         self.col_step_lex = torch.zeros((d_h,), device=self.device, dtype=torch.int64)
         self.col_step_sem = torch.zeros((d_h,), device=self.device, dtype=torch.int64)
 
+    def clone_snapshot(self) -> ColumnMajorFastWeights:
+        """Deep-copy all column-major fast weights & counters (used for M_tools_base snapshots)."""
+        snap = ColumnMajorFastWeights(
+            d_h=self.d_h,
+            d_concept=self.d_concept,
+            d_s=self.d_s,
+            gamma_hip=self.gamma_hip,
+            storage_dtype=self.storage_dtype,
+            device=self.device,
+        )
+        snap.m_c_from_l.copy_(self.m_c_from_l)
+        snap.m_l_from_c.copy_(self.m_l_from_c)
+        snap.u_lex.copy_(self.u_lex)
+        snap.u_sem.copy_(self.u_sem)
+        snap.col_step_lex.copy_(self.col_step_lex)
+        snap.col_step_sem.copy_(self.col_step_sem)
+        snap.step_count = int(self.step_count)
+        return snap
+
+    def restore_from(self, snap: ColumnMajorFastWeights) -> None:
+        """In-place restore all fast weight matrices & counters from a saved snapshot."""
+        self.m_c_from_l.copy_(snap.m_c_from_l)
+        self.m_l_from_c.copy_(snap.m_l_from_c)
+        self.u_lex.copy_(snap.u_lex)
+        self.u_sem.copy_(snap.u_sem)
+        self.col_step_lex.copy_(snap.col_step_lex)
+        self.col_step_sem.copy_(snap.col_step_sem)
+        self.step_count = int(snap.step_count)
+
     def advance_step(self) -> None:
         self.step_count += 1
 
@@ -474,6 +503,7 @@ class HippocampusDualMemory(nn.Module):
         mean_info: torch.Tensor,
         fast_state: Optional[HippocampusStateType] = None,
         enabled: bool = True,
+        ach_override: Optional[float] = None,
     ) -> HippocampusReadOutput:
         """Comprehension-side routing & ACh novelty gate (forced float32 familiarity & routing).
 
@@ -483,6 +513,7 @@ class HippocampusDualMemory(nn.Module):
           sem_norm:  [B] float32 ||W_sem f_m||_2
           mean_info: [B] float32 mean segment surprisal I_bar_m
           fast_state: HippocampusStateType (if None or not enabled, behaves as Stage B/C cortical pass-through)
+          ach_override: optional float override for ACh (e.g. `0.0` during tool observation injection -> pi_bu = pi_cort)
         """
         orig_dtype = c_slow.dtype
         # Precision Island #5 (Red Line #1): DG orthogonal sparse read, familiarity, & ACh gating in fp32
@@ -512,6 +543,8 @@ class HippocampusDualMemory(nn.Module):
             )  # [B] fp32
             gamma_hip = fast_state.read_familiarity_lex(psi_idx, psi_val)  # [B] fp32
             ach = (1.0 - gamma_slow) * (1.0 - gamma_hip)  # [B] fp32
+            if ach_override is not None:
+                ach = torch.full_like(ach, float(ach_override))
 
             c_hip = fast_state.read_c_from_l(psi_idx, psi_val)  # [B, D] fp32
             mu = gamma_hip / (gamma_slow + gamma_hip + self.cfg.eps)  # [B] fp32

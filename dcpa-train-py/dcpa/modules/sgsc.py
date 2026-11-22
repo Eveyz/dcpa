@@ -86,7 +86,71 @@ class SGSC(nn.Module):
         self.w_sem = nn.Linear(d_s, D, bias=False)
         self.norm_c = RMSNorm(D, eps=cfg.eps)
 
+        self._compiled_byte_scan = None
         self._init_weights()
+
+    def enable_compiled_byte_scan(self, **compile_kwargs) -> None:
+        """Compile Hotspot B1: static-shape per-byte gated projections + chunked diag scan + prior."""
+        self._compiled_byte_scan = torch.compile(self._byte_scan_impl, **compile_kwargs)
+
+    def _byte_scan_impl(
+        self,
+        raw_bytes: torch.Tensor,
+        h_start: torch.Tensor,
+        doc_reset_mask: Optional[torch.Tensor] = None,
+        max_span: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Hotspot B1: Static-shape per-byte embedding, diagonal scan, and cosine causal prior."""
+        B, T = raw_bytes.shape
+        device = raw_bytes.device
+        d_s = self.cfg.d_s
+
+        byte_ids = raw_bytes.to(dtype=torch.long)
+        u = self.embed(byte_ids)  # [B, T, d_s]
+        alpha = torch.sigmoid(self.w_alpha(u))  # [B, T, d_s]
+        b_inj = (1.0 - alpha) * F.silu(self.w_u(u))  # [B, T, d_s]
+
+        # Precision Island #1 (Red Line #1): SGSC diagonal recurrence scan & causal byte prior in fp32
+        with fp32_island(device):
+            h_seq_f = parallel_diag_scan(
+                alpha.float(),
+                b_inj.float(),
+                h0=h_start.float(),
+                reset_mask=doc_reset_mask,
+                max_span=max_span,
+            )  # [B, T, d_s] fp32
+
+            if h_start.ndim == 1:
+                h0_col = h_start.float().view(1, 1, d_s).expand(B, 1, d_s)
+            else:
+                h0_col = h_start.float().unsqueeze(1)
+            if T > 1:
+                h_prev = torch.cat([h0_col, h_seq_f[:, :-1, :]], dim=1)
+            else:
+                h_prev = h0_col
+
+            if doc_reset_mask is not None:
+                h_prev = torch.where(doc_reset_mask.unsqueeze(-1), h0_col.expand(B, T, d_s), h_prev)
+
+            h_prev_f = h_prev.float()
+            h_prev_n = h_prev_f * torch.rsqrt(h_prev_f.pow(2).sum(dim=-1, keepdim=True) + 1e-2)
+            w_out_f = self.w_out.weight.float()
+            w_out_n = w_out_f * torch.rsqrt(w_out_f.pow(2).sum(dim=-1, keepdim=True) + 1e-6)
+            prior_logits = F.linear(h_prev_n, w_out_n) * 8.0  # [B, T, 256] fp32
+            log_probs = F.log_softmax(prior_logits, dim=-1)
+            prior_probs = log_probs.exp()
+            info = -log_probs.gather(-1, byte_ids.unsqueeze(-1)).squeeze(-1)  # [B, T] fp32 >= 0
+
+            if T > 1:
+                dinfo_tail = F.relu(info[:, 1:] - info[:, :-1])
+                delta_info = torch.cat([torch.zeros((B, 1), device=device, dtype=torch.float32), dinfo_tail], dim=1)
+            else:
+                delta_info = torch.zeros((B, T), device=device, dtype=torch.float32)
+
+            if doc_reset_mask is not None:
+                delta_info = torch.where(doc_reset_mask, torch.zeros_like(delta_info), delta_info)
+
+        return h_seq_f.to(u.dtype), prior_logits, prior_probs, info, delta_info
 
     def _init_weights(self) -> None:
         # Unit-scale byte embeddings align SGSC h_seq magnitude with RMSNormed PMD m_seq
@@ -133,65 +197,49 @@ class SGSC(nn.Module):
                 doc_reset_mask[0, starts] = True
                 doc_max_span = int((ends - starts).max().item())
 
-        # 1. Parallel byte embedding & diagonal recurrence inputs
-        byte_ids = raw_bytes.to(dtype=torch.long)
-        u = self.embed(byte_ids)  # [B, T, d_s]
-        alpha = torch.sigmoid(self.w_alpha(u))  # [B, T, d_s]
-        b_inj = (1.0 - alpha) * F.silu(self.w_u(u))  # [B, T, d_s]
-
         h_start = self.h0 if h_init is None else h_init
-        # Precision Island #1 (Red Line #1): SGSC diagonal recurrence scan, causal byte prior
-        # log_softmax self-information I_t, and LIF membrane potential integral v_tilde in pure fp32!
+        # 1-3. Hotspot B1: per-byte projections + O(log T) diagonal scan + strictly causal prior
+        if self._compiled_byte_scan is not None and T > 0:
+            # Align T up to chunk multiple (256) strictly inside Hotspot B1 (with reset_mask=True on
+            # tail and immediate slice [:T]) so compiled dynamic=False sees constant static shapes!
+            pad = (256 - (T % 256)) % 256
+            if pad > 0:
+                rb_in = torch.cat([raw_bytes, torch.zeros((B, pad), device=device, dtype=raw_bytes.dtype)], dim=1)
+                if doc_reset_mask is not None:
+                    rm_in = torch.cat([doc_reset_mask, torch.ones((B, pad), device=device, dtype=torch.bool)], dim=1)
+                else:
+                    rm_in = torch.cat(
+                        [
+                            torch.zeros((B, T), device=device, dtype=torch.bool),
+                            torch.ones((B, pad), device=device, dtype=torch.bool),
+                        ],
+                        dim=1,
+                    )
+            else:
+                rb_in = raw_bytes
+                rm_in = (
+                    doc_reset_mask
+                    if doc_reset_mask is not None
+                    else torch.zeros((B, T), device=device, dtype=torch.bool)
+                )
+            h_seq_p, prior_logits_p, prior_probs_p, info_p, delta_info_p = self._compiled_byte_scan(
+                rb_in, h_start, rm_in, None
+            )
+            h_seq = h_seq_p[:, :T, :]
+            prior_logits = prior_logits_p[:, :T, :]
+            prior_probs = prior_probs_p[:, :T, :]
+            info = info_p[:, :T]
+            delta_info = delta_info_p[:, :T]
+        else:
+            h_seq, prior_logits, prior_probs, info, delta_info = self._byte_scan_impl(
+                raw_bytes, h_start, doc_reset_mask, doc_max_span
+            )
+
+        # 4. LIF membrane potential scan + UTF-8 & maxSegLen=16 & doc-boundary guard in float32
         with fp32_island(device):
-            # 2. Parallel Associative Scan (O(log T) depth, strictly reset at every doc_cu_seqlens boundary)
-            h_seq = parallel_diag_scan(
-                alpha.float(),
-                b_inj.float(),
-                h0=h_start.float(),
-                reset_mask=doc_reset_mask,
-                max_span=doc_max_span,
-            )  # [B, T, d_s] fp32
-
-            # 3. Strictly causal shifted state [h_0, h_1, ..., h_{T-1}] -> prior p_t in float32
-            if h_start.ndim == 1:
-                h0_col = h_start.float().view(1, 1, d_s).expand(B, 1, d_s)
-            else:
-                h0_col = h_start.float().unsqueeze(1)
-            if T > 1:
-                h_prev = torch.cat([h0_col, h_seq[:, :-1, :]], dim=1)
-            else:
-                h_prev = h0_col
-
-            if doc_reset_mask is not None:
-                h_prev = torch.where(doc_reset_mask.unsqueeze(-1), h0_col.expand(B, T, d_s), h_prev)
-
-            # Scale-invariant cosine prior on strictly weight-tied W_out: decouples PMD logit-norm
-            # growth from SGSC byte surprisal I_t, eliminating late-stage spike boundary churn!
-            # Smooth +1e-2 denominator on h_prev prevents gradient singularity at zero-initialized h_0.
-            h_prev_f = h_prev.float()
-            h_prev_n = h_prev_f * torch.rsqrt(h_prev_f.pow(2).sum(dim=-1, keepdim=True) + 1e-2)
-            w_out_f = self.w_out.weight.float()
-            w_out_n = w_out_f * torch.rsqrt(w_out_f.pow(2).sum(dim=-1, keepdim=True) + 1e-6)
-            prior_logits = F.linear(h_prev_n, w_out_n) * 8.0  # [B, T, 256] fp32
-            log_probs = F.log_softmax(prior_logits, dim=-1)
-            prior_probs = log_probs.exp()
-            info = -log_probs.gather(-1, byte_ids.unsqueeze(-1)).squeeze(-1)  # [B, T] fp32 >= 0
-
-            # Strictly causal surprisal jump: Delta_I_0 = 0 (and 0 at every doc_start!), Delta_I_t = max(0, I_t - I_{t-1})
-            if T > 1:
-                dinfo_tail = F.relu(info[:, 1:] - info[:, :-1])
-                delta_info = torch.cat([torch.zeros((B, 1), device=device, dtype=torch.float32), dinfo_tail], dim=1)
-            else:
-                delta_info = torch.zeros((B, T), device=device, dtype=torch.float32)
-
-            if doc_reset_mask is not None:
-                delta_info = torch.where(doc_reset_mask, torch.zeros_like(delta_info), delta_info)
-
-            # 4. LIF membrane potential scan + UTF-8 & maxSegLen=16 & doc-boundary guard in float32
             theta_eff = self.theta
             if forced_spikes is not None:
                 spikes = forced_spikes.bool().to(device)
-                # Still compute differentiable v_tilde with resets at forced_spikes & doc starts
                 drive = self.cfg.lif_beta1 * info + self.cfg.lif_beta2 * delta_info
                 if T > 1:
                     prev_s = torch.cat([torch.zeros((B, 1), device=device, dtype=torch.bool), spikes[:, :-1]], dim=1)
@@ -221,8 +269,6 @@ class SGSC(nn.Module):
             # STE surrogate spikes (Commandment #6)
             s_tilde = torch.sigmoid((v_tilde - theta_eff) / max(tau_s, 1e-4))
             s_ste = (spikes.float() - s_tilde).detach() + s_tilde
-
-        h_seq = h_seq.to(u.dtype)
 
         # 5. Zero-padding Ragged cu_seqlens aggregation & Holographic RoPE phase binding
         cu_seqlens, seg_counts = build_cu_seqlens(spikes)

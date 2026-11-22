@@ -849,7 +849,7 @@ def build_corpus(
             if acc.val_bytes < acc.val_target and (bucket_hit or acc.train_bytes >= acc.train_target):
                 val_bin.write(doc_bytes)
                 val_idx.write(
-                    struct.pack(IDX_RECORD_FMT, val_offset, rec_len, acc.lang_id, source_id, max_depth)
+                    struct.pack(IDX_RECORD_FMT, val_offset, rec_len, acc.lang_id, source_id, min(max_depth, 255), 0)
                 )
                 val_offset += rec_len
                 val_docs_total += 1
@@ -858,7 +858,7 @@ def build_corpus(
             elif acc.train_bytes < acc.train_target:
                 train_bin.write(doc_bytes)
                 train_idx.write(
-                    struct.pack(IDX_RECORD_FMT, train_offset, rec_len, acc.lang_id, source_id, max_depth)
+                    struct.pack(IDX_RECORD_FMT, train_offset, rec_len, acc.lang_id, source_id, min(max_depth, 255), 0)
                 )
                 train_offset += rec_len
                 train_docs_total += 1

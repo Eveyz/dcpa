@@ -28,8 +28,40 @@ import torch.nn.functional as F
 from dcpa.config import DCPAConfig
 from dcpa.modules.bcg_pc import ConceptGraphState
 from dcpa.ops.ragged import ragged_local_offsets, ragged_segment_cumsum
+from dcpa.ops.rmsnorm import RMSNorm
 from dcpa.ops.rope import apply_holographic_rope
 from dcpa.ops.scan import parallel_diag_scan, parallel_stack_scan
+
+
+def _compute_multi_frame_stack_reset(
+    target_bytes: torch.Tensor,
+    prev_bytes: torch.Tensor,
+    doc_reset_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Vectorized Spec 1 PMD 128B stack reset mask:
+      reset_t = is_doc_start[t] | (x_{t-1} in {0x04, 0x13, 0x1E}) | (x_{t-3:t} == b"\\x1dE\\n")
+    """
+    B, T = target_bytes.shape
+    device = target_bytes.device
+    ctrl_single = (prev_bytes == 0x04) | (prev_bytes == 0x13) | (prev_bytes == 0x1E)
+    if T >= 3:
+        rb = target_bytes.to(dtype=torch.long)
+        z2 = torch.zeros((B, 2), device=device, dtype=torch.long)
+        z3 = torch.zeros((B, 3), device=device, dtype=torch.long)
+        prev2 = torch.cat([z2, rb[:, :-2]], dim=1)
+        prev3 = torch.cat([z3, rb[:, :-3]], dim=1)
+        scratch_end_hit = (prev3 == 0x1D) & (prev2 == ord("E")) & (prev_bytes == 0x0A)
+        if doc_reset_mask is not None:
+            drm = doc_reset_mask.bool()
+            drm_p1 = torch.cat([torch.zeros((B, 1), device=device, dtype=torch.bool), drm[:, :-1]], dim=1)
+            drm_p2 = torch.cat([torch.zeros((B, 2), device=device, dtype=torch.bool), drm[:, :-2]], dim=1)
+            scratch_end_hit = scratch_end_hit & ~(drm | drm_p1 | drm_p2)
+    else:
+        scratch_end_hit = torch.zeros((B, T), device=device, dtype=torch.bool)
+    frame_reset = ctrl_single | scratch_end_hit
+    if doc_reset_mask is not None:
+        return doc_reset_mask.bool() | frame_reset
+    return frame_reset
 
 
 @dataclass
@@ -69,8 +101,13 @@ class PMD(nn.Module):
         self.embed = shared_embed
         self.w_out = shared_w_out
 
-        # Language/register control vector lookup (64-dim: zh, en, ja, python, rust, synthetic)
-        self.lang_embed = nn.Embedding(cfg.num_lang_domains, d_l)
+        # Orthogonal 32D Language ⊕ 32D Style control vector l_reg in R^64 (Spec 3):
+        # l_reg = [RMSNorm_32(lang_embed(lang_id)) || RMSNorm_32(style_embed(style_id))]
+        d_l_half = d_l // 2
+        self.lang_embed = nn.Embedding(cfg.num_lang_domains, d_l_half)
+        self.style_embed = nn.Embedding(cfg.num_style_domains, d_l_half)
+        self.norm_lang = RMSNorm(d_l_half, eps=cfg.eps)
+        self.norm_style = RMSNorm(d_l_half, eps=cfg.eps)
 
         # 1. Broca Competitive Queuing (CQ) linearizer + IoR
         self.w_ord = nn.Linear(d_l, d_r, bias=False)  # 64 x 32 = 2048 params
@@ -98,10 +135,61 @@ class PMD(nn.Module):
         self.w_e_init = nn.Linear(2 * d_s + d_l, 1, bias=True)
         self.w_drain = nn.Linear(2 * d_s, 1, bias=True)
 
+        self._compiled_motor_scan = None
         self._init_weights()
 
+    def enable_compiled_motor_scan(self, **compile_kwargs) -> None:
+        """Compile Hotspot B2: 128B C=256 parallel stack scan + motor diagonal scan + byte logit head."""
+        self._compiled_motor_scan = torch.compile(self._motor_scan_impl, **compile_kwargs)
+
+    def _motor_scan_impl(
+        self,
+        u_prev: torch.Tensor,
+        d_drive: torch.Tensor,
+        l_reg_bt: torch.Tensor,
+        m_start: torch.Tensor,
+        xi_init: Optional[torch.Tensor] = None,
+        doc_reset_mask: Optional[torch.Tensor] = None,
+        stack_reset_mask: Optional[torch.Tensor] = None,
+        max_span: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Hotspot B2: Static-shape 128B chunked stack scan + O(log T) motor micro-core scan + logits."""
+        B, T, _ = u_prev.shape
+        # 2. 128B Differentiable Pushdown Stack via C=256 Chunked Parallel Associative Scan (fp32!)
+        # Resets at both `is_doc_start` AND the tick immediately following ASCII EOT `0x04`.
+        act_probs = F.softmax(self.w_act(torch.cat([u_prev, l_reg_bt], dim=-1)).float(), dim=-1)  # [B, T, 3]
+        p_push = act_probs[..., 0]
+        p_pop = act_probs[..., 1]
+        p_hold = act_probs[..., 2]
+        v_tag = torch.tanh(self.w_tag(u_prev).float())  # [B, T, 4]
+
+        eff_stack_reset = doc_reset_mask if stack_reset_mask is None else stack_reset_mask
+        stack_xi = parallel_stack_scan(
+            p_push,
+            p_pop,
+            p_hold,
+            v_tag,
+            xi_init=xi_init,
+            reset_mask=eff_stack_reset,
+            max_span=max_span,
+        )  # [B, T, 16, 4] fp32
+        xi_top2 = stack_xi[:, :, :2, :].reshape(B, T, 2 * self.cfg.stack_tag_dim).to(u_prev.dtype)
+
+        # 3. Weight-tied causal byte motor micro-core via O(log T) parallel associative scan
+        x_in = u_prev + d_drive + self.w_st(xi_top2)  # [B, T, d_s]
+        alpha_mot = torch.sigmoid(self.w_alpha_mot(x_in))
+        b_mot = (1.0 - alpha_mot) * F.silu(self.w_m(x_in))
+        m_seq = parallel_diag_scan(
+            alpha_mot, b_mot, h0=m_start, reset_mask=doc_reset_mask, max_span=max_span
+        )  # [B, T, d_s]
+
+        # Shared output classification head (float32 logits)
+        byte_logits = F.linear(m_seq.float(), self.w_out.weight.float())  # [B, T, 256] fp32
+        return byte_logits, stack_xi, m_seq
+
     def _init_weights(self) -> None:
-        nn.init.normal_(self.lang_embed.weight, std=0.1)
+        nn.init.normal_(self.lang_embed.weight, std=1.0)
+        nn.init.normal_(self.style_embed.weight, std=1.0)
         nn.init.xavier_uniform_(self.w_ord.weight)
         nn.init.xavier_uniform_(self.w_coh.weight)
         nn.init.xavier_uniform_(self.w_syn.weight)
@@ -118,8 +206,20 @@ class PMD(nn.Module):
         nn.init.constant_(self.w_e_init.bias, 2.5)
         nn.init.constant_(self.w_drain.bias, -0.5)
 
-    def get_lang_vec(self, lang_id: torch.Tensor) -> torch.Tensor:
-        return self.lang_embed(lang_id.long())
+    def get_lang_vec(
+        self,
+        lang_id: torch.Tensor,
+        style_id: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute orthogonal 64D register vector: [RMSNorm_32(lang) || RMSNorm_32(style)]."""
+        lid = lang_id.long().clamp(0, self.cfg.num_lang_domains - 1)
+        if style_id is None:
+            sid = torch.zeros_like(lid)
+        else:
+            sid = style_id.long().clamp(0, self.cfg.num_style_domains - 1)
+        lang_h = self.norm_lang(self.lang_embed(lid))
+        style_h = self.norm_style(self.style_embed(sid))
+        return torch.cat([lang_h, style_h], dim=-1)
 
     def compute_streaming_delta_syn(
         self,
@@ -261,31 +361,53 @@ class PMD(nn.Module):
         d_drive_flat = chi * d_stem_flat + (1.0 - chi) * delta_syn_flat  # [N, d_s]
         d_drive = d_drive_flat.view(B, T, d_s)
 
-        # 2. 128B Differentiable Pushdown Stack via O(log T) parallel associative scan (float32!)
+        # 2 & 3. Hotspot B2: 128B Chunked Parallel Stack Scan + Causal Byte Motor Micro-Core + Logits
+        # Spec 1 multi-frame isolation: reset 128B pushdown stack Xi_t at doc starts,
+        # after 0x04 / 0x13 / 0x1E, and immediately after `b"\x1dE\n"`.
+        full_stack_reset = _compute_multi_frame_stack_reset(target_bytes, prev_bytes, doc_reset_mask)
+        has_any_reset = bool(full_stack_reset.any().item()) if not torch.compiler.is_compiling() else True
+        stack_reset_mask = full_stack_reset if has_any_reset else doc_reset_mask
+
         l_reg_bt = l_reg[doc_id_flat].view(B, T, self.cfg.d_l)
-        act_probs = F.softmax(self.w_act(torch.cat([u_prev, l_reg_bt], dim=-1)).float(), dim=-1)  # [B, T, 3]
-        p_push = act_probs[..., 0]
-        p_pop = act_probs[..., 1]
-        p_hold = act_probs[..., 2]
-        v_tag = torch.tanh(self.w_tag(u_prev).float())  # [B, T, 4]
-
-        stack_xi = parallel_stack_scan(
-            p_push, p_pop, p_hold, v_tag, xi_init=xi_init, reset_mask=doc_reset_mask, max_span=doc_max_span
-        )  # [B, T, 16, 4] fp32
-        # Top-2 stack slice xi_t = vec(Xi_{t, 0:2}) in R^8
-        xi_top2 = stack_xi[:, :, :2, :].reshape(B, T, 2 * self.cfg.stack_tag_dim).to(u_prev.dtype)
-
-        # 3. Weight-tied causal byte motor micro-core via O(log T) Blelloch parallel scan
-        x_in = u_prev + d_drive + self.w_st(xi_top2)  # [B, T, d_s]
-        alpha_mot = torch.sigmoid(self.w_alpha_mot(x_in))
-        b_mot = (1.0 - alpha_mot) * F.silu(self.w_m(x_in))
         m_start = self.m0 if m_init is None else m_init
-        m_seq = parallel_diag_scan(
-            alpha_mot, b_mot, h0=m_start, reset_mask=doc_reset_mask, max_span=doc_max_span
-        )  # [B, T, d_s]
-
-        # Shared output classification head (float32 logits)
-        byte_logits = F.linear(m_seq.float(), self.w_out.weight.float())  # [B, T, 256] fp32
+        if self._compiled_motor_scan is not None and T > 0 and xi_init is None:
+            pad = (256 - (T % 256)) % 256
+            if pad > 0:
+                u_in = torch.cat([u_prev, torch.zeros((B, pad, d_s), device=device, dtype=u_prev.dtype)], dim=1)
+                d_in = torch.cat([d_drive, torch.zeros((B, pad, d_s), device=device, dtype=d_drive.dtype)], dim=1)
+                l_in = torch.cat([l_reg_bt, torch.zeros((B, pad, self.cfg.d_l), device=device, dtype=l_reg_bt.dtype)], dim=1)
+                if doc_reset_mask is not None:
+                    rm_in = torch.cat([doc_reset_mask, torch.ones((B, pad), device=device, dtype=torch.bool)], dim=1)
+                else:
+                    rm_in = torch.cat(
+                        [
+                            torch.zeros((B, T), device=device, dtype=torch.bool),
+                            torch.ones((B, pad), device=device, dtype=torch.bool),
+                        ],
+                        dim=1,
+                    )
+                if stack_reset_mask is not None:
+                    srm_in = torch.cat([stack_reset_mask, torch.ones((B, pad), device=device, dtype=torch.bool)], dim=1)
+                else:
+                    srm_in = rm_in
+            else:
+                u_in = u_prev
+                d_in = d_drive
+                l_in = l_reg_bt
+                rm_in = (
+                    doc_reset_mask
+                    if doc_reset_mask is not None
+                    else torch.zeros((B, T), device=device, dtype=torch.bool)
+                )
+                srm_in = stack_reset_mask if stack_reset_mask is not None else rm_in
+            logits_p, xi_p, m_p = self._compiled_motor_scan(u_in, d_in, l_in, m_start, None, rm_in, srm_in, None)
+            byte_logits = logits_p[:, :T, :]
+            stack_xi = xi_p[:, :T, :, :]
+            m_seq = m_p[:, :T, :]
+        else:
+            byte_logits, stack_xi, m_seq = self._motor_scan_impl(
+                u_prev, d_drive, l_reg_bt, m_start, xi_init, doc_reset_mask, stack_reset_mask, doc_max_span
+            )
 
         # 4. Dual Motor Charge Depletion Gate E_{n,tau} via segmented associative scan (zero float32 bleed!)
         seg_start_idx = cu_seqlens[:-1].to(torch.int64)
@@ -324,6 +446,7 @@ class PMD(nn.Module):
         m_prev: torch.Tensor,
         xi_prev: torch.Tensor,
         charge_prev: torch.Tensor,
+        extra_stack_reset: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Single-byte streaming motor step matching dcpa-core-rs 1-to-1!
 
@@ -336,6 +459,7 @@ class PMD(nn.Module):
           m_prev:    [B, d_s]
           xi_prev:   [B, 16, 4] float32
           charge_prev: [B] float32 E_{n, tau-1}
+          extra_stack_reset: optional [B] bool (e.g. set True immediately after `b"\\x1dE\\n"`)
 
         Returns:
           logits [B, 256] fp32, m_new [B, d_s], xi_new [B, 16, 4] fp32, charge_new [B] fp32, p_end [B] fp32
@@ -363,6 +487,12 @@ class PMD(nn.Module):
         v_tag = torch.tanh(self.w_tag(u_prev).float()).unsqueeze(1)  # [B, 1, 4]
 
         xi_f = xi_prev.float()
+        # Spec 1 multi-frame stack reset: 0x04 (EOT), 0x13 (tool suspend), 0x1E (user turn), or `\x1dE\n`
+        pb_l = prev_byte.long()
+        ctrl_reset = (pb_l == 0x04) | (pb_l == 0x13) | (pb_l == 0x1E)
+        if extra_stack_reset is not None:
+            ctrl_reset = ctrl_reset | extra_stack_reset.bool()
+        xi_f = torch.where(ctrl_reset.view(B, 1, 1), torch.zeros_like(xi_f), xi_f)
         pushed = torch.cat([v_tag, xi_f[:, :-1, :]], dim=1)
         zero_bot = torch.zeros((B, 1, self.cfg.stack_tag_dim), device=device, dtype=torch.float32)
         popped = torch.cat([xi_f[:, 1:, :], zero_bot], dim=1)
@@ -383,6 +513,9 @@ class PMD(nn.Module):
         charge_new = charge_prev.float() - drain
         p_end = torch.sigmoid(-charge_new / max(self.cfg.tau_e, 1e-4))
         return logits, m_new, xi_new, charge_new, p_end
+
+    # Explicit O(1) autoregressive single-byte shift alias (Performance Audit Task 1)
+    step_single_byte = step_byte_streaming
 
     def init_segment_charge(
         self,

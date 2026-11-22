@@ -38,6 +38,7 @@ from typing import Any, Mapping, Optional, Sequence
 import numpy as np
 import torch
 
+from dcpa.compile_utils import get_clean_state_dict, strip_orig_mod_prefix, unwrap_compiled_module
 from utils.device import capture_rng_state, restore_rng_state, seed_everything
 
 
@@ -572,7 +573,7 @@ class CheckpointManager:
         return {
             "step": int(step),
             "stage_id": int(stage_id),
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": get_clean_state_dict(model),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state": dict(scheduler_state),
             "dynamic_loss_multipliers": dict(dynamic_loss_multipliers),
@@ -633,8 +634,25 @@ class CheckpointManager:
         preserve_watchdog_repairs: bool = False,
         restore_rng: bool = True,
     ) -> tuple[int, dict[str, Any]]:
-        """Restore model, optimizer, curriculum, watchdog, RNG, and return `(step, dataloader_cursor)`."""
-        model.load_state_dict(ckpt["model_state_dict"])
+        """Restore model, optimizer, curriculum, watchdog, RNG, and return `(step, dataloader_cursor)`.
+
+        Strips any `_orig_mod.` prefixes and restores cleanly into either compiled or uncompiled
+        models with `strict=True` (Performance Audit Task 2.4).
+        """
+        clean_sd = strip_orig_mod_prefix(ckpt["model_state_dict"])
+        target_mod = unwrap_compiled_module(model)
+        # If individual submodules (e.g. model.bcg_pc) are compiled, unwrap temporarily for strict=True load
+        # or remap keys to match active submodule wrapper cleanly.
+        target_keys = set(target_mod.state_dict().keys())
+        if target_keys == set(clean_sd.keys()):
+            target_mod.load_state_dict(clean_sd, strict=True)
+        else:
+            remapped = {}
+            for tk in target_keys:
+                canon = ".".join(seg for seg in tk.split(".") if seg != "_orig_mod")
+                if canon in clean_sd:
+                    remapped[tk] = clean_sd[canon]
+            target_mod.load_state_dict(remapped, strict=True)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if hasattr(controller, "load_state_dict"):
             controller.load_state_dict(ckpt.get("scheduler_state"))

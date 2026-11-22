@@ -2,6 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
+fn default_num_style_domains() -> usize {
+    5
+}
+
+fn default_lambda_moe_bal() -> f32 {
+    0.01
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DcpaConfig {
     pub vocab_size: usize,
@@ -27,6 +35,8 @@ pub struct DcpaConfig {
     pub tau_skip: f32,
     pub tau_halt: f32,
     pub ponder_eta: f32,
+    #[serde(default = "default_lambda_moe_bal")]
+    pub lambda_moe_bal: f32,
     pub lif_lambda: f32,
     pub lif_beta1: f32,
     pub lif_beta2: f32,
@@ -38,6 +48,8 @@ pub struct DcpaConfig {
     pub delta_decay: f32,
     pub d_l: usize,
     pub num_lang_domains: usize,
+    #[serde(default = "default_num_style_domains")]
+    pub num_style_domains: usize,
     pub stack_depth: usize,
     pub stack_tag_dim: usize,
     pub tau_e: f32,

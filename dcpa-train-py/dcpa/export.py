@@ -20,6 +20,7 @@ from typing import Optional
 import torch
 from safetensors.torch import save_file
 
+from dcpa.compile_utils import get_clean_state_dict
 from dcpa.model import DCPAModel
 from dcpa.modules.hippocampus import EligibilityState
 
@@ -40,9 +41,11 @@ def extract_flat_state_dict(model: DCPAModel, dtype: torch.dtype = torch.float32
         "bcg_pc.pair_u",
         "bcg_pc.pair_v",
         "bcg_pc.pair_u_onehot",
+        "bcg_pc.pin_mask_72",
+        "bcg_pc.slot0_onehot",
     }
     tensors: dict[str, torch.Tensor] = {}
-    for name, tensor in model.state_dict().items():
+    for name, tensor in get_clean_state_dict(model).items():
         if name in skip_keys:
             continue
         t = tensor.detach().to(device="cpu", dtype=dtype).contiguous()

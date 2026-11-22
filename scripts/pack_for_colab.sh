@@ -35,8 +35,8 @@ if data.get("nbformat") != 4:
     raise SystemExit(f"ERROR: Expected Jupyter nbformat == 4, got {data.get('nbformat')!r}")
 
 cells = data.get("cells")
-if not isinstance(cells, list) or len(cells) != 5:
-    raise SystemExit(f"ERROR: Expected exactly 5 cells, got {len(cells) if isinstance(cells, list) else type(cells)}")
+if not isinstance(cells, list) or len(cells) != 6:
+    raise SystemExit(f"ERROR: Expected exactly 6 cells, got {len(cells) if isinstance(cells, list) else type(cells)}")
 
 code_cells = 0
 for idx, cell in enumerate(cells, start=1):
@@ -171,8 +171,14 @@ for name in names:
 
 required = [
     "configs/dcpa_48m_train.yaml",
+    "configs/dcpa_210m_moe.yaml",
     "utils/device.py",
+    "utils/chat_protocol.py",
     "data/build_corpus.py",
+    "data/build_sft_stage5.py",
+    "data/build_cap_reasoning.py",
+    "data/build_cap_writing.py",
+    "data/build_cap_toolcall.py",
     "data/ragged_dataloader.py",
     "data/wug_generator.py",
     "train/colab_drive_sync.py",
@@ -180,12 +186,18 @@ required = [
     "train/watchdog_and_ckpt.py",
     "train/visual_probe.py",
     "train/train_dcpa.py",
+    "train/train_stage5_sft.py",
+    "cli/chat_m3.py",
     "smoke_overfit_64.py",
     "tests/smoke_overfit_64.py",
     "tests/test_sanity.py",
     "tests/test_data_pipeline.py",
     "tests/test_trainer_lifecycle.py",
+    "tests/test_perf_and_compile.py",
+    "tests/test_stage5_and_repl.py",
+    "tests/test_capabilities_upgrade.py",
     "notebooks/Colab_DCPA_Train.ipynb",
+    "dcpa-train-py/dcpa/compile_utils.py",
     "dcpa-train-py/dcpa/model.py",
 ]
 missing = [r for r in required if r not in names]

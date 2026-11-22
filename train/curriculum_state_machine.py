@@ -99,6 +99,13 @@ class CurriculumStepState:
         return asdict(self)
 
 
+def _canonical_param_name(name: str) -> str:
+    """Strip any `_orig_mod.` wrapper segments introduced by `torch.compile` submodules."""
+    if "_orig_mod" not in name:
+        return name
+    return ".".join(seg for seg in name.split(".") if seg != "_orig_mod")
+
+
 def classify_parameter(name: str, param: nn.Parameter) -> tuple[str, str]:
     """Classify a model parameter into `(lr_wd_tier, developmental_owner)`.
 
@@ -117,6 +124,7 @@ def classify_parameter(name: str, param: nn.Parameter) -> tuple[str, str]:
         (frozen Stage 1, active Stages 2-4).
       - `hippocampus_gates`: all 9 Hippocampus neuromodulatory gating scalars (frozen 1-3, active 4).
     """
+    name = _canonical_param_name(name)
     if any(bad in name for bad in ("m_c_from_l", "m_l_from_c", "u_lex", "u_sem")):
         raise RuntimeError(
             f"Red Line #3 violation: Hippocampal fast buffer {name!r} appeared in model.named_parameters()!"
@@ -189,7 +197,8 @@ def build_three_way_param_groups(
     bucket_names: dict[tuple[str, str], list[str]] = {}
     seen_ids: set[int] = set()
 
-    for pname, param in model.named_parameters():
+    for raw_name, param in model.named_parameters():
+        pname = _canonical_param_name(raw_name)
         pid = id(param)
         if pid in seen_ids:
             continue
@@ -271,7 +280,8 @@ def expected_stage_param_sets(model: nn.Module, stage_id: int) -> tuple[set[str]
     active_set = set(active_owners)
     trainable: set[str] = set()
     frozen: set[str] = set()
-    for pname, param in model.named_parameters():
+    for raw_name, param in model.named_parameters():
+        pname = _canonical_param_name(raw_name)
         _, owner = classify_parameter(pname, param)
         if owner in active_set:
             trainable.add(pname)
@@ -315,9 +325,10 @@ def apply_stage_freeze(model: nn.Module, stage_id: int) -> dict[str, int]:
 
 def hash_named_parameters(model: nn.Module, param_names: Optional[Sequence[str] | set[str]] = None) -> dict[str, str]:
     """Compute exact `blake2b` raw-byte digests for selected model parameters (freeze corrosion audit)."""
-    target = set(param_names) if param_names is not None else None
+    target = {_canonical_param_name(n) for n in param_names} if param_names is not None else None
     digests: dict[str, str] = {}
-    for pname, param in model.named_parameters():
+    for raw_name, param in model.named_parameters():
+        pname = _canonical_param_name(raw_name)
         if target is not None and pname not in target:
             continue
         raw = param.detach().to(device="cpu").contiguous().numpy().tobytes()

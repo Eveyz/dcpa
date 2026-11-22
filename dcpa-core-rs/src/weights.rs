@@ -239,8 +239,11 @@ pub struct DcpaWeights {
     pub hip_w_lex_slow: Vec<f32>,    // [d_s, D]
     pub hip_w_lang_lex: Vec<f32>,    // [D, d_l]
 
-    // Module 4: PMD
-    pub pmd_lang_embed: Vec<f32>,   // [num_lang, d_l]
+    // Module 4: PMD (32D lang ⊕ 32D style orthogonal control vector -> 64D)
+    pub pmd_lang_embed: Vec<f32>,   // [num_lang, d_l/2]
+    pub pmd_style_embed: Vec<f32>,  // [num_style, d_l/2]
+    pub pmd_norm_lang: Vec<f32>,    // [d_l/2]
+    pub pmd_norm_style: Vec<f32>,   // [d_l/2]
     pub pmd_w_ord: Vec<f32>,        // [d_r, d_l]
     pub pmd_w_coh: Vec<f32>,        // [d_r, d_l]
     pub pmd_w_syn_w: Vec<f32>,      // [d_s, d_r + d_l]
@@ -371,6 +374,9 @@ impl DcpaWeights {
             hip_w_lang_lex: take_vec(&mut map, "hippocampus.w_lang_lex.weight")?,
 
             pmd_lang_embed: take_vec(&mut map, "pmd.lang_embed.weight")?,
+            pmd_style_embed: take_vec(&mut map, "pmd.style_embed.weight")?,
+            pmd_norm_lang: take_vec(&mut map, "pmd.norm_lang.weight")?,
+            pmd_norm_style: take_vec(&mut map, "pmd.norm_style.weight")?,
             pmd_w_ord: take_vec(&mut map, "pmd.w_ord.weight")?,
             pmd_w_coh: take_vec(&mut map, "pmd.w_coh.weight")?,
             pmd_w_syn_w: take_vec(&mut map, "pmd.w_syn.weight")?,

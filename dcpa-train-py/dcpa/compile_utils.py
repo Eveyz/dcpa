@@ -140,10 +140,12 @@ def configure_model_compile(
     hotspots: list[str] = []
 
     # --- Hotspot A: BCG-PC single-step concept graph kernel (OptimizedModule wrapping) ---
+    # Keep static_kernel_mode=False so pre-ponder & post-merge compile cleanly into fused Inductor
+    # kernels while pondering executes true event-driven sparse Top-2 MoE dispatch (10-25x faster!).
     if hasattr(model, "bcg_pc"):
         bcg_raw = unwrap_compiled_module(getattr(model, "bcg_pc"))
         if hasattr(bcg_raw, "set_static_kernel_mode"):
-            bcg_raw.set_static_kernel_mode(True)
+            bcg_raw.set_static_kernel_mode(False)
         compiled_bcg = torch.compile(bcg_raw, **compile_kwargs)
         setattr(model, "bcg_pc", compiled_bcg)
         if hasattr(model, "enable_doc_bucketing"):

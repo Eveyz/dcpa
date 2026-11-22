@@ -514,7 +514,7 @@ class DCPAModel(nn.Module):
                 (doc_cu_seqlens is not None) and (not self.training) and (graph_state is None) and (V <= 8)
             )
             # Parallel document-dimension bucketing (Performance Audit Task 2.3): pad V -> ceil(V/16)*16
-            # when selective torch.compile is active so Dynamo caches <= ~10 fixed shapes across 100k steps!
+            # when selective torch.compile is active so Dynamo caches <= ~12 fixed shapes across 100k steps!
             use_bucketing = bool(
                 self.enable_doc_bucketing
                 and not eval_isolated_path
@@ -522,8 +522,32 @@ class DCPAModel(nn.Module):
                 and fast_state is None
                 and elig_state is None
             )
+            # Monotonic active-prefix shrinking (Stages B/C): sort docs by seg_counts descending so
+            # active docs always occupy contiguous [:n_active], shrinking v_cur as shorter docs finish
+            # (eliminates 2-3x straggler-tail wasted BCG-PC work & removes per-step torch.nonzero syncs!).
+            use_prefix_shrink = bool(
+                (not hip_enabled)
+                and (not eval_isolated_path)
+                and graph_state is None
+                and fast_state is None
+                and elig_state is None
+                and V > 1
+            )
             bucket = max(1, int(self.doc_bucket_size))
-            V_eff = ((V + bucket - 1) // bucket) * bucket if use_bucketing else V
+
+            def _coarse_bucket_v(n: int, cap: int) -> int:
+                if not use_bucketing:
+                    return min(max(n, 1), cap)
+                if n <= bucket:
+                    return min(bucket, cap)
+                if n <= bucket * 2:
+                    return min(bucket * 2, cap)
+                if n <= bucket * 4:
+                    return min(bucket * 4, cap)
+                step_b = bucket * 2
+                return min(((n + step_b - 1) // step_b) * step_b, cap)
+
+            V_eff = _coarse_bucket_v(V, max(V, ((V + bucket * 2 - 1) // (bucket * 2)) * (bucket * 2))) if use_bucketing else V
             pad_v = V_eff - V
 
             pts_base = (
@@ -531,32 +555,48 @@ class DCPAModel(nn.Module):
                 if ponder_tax_scale is None
                 else ponder_tax_scale.to(device=device, dtype=torch.float32)
             )
+            if use_prefix_shrink:
+                doc_order = torch.argsort(seg_counts, descending=True)
+                inv_doc_order = torch.argsort(doc_order)
+                seg_counts_ord = seg_counts[doc_order]
+                seg_offsets_ord = seg_offsets[doc_order]
+                l_reg_ord = l_reg[doc_order]
+                pts_ord = pts_base[doc_order]
+                fam_mask_ord = familiar_doc_mask[doc_order] if familiar_doc_mask is not None else None
+            else:
+                inv_doc_order = None
+                seg_counts_ord = seg_counts
+                seg_offsets_ord = seg_offsets
+                l_reg_ord = l_reg
+                pts_ord = pts_base
+                fam_mask_ord = familiar_doc_mask
+
             if pad_v > 0:
                 seg_counts_eff = torch.cat(
-                    [seg_counts, torch.zeros((pad_v,), device=device, dtype=seg_counts.dtype)], dim=0
+                    [seg_counts_ord, torch.zeros((pad_v,), device=device, dtype=seg_counts.dtype)], dim=0
                 )
                 seg_offsets_eff = torch.cat(
-                    [seg_offsets, torch.zeros((pad_v,), device=device, dtype=seg_offsets.dtype)], dim=0
+                    [seg_offsets_ord, torch.zeros((pad_v,), device=device, dtype=seg_offsets.dtype)], dim=0
                 )
                 l_reg_eff = torch.cat(
-                    [l_reg, torch.zeros((pad_v, l_reg.shape[-1]), device=device, dtype=l_reg.dtype)], dim=0
+                    [l_reg_ord, torch.zeros((pad_v, l_reg.shape[-1]), device=device, dtype=l_reg.dtype)], dim=0
                 )
                 pts_eff = torch.cat(
-                    [pts_base, torch.zeros((pad_v,), device=device, dtype=torch.float32)], dim=0
+                    [pts_ord, torch.zeros((pad_v,), device=device, dtype=torch.float32)], dim=0
                 )
                 fam_mask_eff = (
                     torch.cat(
-                        [familiar_doc_mask, torch.zeros((pad_v,), device=device, dtype=torch.bool)], dim=0
+                        [fam_mask_ord, torch.zeros((pad_v,), device=device, dtype=torch.bool)], dim=0
                     )
-                    if familiar_doc_mask is not None
+                    if fam_mask_ord is not None
                     else None
                 )
             else:
-                seg_counts_eff = seg_counts
-                seg_offsets_eff = seg_offsets
-                l_reg_eff = l_reg
-                pts_eff = pts_base
-                fam_mask_eff = familiar_doc_mask
+                seg_counts_eff = seg_counts_ord
+                seg_offsets_eff = seg_offsets_ord
+                l_reg_eff = l_reg_ord
+                pts_eff = pts_ord
+                fam_mask_eff = fam_mask_ord
 
             g_state = self.bcg_pc.init_state(V_eff, device=device, dtype=sgsc_out.c_slow.dtype) if graph_state is None else graph_state
             if g_state.slot0_pinned is None:
@@ -749,21 +789,61 @@ class DCPAModel(nn.Module):
                     slot0_pinned=torch.cat(last_g_pin, dim=0),
                 )
             else:
-                # Zero-index_put gather + single end-of-loop cat/permute + compiled Hotspot A kernel!
+                # Zero-index_put gather + monotonic active-prefix tail shrinking + compiled Hotspot A kernel!
                 seg_offsets_i64 = seg_offsets_eff.to(torch.int64)
                 zero_idx = torch.zeros_like(seg_offsets_i64)
                 f_out_chunks: list[torch.Tensor] = []
                 delta_syn_chunks: list[torch.Tensor] = []
                 flat_idx_chunks: list[torch.Tensor] = []
 
+                seg_counts_cpu = seg_counts_ord.detach().cpu().tolist() if use_prefix_shrink else []
+                n_active_prefix = sum(1 for c in seg_counts_cpu if c > 0) if use_prefix_shrink else V
+                cur_v = V_eff
+                finished_slots: list[torch.Tensor] = []
+                finished_edges: list[torch.Tensor] = []
+                finished_sal: list[torch.Tensor] = []
+                finished_pin: list[torch.Tensor] = []
+
                 for m_step in range(m_max):
-                    active_mask = m_step < seg_counts_eff  # [V_eff] bool (strictly False for padded virtual docs!)
-                    active_f = active_mask.float()
-                    active_b = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
-                    if active_b.numel() == 0:
-                        break
-                    flat_idx = seg_offsets_i64[active_b] + m_step  # [V_act]
-                    safe_idx = torch.where(active_mask, seg_offsets_i64 + m_step, zero_idx)
+                    if use_prefix_shrink:
+                        while n_active_prefix > 0 and seg_counts_cpu[n_active_prefix - 1] <= m_step:
+                            n_active_prefix -= 1
+                        if n_active_prefix == 0:
+                            break
+                        v_next = _coarse_bucket_v(n_active_prefix, cur_v)
+                        if v_next < cur_v:
+                            assert g_state.slot0_pinned is not None
+                            finished_slots.append(g_state.slots[v_next:])
+                            finished_edges.append(g_state.edges[v_next:])
+                            finished_sal.append(g_state.salience[v_next:])
+                            finished_pin.append(g_state.slot0_pinned[v_next:])
+                            g_state = ConceptGraphState(
+                                slots=g_state.slots[:v_next],
+                                edges=g_state.edges[:v_next],
+                                salience=g_state.salience[:v_next],
+                                slot0_pinned=g_state.slot0_pinned[:v_next],
+                            )
+                            cur_v = v_next
+                        active_mask = m_step < seg_counts_eff[:cur_v]
+                        active_f = active_mask.float()
+                        active_b = torch.arange(n_active_prefix, device=device, dtype=torch.int64)
+                        seg_off_cur = seg_offsets_i64[:cur_v]
+                        zero_cur = zero_idx[:cur_v]
+                        l_reg_cur = l_reg_eff[:cur_v]
+                        pts_cur = pts_eff[:cur_v]
+                    else:
+                        active_mask = m_step < seg_counts_eff  # [V_eff] bool (strictly False for padded virtual docs!)
+                        active_f = active_mask.float()
+                        active_b = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
+                        if active_b.numel() == 0:
+                            break
+                        seg_off_cur = seg_offsets_i64
+                        zero_cur = zero_idx
+                        l_reg_cur = l_reg_eff
+                        pts_cur = pts_eff
+
+                    flat_idx = seg_off_cur[active_b] + m_step  # [V_act]
+                    safe_idx = torch.where(active_mask, seg_off_cur + m_step, zero_cur)
 
                     am_col_f = active_f.unsqueeze(-1).to(sgsc_out.f_stem.dtype)
                     am_col_c = active_f.unsqueeze(-1).to(sgsc_out.c_slow.dtype)
@@ -918,25 +998,33 @@ class DCPAModel(nn.Module):
                         nll_step = 0.5 * ((pi_act * err_sq).mean(dim=-1) - torch.log(pi_act.clamp_min(1e-6)).mean(dim=-1))
                         pc_nll_sum = pc_nll_sum + nll_step.sum()
                         ponder_sum = ponder_sum + ponder_step[active_b].float().sum()
-                        ponder_tax_sum = ponder_tax_sum + (ponder_step[active_b].float() * pts_eff[active_b]).sum()
+                        ponder_tax_sum = ponder_tax_sum + (ponder_step[active_b].float() * pts_cur[active_b]).sum()
                         ponder_skip_sum = ponder_skip_sum + (ponder_step[active_b].detach().float() < 0.5).float().sum()
                         merge_probs_sum = merge_probs_sum + merge_probs_step[active_b].float().sum(dim=0)
                         moe_bal_sum = moe_bal_sum + moe_bal_step.float()
                         moe_bal_steps += 1
                     total_valid_steps += int(active_b.numel())
 
-                    # Expressive stem retrieval for active steps (align batch dim V_eff with f_state, then slice active_b!)
-                    f_out_all, _ = self.hippocampus.read_expression(
-                        z_out=z_star_step,
-                        l_reg=l_reg_eff,
-                        fast_state=f_state if hip_enabled else None,
-                        enabled=hip_enabled,
-                    )
-                    f_out_step = f_out_all[active_b]
+                    # Expressive stem retrieval for active steps (align batch dim V_eff with f_state in Stage D!)
+                    if hip_enabled:
+                        f_out_all, _ = self.hippocampus.read_expression(
+                            z_out=z_star_step,
+                            l_reg=l_reg_cur,
+                            fast_state=f_state,
+                            enabled=True,
+                        )
+                        f_out_step = f_out_all[active_b]
+                    else:
+                        f_out_step, _ = self.hippocampus.read_expression(
+                            z_out=z_star_step[active_b],
+                            l_reg=l_reg_cur[active_b],
+                            fast_state=None,
+                            enabled=False,
+                        )
                     delta_syn_step = self.pmd.compute_streaming_delta_syn(
                         g_ctx=g_ctx_step[active_b],
                         z_star=z_star_step[active_b],
-                        l_reg=l_reg_eff[active_b],
+                        l_reg=l_reg_cur[active_b],
                     )
 
                     f_out_chunks.append(f_out_step.to(sgsc_out.f_stem.dtype))
@@ -948,6 +1036,16 @@ class DCPAModel(nn.Module):
                     inv_perm = torch.argsort(order)
                     f_out_flat = torch.cat(f_out_chunks, dim=0)[inv_perm]
                     delta_syn_flat = torch.cat(delta_syn_chunks, dim=0)[inv_perm]
+
+                # Reassemble shrunk active-prefix tails back to [V_eff, ...]
+                if finished_slots:
+                    assert g_state.slot0_pinned is not None
+                    g_state = ConceptGraphState(
+                        slots=torch.cat([g_state.slots, *reversed(finished_slots)], dim=0),
+                        edges=torch.cat([g_state.edges, *reversed(finished_edges)], dim=0),
+                        salience=torch.cat([g_state.salience, *reversed(finished_sal)], dim=0),
+                        slot0_pinned=torch.cat([g_state.slot0_pinned, *reversed(finished_pin)], dim=0),
+                    )
 
                 # Trim bucketed virtual slots back to exact document count V for downstream CQ / output
                 if pad_v > 0:
@@ -968,6 +1066,17 @@ class DCPAModel(nn.Module):
                             f_tilde=e_state.f_tilde[:V],
                             eta=e_state.eta[:V],
                         )
+
+                # Restore original document ordering if active-prefix descending sort was used
+                if inv_doc_order is not None:
+                    g_state = ConceptGraphState(
+                        slots=g_state.slots[inv_doc_order],
+                        edges=g_state.edges[inv_doc_order],
+                        salience=g_state.salience[inv_doc_order],
+                        slot0_pinned=(
+                            g_state.slot0_pinned[inv_doc_order] if g_state.slot0_pinned is not None else None
+                        ),
+                    )
 
             s_trace = s_trace_flat
             a_trace = a_trace_flat

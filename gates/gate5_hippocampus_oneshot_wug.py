@@ -16,15 +16,22 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 import time
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from dcpa.config import DCPAConfig
 from dcpa.data.synthetic import _DISTRACTOR_POOL, generate_pseudoword
 from dcpa.model import DCPAModel
 from dcpa.modules.hippocampus import EligibilityState
+from utils.device import get_device
 
 
 _ENTITY_DEFS = [
@@ -213,12 +220,7 @@ def verify_gate5(cal_steps: int = 1600, num_episodes: int = 40) -> None:
     torch.manual_seed(2026)
     rng = random.Random(2026)
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    device = get_device("auto", deterministic=False)
     print(f"Device: {device}")
 
     cfg = DCPAConfig.tiny()

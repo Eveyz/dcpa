@@ -9,12 +9,20 @@ Pass/Fail Quantitative Thresholds (Engineering Blueprint Chapter 7):
 
 from __future__ import annotations
 
+import sys
 import time
+from pathlib import Path
+
 import torch
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from dcpa.config import DCPAConfig
 from dcpa.modules.sgsc import SGSC
 from dcpa.ops.scan import HAS_TRITON, parallel_diag_scan, sequential_diag_scan_ref
+from utils.device import get_device, synchronize
 
 
 def verify_gate1() -> None:
@@ -78,27 +86,21 @@ def verify_gate1() -> None:
         )
 
     # Speed report (on CUDA + Triton if available, else MPS/CPU)
-    dev = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+    dev = get_device("auto", deterministic=False)
     a_bench = torch.sigmoid(torch.randn(32, 4096, 192, device=dev, dtype=torch.float32), ).requires_grad_(True)
     b_bench = torch.randn(32, 4096, 192, device=dev, dtype=torch.float32, requires_grad=True)
     h0_bench = torch.zeros(192, device=dev, dtype=torch.float32, requires_grad=True)
     # Warmup
     out_w = parallel_diag_scan(a_bench, b_bench, h0_bench)
     out_w.sum().backward()
-    if dev.type == "cuda":
-        torch.cuda.synchronize()
-    elif dev.type == "mps":
-        torch.mps.synchronize()
+    synchronize(dev)
     t0 = time.perf_counter()
     a_bench.grad = None
     b_bench.grad = None
     h0_bench.grad = None
     out_b = parallel_diag_scan(a_bench, b_bench, h0_bench)
     out_b.sum().backward()
-    if dev.type == "cuda":
-        torch.cuda.synchronize()
-    elif dev.type == "mps":
-        torch.mps.synchronize()
+    synchronize(dev)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     print(
         f"[PASS] Check 2/3: Parallel associative scan fwd+bwd matches sequential reference (err < 1e-5). "

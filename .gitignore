@@ -13,9 +13,13 @@ Cargo.lock
 
 # Artifacts / checkpoints / generated test data
 checkpoints/
-data/
+data/corpus/
+data/smoke_corpus/
+data/stage*/
 artifacts/
+dcpa_colab_bundle.zip
 *.safetensors
 *.bin
 *.idx
+*.pt
 .DS_Store

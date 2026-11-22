@@ -535,10 +535,12 @@ class HippocampusDualMemory(nn.Module):
         device = elig.e_idx.device
         b_arange = torch.arange(B, device=device)
 
-        # Extend to K+1
+        # Extend to K+1 (align dtypes safely under bfloat16 autocast)
+        cand_val_aligned = cand_val.to(dtype=elig.e_val.dtype)
+        cand_f_aligned = cand_f.to(dtype=elig.f_tilde.dtype)
         e_idx_ext = torch.cat([elig.e_idx, cand_idx.unsqueeze(1)], dim=1)  # [B, K+1, s]
-        e_val_ext = torch.cat([elig.e_val, cand_val.unsqueeze(1)], dim=1)  # [B, K+1, s]
-        f_ext = torch.cat([elig.f_tilde, cand_f.unsqueeze(1)], dim=1)      # [B, K+1, d_s]
+        e_val_ext = torch.cat([elig.e_val, cand_val_aligned.unsqueeze(1)], dim=1)  # [B, K+1, s]
+        f_ext = torch.cat([elig.f_tilde, cand_f_aligned.unsqueeze(1)], dim=1)      # [B, K+1, d_s]
         eta_ext = torch.cat([elig.eta, cand_ach.float().unsqueeze(1)], dim=1)  # [B, K+1]
 
         eta_i = eta_ext[b_arange, win_i]
@@ -565,8 +567,8 @@ class HippocampusDualMemory(nn.Module):
             b_cb = b_arange[case_b]
             v_cb = v[case_b]
             new_e_idx[b_cb, v_cb] = cand_idx[b_cb]
-            new_e_val[b_cb, v_cb] = cand_val[b_cb]
-            new_f[b_cb, v_cb] = cand_f[b_cb]
+            new_e_val[b_cb, v_cb] = cand_val_aligned[b_cb]
+            new_f[b_cb, v_cb] = cand_f_aligned[b_cb]
             new_eta[b_cb, v_cb] = cand_ach.float()[b_cb]
 
         return EligibilityState(e_idx=new_e_idx, e_val=new_e_val, f_tilde=new_f, eta=new_eta)

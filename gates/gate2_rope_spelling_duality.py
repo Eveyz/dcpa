@@ -10,13 +10,20 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 import time
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from dcpa.config import DCPAConfig
 from dcpa.model import DCPAModel
+from utils.device import get_device
 
 
 _EN_SYL = [
@@ -94,12 +101,7 @@ def verify_gate2(steps: int = 5000, batch_size: int = 256, preset: str = "base")
     torch.manual_seed(2026)
     rng = random.Random(2026)
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    device = get_device("auto", deterministic=False)
     print(f"Device: {device}")
 
     cfg = {"base": DCPAConfig.base, "tiny": DCPAConfig.tiny, "micro": DCPAConfig.micro}[preset]()

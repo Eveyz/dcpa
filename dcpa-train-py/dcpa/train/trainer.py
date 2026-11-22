@@ -14,9 +14,14 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 from pathlib import Path
 
 import torch
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from dcpa.config import DCPAConfig
 from dcpa.data.shard_loader import BinaryShardDataset
@@ -29,6 +34,7 @@ from dcpa.export import export_model_and_golden
 from dcpa.model import DCPAModel
 from dcpa.train.curriculum import CurriculumSchedule
 from dcpa.train.monitor import AntiCollapseMonitor, project_spectral_norm
+from utils.device import amp_autocast, get_device, is_bf16_enabled
 
 
 def _sample_synthetic_batch(
@@ -89,15 +95,7 @@ def train_loop(
     torch.manual_seed(seed)
     rng = random.Random(seed)
 
-    if device_str == "auto":
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
-    else:
-        device = torch.device(device_str)
+    device = get_device(preferred=device_str, deterministic=False)
 
     cfg = {"base": DCPAConfig.base, "tiny": DCPAConfig.tiny, "micro": DCPAConfig.micro}[preset]()
     model = DCPAModel(cfg).to(device)
@@ -116,7 +114,7 @@ def train_loop(
     last_metrics: dict[str, float] = {}
     directives = monitor.observe({}, stage="A", step_in_stage=0)
 
-    use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    use_bf16 = is_bf16_enabled(device)
 
     for step in range(total_steps):
         sc = schedule.get(step)
@@ -138,7 +136,7 @@ def train_loop(
         optimizer.zero_grad(set_to_none=True)
         tau_m = sc.tau_m if directives.tau_m_override is None else directives.tau_m_override
 
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+        with amp_autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
             out = model(
                 raw_bytes=raw_bytes,
                 lang_ids=lang_ids,

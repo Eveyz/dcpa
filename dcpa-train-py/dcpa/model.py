@@ -338,10 +338,10 @@ class DCPAModel(nn.Module):
                     l_reg=l_reg[active_b],
                 )
 
-                z_star_flat[flat_idx] = bcg_out.z_star[active_b]
-                g_ctx_flat[flat_idx] = bcg_out.g_ctx[active_b]
-                f_out_flat[flat_idx] = f_out_step
-                delta_syn_flat[flat_idx] = delta_syn_step
+                z_star_flat[flat_idx] = bcg_out.z_star[active_b].to(z_star_flat.dtype)
+                g_ctx_flat[flat_idx] = bcg_out.g_ctx[active_b].to(g_ctx_flat.dtype)
+                f_out_flat[flat_idx] = f_out_step.to(f_out_flat.dtype)
+                delta_syn_flat[flat_idx] = delta_syn_step.to(delta_syn_flat.dtype)
 
             denom = max(total_valid_steps, 1)
             loss_pc = (pc_nll_sum / denom) + loss_var
@@ -396,8 +396,8 @@ class DCPAModel(nn.Module):
                             enabled=hip_enabled,
                         )
                         flat_idx = seg_offsets[active_b].to(torch.int64) + n_step
-                        cq_f_out[flat_idx] = f_cq
-                        cq_delta_syn[flat_idx] = cq_out.delta_syn[active_b]
+                        cq_f_out[flat_idx] = f_cq.to(cq_f_out.dtype)
+                        cq_delta_syn[flat_idx] = cq_out.delta_syn[active_b].to(cq_delta_syn.dtype)
                 f_decode = cq_f_out
                 d_decode = cq_delta_syn
             else:

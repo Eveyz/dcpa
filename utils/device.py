@@ -146,7 +146,9 @@ def amp_autocast(
 
 
 def fp32_island(device: torch.device) -> ContextManager[Any]:
-    """Explicit float32 precision island context manager overriding outer CUDA bfloat16 autocast."""
+    """Explicit float32 precision island context manager overriding outer CUDA (or CPU test) bfloat16 autocast."""
+    if device.type == "cpu":
+        return torch.amp.autocast(device_type="cpu", enabled=False)
     return amp_autocast(device, enabled=False)
 
 

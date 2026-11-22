@@ -144,6 +144,25 @@ class CompactHouseholderState:
             self.u_lex = self.u_lex * self.gamma_hip
             self.u_sem = self.u_sem * self.gamma_hip
 
+    def slice_batch(self, n: int) -> CompactHouseholderState:
+        """Return a batch-trimmed view `[:n]` (used when trimming doc-bucketed virtual slots)."""
+        sliced = CompactHouseholderState(
+            batch_size=int(n),
+            d_h=self.d_h,
+            d_concept=self.d_concept,
+            d_s=self.d_s,
+            s_active=self.s_active,
+            w_max=self.w_max,
+            gamma_hip=self.gamma_hip,
+            device=self.device,
+        )
+        sliced.step_count = self.step_count
+        sliced.u_lex = self.u_lex[:n]
+        sliced.u_sem = self.u_sem[:n]
+        sliced.c_from_l_traces = [(ki[:n], kv[:n], d[:n], st) for (ki, kv, d, st) in self.c_from_l_traces]
+        sliced.l_from_c_traces = [(ki[:n], kv[:n], d[:n], st) for (ki, kv, d, st) in self.l_from_c_traces]
+        return sliced
+
     def read_familiarity_lex(self, psi_idx: torch.Tensor, psi_val: torch.Tensor) -> torch.Tensor:
         """gamma_hip = sum_{k in I} psi_k^2 * u_lex[k] -> [B] float32."""
         u_gathered = self.u_lex.gather(1, psi_idx)  # [B, s]
@@ -519,7 +538,16 @@ class HippocampusDualMemory(nn.Module):
         # Precision Island #5 (Red Line #1): DG orthogonal sparse read, familiarity, & ACh gating in fp32
         with fp32_island(c_slow.device):
             psi_idx, psi_val = self.dg_lex(f_stem)
-            pi_cort = F.softplus(self.f_prec_cort(c_slow).float()) + 1e-4  # [B, D] fp32
+            pi_cort = (
+                F.softplus(
+                    F.linear(
+                        c_slow.float(),
+                        self.f_prec_cort.weight.float(),
+                        self.f_prec_cort.bias.float() if self.f_prec_cort.bias is not None else None,
+                    )
+                )
+                + 1e-4
+            )  # [B, D] fp32
 
             if (not enabled) or (fast_state is None):
                 B = c_slow.shape[0]
@@ -676,7 +704,7 @@ class HippocampusDualMemory(nn.Module):
                 )
 
             # Quench consumed eligibility traces
-            new_eta = (1.0 - self.cfg.kappa_quench * beta.detach()) * elig.eta
+            new_eta = (1.0 - self.cfg.kappa_quench * beta.detach()) * elig.eta.float()
             new_elig = EligibilityState(
                 e_idx=elig.e_idx,
                 e_val=elig.e_val,

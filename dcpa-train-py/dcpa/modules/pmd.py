@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from dcpa.config import DCPAConfig
 from dcpa.modules.bcg_pc import ConceptGraphState
+from dcpa.ops.fp32 import fp32_island
 from dcpa.ops.ragged import ragged_local_offsets, ragged_segment_cumsum
 from dcpa.ops.rmsnorm import RMSNorm
 from dcpa.ops.rope import apply_holographic_rope
@@ -252,34 +253,36 @@ class PMD(nn.Module):
         B, K, _ = graph.slots.shape
         tau = self.cfg.tau_q if tau_q is None else tau_q
 
-        # Edge precedence inhibition matrix P^{ord}_{i,j}(l_reg) = tanh((W_ord l_reg)^T A_{i,j})
-        ord_vec = self.w_ord(l_reg).float()  # [B, d_r]
-        p_ord = torch.tanh(torch.einsum("br,bijr->bij", ord_vec, graph.edges.float()))  # [B, K, K]
+        # Edge precedence inhibition matrix & IoR competitive queuing strictly in float32
+        with fp32_island(q_prev.device):
+            ord_vec = F.linear(l_reg.float(), self.w_ord.weight.float())  # [B, d_r]
+            p_ord = torch.tanh(torch.einsum("br,bijr->bij", ord_vec, graph.edges.float()))  # [B, K, K]
 
-        # Lateral inhibition from unexpressed j != i
-        eye_mask = 1.0 - torch.eye(K, device=q_prev.device, dtype=torch.float32).unsqueeze(0)
-        inh = torch.einsum("bj,bij->bi", q_prev.float(), F.relu(p_ord) * eye_mask)  # [B, K]
+            # Lateral inhibition from unexpressed j != i
+            eye_mask = 1.0 - torch.eye(K, device=q_prev.device, dtype=torch.float32).unsqueeze(0)
+            inh = torch.einsum("bj,bij->bi", q_prev.float(), F.relu(p_ord) * eye_mask)  # [B, K]
 
-        coh_vec = self.w_coh(l_reg).float()  # [B, d_r]
-        coh = torch.einsum("br,bir->bi", coh_vec, a_prev.float())  # [B, K]
+            coh_vec = F.linear(l_reg.float(), self.w_coh.weight.float())  # [B, d_r]
+            coh = torch.einsum("br,bir->bi", coh_vec, a_prev.float())  # [B, K]
 
-        u_ready = torch.log(q_prev.float().clamp_min(self.cfg.eps)) - self.cfg.lambda_inh * inh + coh  # [B, K] fp32
+            u_ready = torch.log(q_prev.float().clamp_min(self.cfg.eps)) - self.cfg.lambda_inh * inh + coh  # [B, K] fp32
 
-        # STE winner selection
-        pi_soft = F.softmax(u_ready / max(tau, 1e-4), dim=-1)
-        win = u_ready.argmax(dim=-1)
-        pi_hard = F.one_hot(win, num_classes=K).float()
-        pi_sel = (pi_hard - pi_soft).detach() + pi_soft  # [B, K] fp32
+            # STE winner selection
+            pi_soft = F.softmax(u_ready / max(tau, 1e-4), dim=-1)
+            win = u_ready.argmax(dim=-1)
+            pi_hard = F.one_hot(win, num_classes=K).float()
+            pi_sel = (pi_hard - pi_soft).detach() + pi_soft  # [B, K] fp32
 
-        pi_dt = pi_sel.to(graph.slots.dtype)
-        z_out = torch.einsum("bk,bkd->bd", pi_dt, graph.slots)  # [B, D]
-        r_role = torch.einsum("bi,bj,bjir->br", pi_dt, q_init.to(graph.edges.dtype), graph.edges)  # [B, d_r]
+            # Inhibition of Return (IoR)
+            q_next = (q_prev.float() * (1.0 - pi_sel)).clamp(0.0, 1.0)
+            done = q_next.max(dim=-1).values < self.cfg.tau_done
+
+        pi_dt_s = pi_sel.to(graph.slots.dtype)
+        pi_dt_e = pi_sel.to(graph.edges.dtype)
+        z_out = torch.einsum("bk,bkd->bd", pi_dt_s, graph.slots)  # [B, D]
+        r_role = torch.einsum("bi,bj,bjir->br", pi_dt_e, q_init.to(graph.edges.dtype), graph.edges)  # [B, d_r]
         delta_syn = F.silu(self.w_syn(torch.cat([r_role, l_reg], dim=-1)) + self.u_syn(z_out))  # [B, d_s]
-
-        # Inhibition of Return (IoR)
-        q_next = (q_prev.float() * (1.0 - pi_sel)).clamp(0.0, 1.0)
-        a_prev_next = torch.einsum("bk,bkir->bir", pi_dt, graph.edges)  # [B, K, d_r]
-        done = q_next.max(dim=-1).values < self.cfg.tau_done
+        a_prev_next = torch.einsum("bk,bkir->bir", pi_dt_e, graph.edges)  # [B, K, d_r]
 
         return BrocaStepOutput(
             z_out=z_out,

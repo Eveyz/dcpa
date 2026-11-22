@@ -298,7 +298,8 @@ def _run_domain_probes(
         decoded_str = pred_bytes.decode("utf-8", errors="replace").replace("\n", "\\n")
 
         # Efference-copy self-monitoring cosine error eps_mon between original and re-encoded concepts
-        re_sgsc = model.sgsc(pred_ids.unsqueeze(0), tau_s=tau_s)
+        with amp_autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
+            re_sgsc = model.sgsc(pred_ids.unsqueeze(0), tau_s=tau_s)
         c_orig = out.sgsc.c_slow.float().mean(dim=0, keepdim=True)
         c_re = re_sgsc.c_slow.float().mean(dim=0, keepdim=True)
         cos_sim = float(F.cosine_similarity(c_orig, c_re, dim=-1, eps=1e-8).item())

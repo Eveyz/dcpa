@@ -21,6 +21,7 @@ from dcpa.config import DCPAConfig
 from dcpa.modules.bcg_pc import BCGPC, ConceptGraphState
 from dcpa.modules.hippocampus import (
     ColumnMajorFastWeights,
+    CompactHouseholderState,
     EligibilityState,
     HippocampusDualMemory,
     HippocampusStateType,
@@ -903,6 +904,15 @@ class DCPAModel(nn.Module):
                             g_state.slot0_pinned[:V] if g_state.slot0_pinned is not None else None
                         ),
                     )
+                    if isinstance(f_state, CompactHouseholderState):
+                        f_state = f_state.slice_batch(V)
+                    if e_state is not None:
+                        e_state = EligibilityState(
+                            e_idx=e_state.e_idx[:V],
+                            e_val=e_state.e_val[:V],
+                            f_tilde=e_state.f_tilde[:V],
+                            eta=e_state.eta[:V],
+                        )
 
             s_trace = s_trace_flat
             a_trace = a_trace_flat

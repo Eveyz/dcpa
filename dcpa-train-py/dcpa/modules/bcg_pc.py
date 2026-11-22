@@ -184,7 +184,7 @@ class SparseMicroMoE(nn.Module):
             sample_idx, k_pos = torch.nonzero(mask, as_tuple=True)
             y_e = expert(x[sample_idx])
             w_e = gates[sample_idx, k_pos].unsqueeze(-1)
-            out.index_add_(0, sample_idx, y_e * w_e)
+            out.index_add_(0, sample_idx, (y_e * w_e).to(out.dtype))
         return out, aux_bal
 
 
@@ -309,9 +309,9 @@ class BCGPC(nn.Module):
         w_attn = F.softmax(salience.float(), dim=-1)  # [B, K] fp32
         e_proj = torch.tanh(self.w_e(edges))  # [B, K, K, D], bounded in (-1, 1) for stable multi-step recurrence
         # S_bar_i = S_i + sum_j w_attn[j] * (tanh(W_e A_{i,j}) * S_j)
-        weighted_s = slots * w_attn.unsqueeze(-1).to(slots.dtype)  # [B, K, D]
+        weighted_s = slots.to(e_proj.dtype) * w_attn.unsqueeze(-1).to(e_proj.dtype)  # [B, K, D]
         agg = torch.einsum("bijd,bjd->bid", e_proj, weighted_s)
-        s_bar = slots + agg
+        s_bar = slots + agg.to(slots.dtype)
         g_ctx = torch.einsum("bk,bkd->bd", w_attn.to(s_bar.dtype), s_bar)
         return s_bar, g_ctx
 
@@ -403,7 +403,7 @@ class BCGPC(nn.Module):
                 moe_bal_sum = moe_bal_sum + bal_l
                 moe_bal_count = moe_bal_count + (active.float().sum() > 0.0).float()
 
-                z_cand = self.norm_ponder(z_cur + self.cfg.ponder_eta * delta_all)
+                z_cand = self.norm_ponder(z_cur + self.cfg.ponder_eta * delta_all).to(z_cur.dtype)
                 act_col = active.unsqueeze(-1)
                 z_cur = torch.where(act_col, z_cand, z_cur)
 
@@ -424,7 +424,7 @@ class BCGPC(nn.Module):
                 moe_bal_sum = moe_bal_sum + bal_l
                 moe_bal_count = moe_bal_count + 1.0
 
-                z_next_a = self.norm_ponder(z_a + self.cfg.ponder_eta * delta_a)
+                z_next_a = self.norm_ponder(z_a + self.cfg.ponder_eta * delta_a).to(z_cur.dtype)
 
                 z_next = z_cur.clone()
                 z_next[act_idx] = z_next_a
@@ -497,12 +497,14 @@ class BCGPC(nn.Module):
                 win_idx = m_score_f.argmax(dim=-1)  # [B]
                 alpha = F.one_hot(win_idx, num_classes=m_score_f.shape[-1]).float()
 
+            # Single einsum contraction with prebuilt [72, K, K+1] perm_bank strictly in fp32
+            p_mat = torch.einsum("bp,pka->bka", alpha, self.perm_bank.float())  # [B, K, K+1] fp32
+
         win_i = pi_idx[win_idx]  # [B]
         win_j = pj_idx[win_idx]  # [B]
 
-        # Single einsum contraction with prebuilt [72, K, K+1] perm_bank
-        p_mat = torch.einsum("bp,pka->bka", alpha, self.perm_bank)  # [B, K, K+1] fp32
-        p_mat_dt = p_mat.to(orig_dtype)
+        p_mat_s = p_mat.to(s_tilde.dtype)
+        p_mat_a = p_mat.to(a_tilde.dtype)
 
         b_arange = torch.arange(B, device=c_fused.device)
         s_i_win = s_tilde[b_arange, win_i]  # [B, D]
@@ -513,11 +515,11 @@ class BCGPC(nn.Module):
         s_merged_win = self.norm_merge(g_win * comp_win + (1.0 - g_win) * s_i_win)  # [B, D]
 
         if self.training:
-            alpha_win = alpha[b_arange, win_idx].to(orig_dtype)  # [B], forward == 1.0
-            corr_win = alpha_win.unsqueeze(-1) * (s_merged_win - 0.5 * (s_i_win + s_j_win))
-            win_u_oh = self.pair_u_onehot[win_idx].to(orig_dtype)  # [B, K]
+            alpha_win = alpha[b_arange, win_idx].to(s_tilde.dtype)  # [B], forward == 1.0
+            corr_win = alpha_win.unsqueeze(-1) * (s_merged_win.to(s_tilde.dtype) - 0.5 * (s_i_win + s_j_win))
+            win_u_oh = self.pair_u_onehot[win_idx].to(s_tilde.dtype)  # [B, K]
             slot_corr = win_u_oh.unsqueeze(-1) * corr_win.unsqueeze(1)  # [B, K, D]
-            s_cand_new = torch.einsum("bka,bad->bkd", p_mat_dt, s_tilde) + slot_corr
+            s_cand_new = (torch.einsum("bka,bad->bkd", p_mat_s, s_tilde) + slot_corr).to(slots.dtype)
         else:
             # 100% branchless, zero-ULP exact eval slot placement (compile-friendly!)
             win_u = pu_idx[win_idx]  # [B]
@@ -525,36 +527,41 @@ class BCGPC(nn.Module):
             k_ids = torch.arange(K, device=c_fused.device).unsqueeze(0)  # [1, K]
             is_u = (k_ids == win_u.unsqueeze(1)).unsqueeze(-1)  # [B, K, 1]
             is_v = (k_ids == win_v.unsqueeze(1)).unsqueeze(-1)  # [B, K, 1] (False if win_v == K)
-            s_cand_new = torch.where(is_u, s_merged_win.unsqueeze(1), slots)
-            s_cand_new = torch.where(is_v, z_star.unsqueeze(1), s_cand_new)
+            s_cand_new = torch.where(is_u, s_merged_win.to(slots.dtype).unsqueeze(1), slots)
+            s_cand_new = torch.where(is_v, z_star.to(slots.dtype).unsqueeze(1), s_cand_new)
 
         # Factored two-stage edge tensor contraction: P_m @ A_tilde @ P_m^T
         # `.contiguous()` preserves exact canonical [B, K, K, d_r] strides across steps (0 Dynamo recompiles!)
-        a_tmp = torch.einsum("bka,bacr->bkcr", p_mat_dt, a_tilde)
-        a_cand_new = torch.einsum("blc,bkcr->bklr", p_mat_dt, a_tmp).contiguous()
+        a_tmp = torch.einsum("bka,bacr->bkcr", p_mat_a, a_tilde)
+        a_cand_new = torch.einsum("blc,bkcr->bklr", p_mat_a, a_tmp).to(edges.dtype).contiguous()
 
-        # 5. Exact LogSumExp Slot Salience Conservation Equation in float32
-        omega_old_decayed = salience.float() - self.cfg.delta_decay  # [B, K]
-        omega_cand = self.w_omega(z_star).squeeze(-1).float() + self.kappa_omega.float() * surprisal_0
-        omega_tilde = torch.cat([omega_old_decayed, omega_cand.unsqueeze(-1)], dim=-1)  # [B, K+1]
-
-        w_i = omega_tilde[:, pi_idx]  # [B, 72]
-        w_j = omega_tilde[:, pj_idx]  # [B, 72]
-        w_merged = torch.logaddexp(w_i, w_j)  # [B, 72]
-        w_base = 0.5 * (w_i + w_j)
-        w_corr_pairs = alpha * (w_merged - w_base)  # [B, 72]
-        w_corr = torch.einsum("pk,bp->bk", self.pair_u_onehot, w_corr_pairs)
-        omega_cand_new = torch.einsum("bka,ba->bk", p_mat, omega_tilde) + w_corr
-
-        # Bit-exact static-shape Slot-0 invariance when already pinned (0.0 drift even in bf16!)
+        # 5. Exact LogSumExp Slot Salience Conservation Equation strictly in float32 (Precision Island #3)
         slot0_bool = self.slot0_onehot > 0.5  # [K]
         already_pinned_b = pinned_cur > 0.5  # [B]
+        with fp32_island(c_fused.device):
+            omega_old_decayed = salience.float() - self.cfg.delta_decay  # [B, K]
+            omega_cand = (
+                F.linear(z_star.float(), self.w_omega.weight.float()).squeeze(-1)
+                + self.kappa_omega.float() * surprisal_0.float()
+            )
+            omega_tilde = torch.cat([omega_old_decayed, omega_cand.unsqueeze(-1)], dim=-1)  # [B, K+1]
+
+            w_i = omega_tilde[:, pi_idx]  # [B, 72]
+            w_j = omega_tilde[:, pj_idx]  # [B, 72]
+            w_merged = torch.logaddexp(w_i, w_j)  # [B, 72]
+            w_base = 0.5 * (w_i + w_j)
+            w_corr_pairs = alpha * (w_merged - w_base)  # [B, 72]
+            w_corr = torch.einsum("pk,bp->bk", self.pair_u_onehot.float(), w_corr_pairs)
+            omega_cand_new = torch.einsum("bka,ba->bk", p_mat, omega_tilde) + w_corr
+
+            omega_cand_new = torch.where(
+                already_pinned_b.view(B, 1) & slot0_bool.view(1, K),
+                torch.maximum(omega_cand_new, torch.full_like(omega_cand_new, 2.0)),
+                omega_cand_new,
+            )
+
+        # Bit-exact static-shape Slot-0 invariance when already pinned (0.0 drift even in bf16!)
         s_cand_new = torch.where(already_pinned_b.view(B, 1, 1) & slot0_bool.view(1, K, 1), slots, s_cand_new)
-        omega_cand_new = torch.where(
-            already_pinned_b.view(B, 1) & slot0_bool.view(1, K),
-            torch.maximum(omega_cand_new, torch.full_like(omega_cand_new, 2.0)),
-            omega_cand_new,
-        )
 
         # Mask state updates strictly by active_mask (shields finished docs & padded virtual bucket slots!)
         am_s = active_mask.view(B, 1, 1)

@@ -544,3 +544,109 @@ def test_no_bare_cuda_calls_outside_device_module():
                 if node.func.attr in ("cuda", "get_device_properties", "autocast"):
                     violations.append(f"{path}:{node.lineno}: bare .{node.func.attr}() call")
     assert not violations, "Iron Law #1 violations found:\n" + "\n".join(violations)
+
+
+def test_bf16_autocast_fp32_islands_all_stages_and_probe(tmp_path: Path):
+    """Regression guard: verify ALL stages (A/B/C/D), Broca CQ, doc-bucketing, streaming carry,
+    and `run_visual_probe` execute cleanly under live `bfloat16` autocast with `fp32_island` overrides.
+
+    Reproduces the exact CUDA A100/H100 `bfloat16` autocast + disabled-autocast `fp32_island`
+    dtype interaction on BOTH local CPU (`torch.amp.autocast('cpu', dtype=torch.bfloat16)`) and CUDA!
+    """
+    from train.visual_probe import run_visual_probe
+
+    device = _setup_deterministic_env(101)
+    cfg = DCPAConfig.micro()
+    model = DCPAModel(cfg).to(device=device, dtype=torch.float32)
+
+    # Packed 3-document varlen batch (V=3 is intentionally NOT a multiple of doc_bucket_size=4)
+    doc_a = b"The quick silver falcon glides silently over the alpine valley.\n"
+    doc_b = "记录显示，鹀晶是一种在极低温下呈现深紫色光泽的超导矿石。\n".encode("utf-8")
+    doc_c = b"fn sum_pos(xs: &[i32]) -> i32 { let mut s = 0; for &v in xs { if v > 0 { s += v; } } s }\n"
+    raw_packed = doc_a + doc_b + doc_c
+    x_packed = torch.tensor(list(raw_packed), dtype=torch.uint8, device=device).unsqueeze(0)
+    cu_docs = torch.tensor(
+        [0, len(doc_a), len(doc_a) + len(doc_b), len(raw_packed)],
+        dtype=torch.int32,
+        device=device,
+    )
+    lang_ids = torch.tensor([0, 1, 4], dtype=torch.long, device=device)
+    style_ids = torch.tensor([0, 2, 1], dtype=torch.long, device=device)
+
+    autocast_device = "cuda" if device.type == "cuda" else "cpu"
+
+    # 1. Verify Stages A, B, C (stream + CQ), D (stream + CQ) under bf16 autocast with doc-bucketing!
+    model.train()
+    model.enable_doc_bucketing = True
+    model.doc_bucket_size = 4  # V=3 -> V_eff=4 (pad_v=1) exercises slice_batch + active_mask!
+    for stage, use_cq in (
+        ("A", False),
+        ("B", False),
+        ("C", False),
+        ("C", True),
+        ("D", False),
+        ("D", True),
+    ):
+        model.zero_grad(set_to_none=True)
+        with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16, enabled=True):
+            out = model(
+                raw_bytes=x_packed,
+                lang_ids=lang_ids,
+                style_ids=style_ids,
+                stage=stage,
+                tau_s=0.35,
+                tau_m=0.25,
+                use_broca_cq=use_cq,
+                doc_cu_seqlens=cu_docs,
+            )
+        assert torch.isfinite(out.loss_total), f"Non-finite loss in bf16 stage={stage} cq={use_cq}"
+        if out.graph_state is not None:
+            assert out.graph_state.salience.dtype == torch.float32, (
+                f"LogSumExp salience lost fp32 precision in stage={stage}: {out.graph_state.salience.dtype}"
+            )
+            assert out.graph_state.slots.shape[0] == 3
+        out.loss_total.backward()
+        active_grads = [p.grad for p in model.parameters() if p.grad is not None]
+        assert len(active_grads) > 0
+        assert all(torch.isfinite(g).all() for g in active_grads), (
+            f"Non-finite gradient in bf16 stage={stage} cq={use_cq}"
+        )
+
+    # 2. Verify float32 carry_state + forward_streaming_chunk under live bf16 autocast!
+    model.eval()
+    model.enable_doc_bucketing = False
+    x_single = torch.tensor(list(doc_a), dtype=torch.uint8, device=device).unsqueeze(0)
+    l_single = torch.tensor([0], dtype=torch.long, device=device)
+    carry = model.init_carry_state(batch_size=1, device=device, dtype=torch.float32)
+    with torch.no_grad():
+        with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16, enabled=True):
+            out_s1, carry = model.forward_streaming_chunk(x_single, l_single, carry_state=carry, stage="D")
+            out_s2, carry = model.forward_streaming_chunk(x_single, l_single, carry_state=carry, stage="D")
+    assert torch.isfinite(out_s1.loss_total) and torch.isfinite(out_s2.loss_total)
+
+    # 3. Verify run_visual_probe (incl. Live Wug Stage D fast-mapping) under live bf16 autocast!
+    use_bf16_flag = device.type == "cuda"
+    with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16, enabled=True):
+        probe_res = run_visual_probe(
+            model,
+            step=500,
+            total_steps=1000,
+            stage_id=1,
+            model_stage="A",
+            tau_s=0.5,
+            tau_m=0.8,
+            lr=1e-3,
+            train_metrics=out_s1.metrics,
+            device=device,
+            use_bf16=use_bf16_flag,
+            kb_per_sec=42.0,
+            max_doc_bytes=512,
+            logs_dir=tmp_path / "logs",
+        )
+    assert probe_res.wug_total == 2
+    assert np.isfinite(probe_res.wug_target_bpc)
+    assert (tmp_path / "logs" / "latest_probe.md").exists()
+    print(
+        f"[PASS bf16 Precision Islands] All stages A/B/C/D (+CQ +bucketing +carry +visual_probe) "
+        f"verified under {autocast_device} bfloat16 autocast | wug_bpc={probe_res.wug_target_bpc:.3f}"
+    )

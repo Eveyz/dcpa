@@ -190,8 +190,7 @@ class DCPAModel(nn.Module):
         w_d2: torch.Tensor,
         gumbel_u: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
-        bcg_raw = getattr(self.bcg_pc, "_orig_mod", self.bcg_pc)
-        return bcg_raw.forward_fast_dispatch(
+        return self.bcg_pc(
             in_slots,
             in_edges,
             in_sal,
@@ -393,6 +392,7 @@ class DCPAModel(nn.Module):
         style_ids: Optional[torch.Tensor] = None,
         ponder_tax_scale: Optional[torch.Tensor] = None,
         ach_override: Optional[float] = None,
+        record_traces: bool = True,
     ) -> DCPAForwardOutput:
         """Execute full-stack forward pass (rectangular [B, T] or packed varlen doc_cu_seqlens)."""
         stage = stage.upper()
@@ -688,15 +688,47 @@ class DCPAModel(nn.Module):
 
             f_out_flat = torch.zeros((m_total, d_s), device=device, dtype=sgsc_out.f_stem.dtype)
             delta_syn_flat = torch.zeros((m_total, d_s), device=device, dtype=sgsc_out.f_stem.dtype)
-            z_star_flat: Optional[torch.Tensor] = torch.zeros((m_total, D), device=device, dtype=sgsc_out.c_slow.dtype)
+            z_star_flat: Optional[torch.Tensor] = (
+                torch.zeros((m_total, D), device=device, dtype=sgsc_out.c_slow.dtype)
+                if eval_isolated_path
+                else None
+            )
 
-            s_trace_flat = torch.zeros((m_total, K, D), device=device, dtype=sgsc_out.c_slow.dtype)
-            a_trace_flat = torch.zeros((m_total, K, K, d_r), device=device, dtype=sgsc_out.c_slow.dtype)
-            alpha_trace_flat = torch.zeros((m_total, num_pairs), device=device, dtype=torch.float32)
-            win_pair_flat = torch.zeros((m_total, 3), device=device, dtype=torch.int64)
-            ach_trace_flat = torch.zeros((m_total,), device=device, dtype=torch.float32)
-            beta_max_flat = torch.zeros((m_total,), device=device, dtype=torch.float32)
-            slot0_pinned_flat = torch.zeros((m_total,), device=device, dtype=torch.float32)
+            s_trace_flat = (
+                torch.zeros((m_total, K, D), device=device, dtype=sgsc_out.c_slow.dtype)
+                if record_traces
+                else None
+            )
+            a_trace_flat = (
+                torch.zeros((m_total, K, K, d_r), device=device, dtype=sgsc_out.c_slow.dtype)
+                if record_traces
+                else None
+            )
+            alpha_trace_flat = (
+                torch.zeros((m_total, num_pairs), device=device, dtype=torch.float32)
+                if record_traces
+                else None
+            )
+            win_pair_flat = (
+                torch.zeros((m_total, 3), device=device, dtype=torch.int64)
+                if record_traces
+                else None
+            )
+            ach_trace_flat = (
+                torch.zeros((m_total,), device=device, dtype=torch.float32)
+                if record_traces
+                else None
+            )
+            beta_max_flat = (
+                torch.zeros((m_total,), device=device, dtype=torch.float32)
+                if record_traces
+                else None
+            )
+            slot0_pinned_flat = (
+                torch.zeros((m_total,), device=device, dtype=torch.float32)
+                if record_traces
+                else None
+            )
 
             pc_nll_sum = zero
             ponder_sum = zero
@@ -765,16 +797,24 @@ class DCPAModel(nn.Module):
                             pin_trigger=trig_step,
                         )
                         gd = bcg_out.state
-                        s_trace_flat[f_idx] = gd.slots[0].detach().to(s_trace_flat.dtype)
-                        a_trace_flat[f_idx] = gd.edges[0].detach().to(a_trace_flat.dtype)
-                        alpha_trace_flat[f_idx] = bcg_out.merge_alpha[0].detach().float()
-                        if gd.slot0_pinned is not None:
-                            slot0_pinned_flat[f_idx] = gd.slot0_pinned[0].detach().float()
-                        wi = bcg_out.win_i[0].detach()
-                        wj = bcg_out.win_j[0].detach()
-                        win_pair_flat[f_idx, 0] = wi
-                        win_pair_flat[f_idx, 1] = wj
-                        win_pair_flat[f_idx, 2] = torch.minimum(wi, wj)
+                        if record_traces:
+                            assert (
+                                s_trace_flat is not None
+                                and a_trace_flat is not None
+                                and alpha_trace_flat is not None
+                                and slot0_pinned_flat is not None
+                                and win_pair_flat is not None
+                            )
+                            s_trace_flat[f_idx] = gd.slots[0].detach().to(s_trace_flat.dtype)
+                            a_trace_flat[f_idx] = gd.edges[0].detach().to(a_trace_flat.dtype)
+                            alpha_trace_flat[f_idx] = bcg_out.merge_alpha[0].detach().float()
+                            if gd.slot0_pinned is not None:
+                                slot0_pinned_flat[f_idx] = gd.slot0_pinned[0].detach().float()
+                            wi = bcg_out.win_i[0].detach()
+                            wj = bcg_out.win_j[0].detach()
+                            win_pair_flat[f_idx, 0] = wi
+                            win_pair_flat[f_idx, 1] = wj
+                            win_pair_flat[f_idx, 2] = torch.minimum(wi, wj)
 
                         # Strictly causal expressive retrieval BEFORE segment-m hippocampal write:
                         # PMD decodes segment m strictly from top-down prediction c_hat_m (G_{m-1})
@@ -816,8 +856,10 @@ class DCPAModel(nn.Module):
                             beta_sum += float(beta_mat.detach().mean().item())
                             beta_count += 1
                             ach_list.append(hip_read.ach_signal)
-                            ach_trace_flat[f_idx] = hip_read.ach_signal[0].detach().float()
-                            beta_max_flat[f_idx] = beta_mat[0].detach().float().max()
+                            if record_traces:
+                                assert ach_trace_flat is not None and beta_max_flat is not None
+                                ach_trace_flat[f_idx] = hip_read.ach_signal[0].detach().float()
+                                beta_max_flat[f_idx] = beta_mat[0].detach().float().max()
                             if familiar_doc_mask is not None and bool(familiar_doc_mask[d_idx].item()):
                                 familiar_ach_list.append(hip_read.ach_signal)
 
@@ -862,6 +904,11 @@ class DCPAModel(nn.Module):
                 c_hat_chunks: list[torch.Tensor] = []
                 z_star_chunks: list[torch.Tensor] = []
                 g_ctx_chunks: list[torch.Tensor] = []
+                pi_m_chunks: list[torch.Tensor] = []
+                ponder_chunks: list[torch.Tensor] = []
+                pts_chunks: list[torch.Tensor] = []
+                merge_probs_chunks: list[torch.Tensor] = []
+                moe_bal_chunks: list[torch.Tensor] = []
                 flat_idx_chunks: list[torch.Tensor] = []
 
                 # Pre-pack MoE expert weights into 4 batched-GEMM tensors ONCE per forward()!
@@ -1021,7 +1068,7 @@ class DCPAModel(nn.Module):
                         # Update neutral concept center c_0 ONCE outside checkpoint (never doubled on bwd!)
                         bcg_raw.update_c0_from_slots(bcg_step_out[6], active_mask)
                     else:
-                        bcg_step_out = bcg_raw.forward_fast_dispatch(
+                        bcg_step_out = self.bcg_pc(
                             in_slots,
                             in_edges,
                             in_sal,
@@ -1067,22 +1114,30 @@ class DCPAModel(nn.Module):
                         slot0_pinned=slot0_pinned_next,
                     )
 
-                    # Record detached per-segment graph trajectory & forward discrete merge alpha
-                    s_trace_flat[flat_idx] = g_state.slots[active_b].detach().to(s_trace_flat.dtype)
-                    slot0_pinned_flat[flat_idx] = slot0_pinned_next[active_b].detach().float()
-                    if not self.training:
-                        a_trace_flat[flat_idx] = g_state.edges[active_b].detach().to(a_trace_flat.dtype)
-                        wi_a = win_i_step[active_b].detach()
-                        wj_a = win_j_step[active_b].detach()
-                        win_pair_flat[flat_idx, 0] = wi_a
-                        win_pair_flat[flat_idx, 1] = wj_a
-                        win_pair_flat[flat_idx, 2] = torch.minimum(wi_a, wj_a)
-                    alpha_trace_flat[flat_idx] = merge_alpha_step[active_b].detach().float()
+                    # Record detached per-segment graph trajectory & forward discrete merge alpha (only when requested)
+                    if record_traces:
+                        assert (
+                            s_trace_flat is not None
+                            and slot0_pinned_flat is not None
+                            and alpha_trace_flat is not None
+                        )
+                        s_trace_flat[flat_idx] = g_state.slots[active_b].detach().to(s_trace_flat.dtype)
+                        slot0_pinned_flat[flat_idx] = slot0_pinned_next[active_b].detach().float()
+                        if not self.training:
+                            assert a_trace_flat is not None and win_pair_flat is not None
+                            a_trace_flat[flat_idx] = g_state.edges[active_b].detach().to(a_trace_flat.dtype)
+                            wi_a = win_i_step[active_b].detach()
+                            wj_a = win_j_step[active_b].detach()
+                            win_pair_flat[flat_idx, 0] = wi_a
+                            win_pair_flat[flat_idx, 1] = wj_a
+                            win_pair_flat[flat_idx, 2] = torch.minimum(wi_a, wj_a)
+                        alpha_trace_flat[flat_idx] = merge_alpha_step[active_b].detach().float()
 
                     # Strictly causal expressive retrieval BEFORE segment-m hippocampal write:
                     # - In Stage D (hip_enabled): fast_state mutates per step, so retrieve per step
                     #   from pre-write fast_state M_{m-1} using causal top-down prediction c_hat_m!
-                    # - In Stages B/C (not hip_enabled): hoist into ONE single batched matmul after loop!
+                    # - In Stages B/C (not hip_enabled): hoist both expression & L_PC/ponder reductions
+                    #   into ONE single vectorized pass after the loop!
                     if hip_enabled:
                         f_out_all, _ = self.hippocampus.read_expression(
                             z_out=c_hat_step,
@@ -1102,6 +1157,11 @@ class DCPAModel(nn.Module):
                         c_hat_chunks.append(c_hat_step[active_b])
                         z_star_chunks.append(z_star_step[active_b])
                         g_ctx_chunks.append(g_ctx_step[active_b])
+                        pi_m_chunks.append(pi_m_step[active_b])
+                        ponder_chunks.append(ponder_step[active_b])
+                        pts_chunks.append(pts_cur[active_b])
+                        merge_probs_chunks.append(merge_probs_step[active_b])
+                        moe_bal_chunks.append(moe_bal_step)
                     flat_idx_chunks.append(flat_idx)
 
                     # Module 3 Eligibility Inheritance & Three-Factor Gated Delta Write (Stage D)
@@ -1134,7 +1194,8 @@ class DCPAModel(nn.Module):
                         beta_count += 1
                         ach_act = hip_read.ach_signal[active_b]
                         ach_list.append(ach_act)
-                        if not self.training:
+                        if (not self.training) and record_traces:
+                            assert ach_trace_flat is not None and beta_max_flat is not None
                             ach_trace_flat[flat_idx] = ach_act.detach().float()
                             beta_max_flat[flat_idx] = beta_mat[active_b].detach().float().max(dim=-1).values
                         if fam_mask_eff is not None:
@@ -1142,22 +1203,26 @@ class DCPAModel(nn.Module):
                             if fam_active.any():
                                 familiar_ach_list.append(ach_act[fam_active])
 
-                    # Precision Island #4 (Red Line #1): Accumulate L_PC strictly in float32
-                    # with STRICT stop_gradient on c_fused!
-                    with fp32_island(device):
-                        c_target_sg = c_fused_step[active_b].detach().float()
-                        c_pred = c_hat_step[active_b].float()
-                        pi_act = pi_m_step[active_b].float()
-                        err_sq = (c_target_sg - c_pred).pow(2)
-                        nll_step = 0.5 * ((pi_act * err_sq).mean(dim=-1) - torch.log(pi_act.clamp_min(1e-6)).mean(dim=-1))
-                        pc_nll_sum = pc_nll_sum + nll_step.sum()
-                        ponder_sum = ponder_sum + ponder_step[active_b].float().sum()
-                        ponder_tax_sum = ponder_tax_sum + (ponder_step[active_b].float() * pts_cur[active_b]).sum()
-                        ponder_skip_sum = ponder_skip_sum + (ponder_step[active_b].detach().float() < 0.5).float().sum()
-                        merge_probs_sum = merge_probs_sum + merge_probs_step[active_b].float().sum(dim=0)
-                        moe_bal_sum = moe_bal_sum + moe_bal_step.float()
-                        moe_bal_steps += 1
-                    total_valid_steps += int(active_b.numel())
+                    if hip_enabled:
+                        # Precision Island #4 (Red Line #1): Accumulate L_PC strictly in float32
+                        with fp32_island(device):
+                            c_target_sg = c_fused_step[active_b].detach().float()
+                            c_pred = c_hat_step[active_b].float()
+                            pi_act = pi_m_step[active_b].float()
+                            err_sq = (c_target_sg - c_pred).pow(2)
+                            nll_step = 0.5 * (
+                                (pi_act * err_sq).mean(dim=-1) - torch.log(pi_act.clamp_min(1e-6)).mean(dim=-1)
+                            )
+                            pc_nll_sum = pc_nll_sum + nll_step.sum()
+                            ponder_sum = ponder_sum + ponder_step[active_b].float().sum()
+                            ponder_tax_sum = ponder_tax_sum + (ponder_step[active_b].float() * pts_cur[active_b]).sum()
+                            ponder_skip_sum = (
+                                ponder_skip_sum + (ponder_step[active_b].detach().float() < 0.5).float().sum()
+                            )
+                            merge_probs_sum = merge_probs_sum + merge_probs_step[active_b].float().sum(dim=0)
+                            moe_bal_sum = moe_bal_sum + moe_bal_step.float()
+                            moe_bal_steps += 1
+                        total_valid_steps += int(active_b.numel())
 
                 if flat_idx_chunks:
                     order = torch.cat(flat_idx_chunks, dim=0)
@@ -1167,7 +1232,8 @@ class DCPAModel(nn.Module):
                         delta_syn_flat = torch.cat(delta_syn_chunks, dim=0)[inv_perm]
                         z_star_flat = None
                     else:
-                        c_hat_flat = torch.cat(c_hat_chunks, dim=0)[inv_perm]
+                        c_hat_all_ord = torch.cat(c_hat_chunks, dim=0)
+                        c_hat_flat = c_hat_all_ord[inv_perm]
                         z_star_flat = torch.cat(z_star_chunks, dim=0)[inv_perm]
                         g_ctx_flat = torch.cat(g_ctx_chunks, dim=0)[inv_perm]
                         f_out_all_flat, _ = self.hippocampus.read_expression(
@@ -1183,6 +1249,27 @@ class DCPAModel(nn.Module):
                         )
                         f_out_flat = f_out_all_flat.to(sgsc_out.f_stem.dtype)
                         delta_syn_flat = delta_syn_all_flat.to(sgsc_out.f_stem.dtype)
+                        with fp32_island(device):
+                            c_target_all = sgsc_out.c_slow.detach().float()[order]
+                            c_pred_all = c_hat_all_ord.float()
+                            pi_all = torch.cat(pi_m_chunks, dim=0).float()
+                            err_sq_all = (c_target_all - c_pred_all).pow(2)
+                            pc_nll_sum = (
+                                0.5
+                                * (
+                                    (pi_all * err_sq_all).mean(dim=-1)
+                                    - torch.log(pi_all.clamp_min(1e-6)).mean(dim=-1)
+                                )
+                            ).sum()
+                            ponder_all = torch.cat(ponder_chunks, dim=0).float()
+                            pts_all = torch.cat(pts_chunks, dim=0).float()
+                            ponder_sum = ponder_all.sum()
+                            ponder_tax_sum = (ponder_all * pts_all).sum()
+                            ponder_skip_sum = (ponder_all.detach() < 0.5).float().sum()
+                            merge_probs_sum = torch.cat(merge_probs_chunks, dim=0).float().sum(dim=0)
+                            moe_bal_sum = torch.stack(moe_bal_chunks).float().sum()
+                            moe_bal_steps = len(moe_bal_chunks)
+                        total_valid_steps = int(order.numel())
 
                 # Reassemble shrunk active-prefix tails back to [V_eff, ...]
                 if finished_slots:

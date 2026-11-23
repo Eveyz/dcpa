@@ -143,13 +143,11 @@ def configure_model_compile(
 
     hotspots: list[str] = []
 
-    # --- Hotspot A: BCG-PC single-step concept graph kernel + compacted Pondering/MoE sub-kernels ---
+    # --- Hotspot A: BCG-PC single-step concept graph kernel (zero-sync single fused Inductor graph) ---
     if hasattr(model, "bcg_pc"):
         bcg_raw = unwrap_compiled_module(getattr(model, "bcg_pc"))
         if hasattr(bcg_raw, "set_static_kernel_mode"):
             bcg_raw.set_static_kernel_mode(True)
-        if hasattr(bcg_raw, "enable_compiled_subkernels"):
-            bcg_raw.enable_compiled_subkernels(**compile_kwargs)
         compiled_bcg = torch.compile(bcg_raw, **compile_kwargs)
         setattr(model, "bcg_pc", compiled_bcg)
         if hasattr(model, "enable_doc_bucketing"):

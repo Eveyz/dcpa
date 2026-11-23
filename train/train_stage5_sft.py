@@ -427,6 +427,7 @@ def run_stage5_sft(
                         lambda_halt_override=0.5,
                         lambda_act_override=0.02,
                         doc_cu_seqlens=cu,
+                        record_traces=False,
                     )
                 scaled_loss = out.loss_total / float(grad_accum)
                 scaled_loss.backward()

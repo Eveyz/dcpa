@@ -1053,6 +1053,7 @@ def run_training(
                             familiar_ach_reg_weight=sc.lambda_ach_reg if sc.stage_id == 4 else 0.0,
                             familiar_doc_mask=fam_mask,
                             doc_cu_seqlens=cu_seqlens,
+                            record_traces=False,
                         )
 
                     for k, v in out.metrics.items():

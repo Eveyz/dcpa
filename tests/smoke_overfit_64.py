@@ -248,10 +248,10 @@ def _greedy_decode_single_doc(
         )
         g_state = bcg_o.state
         f_out_m, _ = model.hippocampus.read_expression(
-            z_out=bcg_o.z_star, l_reg=l_reg, fast_state=None, enabled=False
+            z_out=bcg_o.c_hat, l_reg=l_reg, fast_state=None, enabled=False
         )
         delta_syn_m = model.pmd.compute_streaming_delta_syn(
-            g_ctx=bcg_o.g_ctx, z_star=bcg_o.z_star, l_reg=l_reg
+            g_ctx=bcg_o.g_ctx, z_star=bcg_o.c_hat, l_reg=l_reg
         )
         f_outs.append(f_out_m)
         delta_syns.append(delta_syn_m)

@@ -167,9 +167,9 @@ curriculum:
     lambda_var: 1.0
     lambda_halt: 1.0
     lambda_pc_ramp_steps: 3000
-    lambda_pc_target: 1.0
-    lambda_act_delay_steps: 15000
-    lambda_act_ramp_steps: 15000
+    lambda_pc_target: 0.5
+    lambda_act_delay_steps: 1000
+    lambda_act_ramp_steps: 9000
     lambda_act_target: 0.04
   stage3:
     name: cross_lingual_reasoning_writing_and_code_stack
@@ -184,7 +184,7 @@ curriculum:
     lambda_rate: 2.0
     lambda_var: 1.0
     lambda_halt: 1.0
-    lambda_pc: 1.0
+    lambda_pc: 0.5
     lambda_act: 0.04
     code_delimiter_focal_weight: 1.5
     code_delimiter_chars: "{}()[]:;\n"

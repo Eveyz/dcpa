@@ -88,8 +88,8 @@ class ProbeResult:
 
 def format_console_header() -> str:
     return (
-        f"{'Step':>8} | {'Stg':>3} | {'Loss':>7} | {'BPC':>6} | {'rho':>5} | "
-        f"{'Std(m/mn)':>11} | {'Ent':>5} | {'Skip%':>6} | {'L_m':>4} | {'LR':>8} | {'MemGB':>5} | {'KB/s':>7}"
+        f"{'Step':>8} | {'Stg':>3} | {'Loss':>7} | {'BPC':>6} | {'PC':>6} | {'rho':>5} | "
+        f"{'Std(m/mn)':>11} | {'Ent':>5} | {'Skip%':>6} | {'L_m':>4} | {'GN':>6} | {'LR':>8} | {'MemGB':>5} | {'KB/s':>7}"
     )
 
 
@@ -104,16 +104,19 @@ def format_console_row(
 ) -> str:
     loss_tot = float(metrics.get("loss_total", 0.0))
     bpc = float(metrics.get("loss_lang", 0.0)) / LN2
+    pc_raw = float(metrics.get("loss_pc_raw", metrics.get("loss_pc", 0.0)))
     rho = float(metrics.get("compression_ratio", 0.0))
     std_m = float(metrics.get("c_slow_std_mean", 0.0))
     std_mn = float(metrics.get("c_slow_std_min", 0.0))
     ent = float(metrics.get("merge_entropy_nats", 0.0))
     skip_pct = 100.0 * float(metrics.get("ponder_skip_rate", 0.0))
     avg_l = float(metrics.get("avg_ponder_steps", 0.0))
+    gn = float(metrics.get("grad_norm", 0.0))
+    gn_str = f"{gn:6.2f}" if gn < 1000.0 else f"{gn:6.1e}"
     return (
-        f"{step:8d} | S{stage_id:<2d} | {loss_tot:7.4f} | {bpc:6.3f} | {rho:5.2f} | "
+        f"{step:8d} | S{stage_id:<2d} | {loss_tot:7.4f} | {bpc:6.3f} | {pc_raw:6.3f} | {rho:5.2f} | "
         f"{std_m:5.2f}/{std_mn:5.2f} | {ent:5.2f} | {skip_pct:5.1f}% | {avg_l:4.2f} | "
-        f"{lr:8.2e} | {mem_gb:5.2f} | {kb_per_sec:7.1f}"
+        f"{gn_str} | {lr:8.2e} | {mem_gb:5.2f} | {kb_per_sec:7.1f}"
     )
 
 
@@ -489,6 +492,7 @@ def run_visual_probe(
             model.train()
 
     mem_gb = get_peak_memory_gb(device)
+    raw_pc_nll = float(train_metrics.get("loss_pc_raw", train_metrics.get("loss_pc", 0.0)))
     rho = float(train_metrics.get("compression_ratio", 0.0))
     std_mean = float(train_metrics.get("c_slow_std_mean", 0.0))
     std_min = float(train_metrics.get("c_slow_std_min", 0.0))
@@ -501,6 +505,11 @@ def run_visual_probe(
 
     ts_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     alerts_txt = ", ".join(watchdog_alerts) if watchdog_alerts else "None"
+    decode_mode_note = (
+        "SGSC + PMD Autoencoder Efference Copy"
+        if model_stage.upper() == "A"
+        else "SGSC + PMD Strictly Causal Next-Byte Prediction"
+    )
 
     lines: list[str] = [
         f"# DCPA Visual Diagnostic Probe — Step {step:,} / {total_steps:,} (Stage {stage_id} / {model_stage})",
@@ -509,17 +518,17 @@ def run_visual_probe(
         "",
         "## 1. 核心生命体征仪表盘 (Vital Signs)",
         "",
-        "| Step / Stage | Train_BPC | Val_BPC (en / zh / ja / py / rs) | ρ = T/M | Concept_Std (Mean / Min) | Merge_Entropy | Ponder_Skip_% | Avg_L_m | VRAM_GB | KB/s |",
-        "| :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Step / Stage | Train_BPC | Val_BPC (en / zh / ja / py / rs) | Raw_PC_NLL | ρ = T/M | Concept_Std (Mean / Min) | Merge_Entropy | Ponder_Skip_% | Avg_L_m | VRAM_GB | KB/s |",
+        "| :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         (
             f"| `{step:,} / S{stage_id}({model_stage})` | `{train_bpc:.3f}` | "
             f"`{_fmt(val_by_dom['en'])} / {_fmt(val_by_dom['zh'])} / {_fmt(val_by_dom['ja'])} / "
             f"{_fmt(val_by_dom['py'])} / {_fmt(val_by_dom['rs'])}` (avg `{_fmt(val_overall)}`) | "
-            f"`{rho:.2f}x` | `{std_mean:.3f} / {std_min:.3f}` | `{merge_ent:.3f}` | "
+            f"`{raw_pc_nll:.3f}` | `{rho:.2f}x` | `{std_mean:.3f} / {std_min:.3f}` | `{merge_ent:.3f}` | "
             f"`{skip_pct:.1f}%` | `{avg_l:.2f}` | `{mem_gb:.2f}` | `{kb_per_sec:.1f}` |"
         ),
         "",
-        "## 2. 四语域脉冲切分 `|` 与副本放电重建对比 (SGSC + PMD Efference Copy)",
+        f"## 2. 四语域脉冲切分 `|` 与解码对比 ({decode_mode_note})",
         "",
     ]
 

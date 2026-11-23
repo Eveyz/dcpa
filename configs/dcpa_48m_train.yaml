@@ -142,13 +142,13 @@ optimizer:
   grad_clip_norm: 1.0
   groups:
     group_matrix_decay:
-      lr: 6.0e-4
+      lr: 4.0e-4
       weight_decay: 0.05
     group_norm_embed_nodecay:
-      lr: 6.0e-4
+      lr: 4.0e-4
       weight_decay: 0.0
     group_gates_thresholds:
-      lr: 1.2e-3
+      lr: 8.0e-4
       weight_decay: 0.0
 
 # 100,000-step 4-stage developmental curriculum state machine
@@ -191,9 +191,9 @@ curriculum:
     lambda_var: 1.0
     lambda_halt: 1.0
     lambda_pc_ramp_steps: 3000
-    lambda_pc_target: 1.0
-    lambda_act_delay_steps: 15000   # 15k..30k kept at 0.0
-    lambda_act_ramp_steps: 15000    # 30k..45k linear 0.0 -> 0.04
+    lambda_pc_target: 0.5
+    lambda_act_delay_steps: 1000    # 15k..16k kept at 0.0 during BCG local warmup
+    lambda_act_ramp_steps: 9000     # 16k..25k linear 0.0 -> 0.04 (prevents Avg_L_m=8.0 runaway)
     lambda_act_target: 0.04
   stage3:
     name: cross_lingual_reordering_and_code_stack
@@ -208,7 +208,7 @@ curriculum:
     lambda_rate: 2.0
     lambda_var: 1.0
     lambda_halt: 1.0
-    lambda_pc: 1.0
+    lambda_pc: 0.5
     lambda_act: 0.04
     code_delimiter_focal_weight: 1.5
     code_delimiter_chars: "{}()[]:;\n"

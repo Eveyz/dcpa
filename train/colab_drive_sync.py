@@ -29,7 +29,9 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -330,7 +332,45 @@ class ABDriveSyncManager:
         """
         manifest = self._read_manifest()
         if manifest is None:
-            return None
+            # If no active A/B manifest exists (e.g., after archiving stale slots to rewind cleanly),
+            # automatically resume from the highest-step archived checkpoint among `best_model.pt`
+            # and `milestone_step_*.pt`.
+            cand_paths: list[Path] = sorted(self.drive_sync_dir.glob("milestone_step_*.pt"))
+            best_p = self.drive_sync_dir / "best_model.pt"
+            if best_p.exists():
+                cand_paths.append(best_p)
+            best_ckpt: Optional[dict[str, Any]] = None
+            best_path: Optional[Path] = None
+            best_step = -1
+            for cp in cand_paths:
+                local_restore = self.local_ckpt_dir / f"resume_{cp.name}"
+                try:
+                    shutil.copyfile(cp, local_restore)
+                    ck = torch.load(str(local_restore), map_location=map_location, weights_only=False)
+                    st = int(ck.get("step", -1))
+                    if st > best_step:
+                        best_step = st
+                        best_ckpt = ck
+                        best_path = cp
+                except Exception as exc:
+                    print(f"[DriveSync][WARN] Skipping unreadable fallback checkpoint {cp.name}: {exc}", flush=True)
+            if best_ckpt is None or best_path is None:
+                return None
+            stage_id = str(best_ckpt.get("stage_id", "A"))
+            print(
+                f"[DriveSync][RESUME] No manifest.json; auto-resuming from {best_path.name} "
+                f"| step={best_step} | stage={stage_id}",
+                flush=True,
+            )
+            return ResumeResult(
+                checkpoint=best_ckpt,
+                slot_used=best_path.name,
+                fallback_triggered=True,
+                source_path=best_path,
+                step=best_step,
+                stage_id=stage_id,
+                reason=f"Auto-resumed from {best_path.name} (no active manifest.json)",
+            )
 
         slots_meta = manifest.get("slots", {})
         active = manifest.get("active_slot")
@@ -423,3 +463,157 @@ def sync_file_to_drive(local_path: str | Path, drive_dir: str | Path, dest_name:
     if written != expected_size or dst.stat().st_size != expected_size:
         raise IOError(f"Failed syncing {src} -> {dst}: expected={expected_size}, written={written}")
     return dst
+
+
+def restore_drive_log_file(
+    drive_logs_dir: Optional[str | Path],
+    local_logs_dir: str | Path,
+    filename: str,
+) -> Optional[Path]:
+    """Restore an append-only log file (e.g. `metrics.jsonl`) from Drive onto fresh NVMe before appending."""
+    if drive_logs_dir is None:
+        return None
+    src = Path(drive_logs_dir) / filename
+    dst = Path(local_logs_dir) / filename
+    if src.exists() and not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copyfile(src, dst)
+            return dst
+        except Exception as exc:
+            print(f"[DriveSync][WARN] Could not restore {src} -> {dst}: {exc}", flush=True)
+    return None
+
+
+class _TeeStream:
+    """Transparent stdout/stderr tee writing immediately to local NVMe log file."""
+
+    def __init__(self, orig_stream: Any, log_fp: Any) -> None:
+        self._orig = orig_stream
+        self._fp = log_fp
+
+    def write(self, data: str) -> int:
+        n = self._orig.write(data)
+        if data and not self._fp.closed:
+            try:
+                self._fp.write(data)
+                if "\n" in data:
+                    self._fp.flush()
+            except Exception:
+                pass
+        return n
+
+    def flush(self) -> None:
+        self._orig.flush()
+        if not self._fp.closed:
+            try:
+                self._fp.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._orig, "isatty", lambda: False)())
+
+    def fileno(self) -> int:
+        return self._orig.fileno()
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._orig, "encoding", "utf-8")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._orig, name)
+
+
+class RunLogTee:
+    """Capture full console stdout+stderr to NVMe and mirror safely to Google Drive `logs/`.
+
+    Writes all hot line-by-line output ONLY to local NVMe (`<local_logs_dir>/train_run_<ts>.log`)
+    and periodically (plus on rollbacks, probes, checkpoints, and exit/crash) syncs in-place to:
+      - `<drive_logs_dir>/train_run_<ts>.log` (per-session archive, never overwrites past runs)
+      - `<drive_logs_dir>/train_latest.log`   (fixed pointer to the latest run's full console log)
+      - `<drive_logs_dir>/watchdog_events.jsonl` (whenever present)
+    """
+
+    def __init__(
+        self,
+        local_logs_dir: str | Path,
+        drive_logs_dir: Optional[str | Path] = None,
+        *,
+        sync_interval_seconds: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.local_logs_dir = Path(local_logs_dir)
+        self.drive_logs_dir = Path(drive_logs_dir) if drive_logs_dir is not None else None
+        self.sync_interval_seconds = max(0.0, float(sync_interval_seconds))
+        self._clock = clock
+        self.local_logs_dir.mkdir(parents=True, exist_ok=True)
+        if self.drive_logs_dir is not None:
+            self.drive_logs_dir.mkdir(parents=True, exist_ok=True)
+
+        ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        base_name = f"train_run_{ts}"
+        candidate = f"{base_name}.log"
+        suffix = 1
+        while (self.local_logs_dir / candidate).exists() or (
+            self.drive_logs_dir is not None and (self.drive_logs_dir / candidate).exists()
+        ):
+            candidate = f"{base_name}_{suffix}.log"
+            suffix += 1
+        self.log_filename = candidate
+        self.local_log_path = self.local_logs_dir / self.log_filename
+        self._fp: Optional[Any] = None
+        self._orig_stdout: Optional[Any] = None
+        self._orig_stderr: Optional[Any] = None
+        self._last_sync_t: float = -1e9
+
+    def __enter__(self) -> "RunLogTee":
+        self._fp = self.local_log_path.open("a", encoding="utf-8", buffering=1)
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+        sys.stdout = _TeeStream(self._orig_stdout, self._fp)
+        sys.stderr = _TeeStream(self._orig_stderr, self._fp)
+        return self
+
+    def sync_to_drive(self, *, force: bool = False) -> bool:
+        if self.drive_logs_dir is None or self._fp is None or self._fp.closed:
+            return False
+        now = self._clock()
+        if not force and (now - self._last_sync_t) < self.sync_interval_seconds:
+            return False
+        try:
+            self._fp.flush()
+            sync_file_to_drive(self.local_log_path, self.drive_logs_dir, dest_name=self.log_filename)
+            sync_file_to_drive(self.local_log_path, self.drive_logs_dir, dest_name="train_latest.log")
+            wd_events = self.local_logs_dir / "watchdog_events.jsonl"
+            if wd_events.exists():
+                sync_file_to_drive(wd_events, self.drive_logs_dir, dest_name="watchdog_events.jsonl")
+            self._last_sync_t = now
+            return True
+        except Exception as exc:
+            err_stream = self._orig_stderr if self._orig_stderr is not None else sys.stderr
+            try:
+                err_stream.write(f"[DriveSync][WARN] Failed syncing training log to Drive: {exc}\n")
+                err_stream.flush()
+            except Exception:
+                pass
+            return False
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+        if exc_type is not None and self._fp is not None and not self._fp.closed:
+            try:
+                tb_text = "".join(traceback.format_exception(exc_type, exc_val, exc_tb))
+                self._fp.write(f"\n[RunLogTee][EXIT] {tb_text}\n")
+                self._fp.flush()
+            except Exception:
+                pass
+        if self._orig_stdout is not None:
+            sys.stdout = self._orig_stdout
+        if self._orig_stderr is not None:
+            sys.stderr = self._orig_stderr
+        try:
+            self.sync_to_drive(force=True)
+        finally:
+            if self._fp is not None and not self._fp.closed:
+                self._fp.close()
+        return False

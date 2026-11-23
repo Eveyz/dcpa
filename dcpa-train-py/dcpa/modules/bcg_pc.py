@@ -400,26 +400,28 @@ class BCGPC(nn.Module):
 
         for l_idx in range(self.cfg.l_max):
             thresh = self.cfg.tau_skip if l_idx == 0 else self.cfg.tau_halt
+            prev_active_f = active.float()
             still_surprised = surp_cur > thresh
             active = active & still_surprised
 
-            # Differentiable STE ponder counter masked by active_mask
-            soft_act = torch.sigmoid((surp_cur - thresh) / 0.1) * am_f
+            # Differentiable STE ponder counter gated strictly on samples still active entering step l_idx
+            # (zero phantom gradient on already-skipped/halted samples; tau_ste=0.25 prevents sigmoid saturation).
+            soft_act = torch.sigmoid((surp_cur - thresh) / 0.25) * prev_active_f
             hard_act = active.float()
             ste_act = (hard_act - soft_act).detach() + soft_act
             ponder_steps = ponder_steps + ste_act
 
             if not active.any():
-                # Exact bit-identical STE contribution for all remaining dead iterations (hard_act == 0)
-                rem = (self.cfg.l_max - 1) - l_idx
-                if rem > 0:
-                    soft_rem = torch.sigmoid((surp_cur - self.cfg.tau_halt) / 0.1) * am_f
-                    ponder_steps = ponder_steps + float(rem) * (soft_rem - soft_rem.detach())
                 break
 
             act_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
             z_a = z_cur[act_idx]
             eps_a = eps_cur[act_idx]
+            if self.training and l_idx > 0:
+                # Zero-ULP straight-through ponder carry damping (0.5): bit-identical forward while
+                # bounding 8-step recurrent Jacobian amplification O(0.5^7) inside deep pondering.
+                z_a = z_a.detach() + 0.5 * (z_a - z_a.detach())
+                eps_a = eps_a.detach() + 0.5 * (eps_a - eps_a.detach())
             s_bar_a = s_bar_prev[act_idx]
 
             r_a = self.cross_attn(z_a, s_bar_a)
@@ -441,7 +443,7 @@ class BCGPC(nn.Module):
             eps_cur = eps_next
 
             surp_next = surp_cur.clone()
-            surp_next[act_idx] = eps_next_a.float().norm(dim=-1) / math.sqrt(D)
+            surp_next[act_idx] = torch.sqrt(eps_next_a.float().pow(2).mean(dim=-1) + 1e-8)
             surp_cur = surp_next
 
         moe_bal_loss = moe_bal_sum / moe_bal_count.clamp_min(1.0)
@@ -507,17 +509,29 @@ class BCGPC(nn.Module):
 
         ach_f32 = ach.float().clamp(0.0, 1.0)
         prec_bu_f32 = prec_bu.float().clamp_min(0.0)
-        pi_eff = pi_m * (1.0 - ach_f32).unsqueeze(-1)
+        # Detach top-down prior precision pi_m inside pondering gate/fusion so L_ponder cannot
+        # cheat pondering tax by collapsing pi_m -> 0 (pi_m is calibrated strictly via L_PC).
+        pi_m_sg = pi_m.detach()
+        pi_eff = pi_m_sg * (1.0 - ach_f32).unsqueeze(-1)
 
-        eps_0 = (pi_eff * (c_fused.float() - c_hat.float())).to(orig_dtype)
-        surprisal_0 = eps_0.float().norm(dim=-1) / math.sqrt(D)  # [B] fp32
+        eps_0_surp = (pi_eff * (c_fused.float() - c_hat.float())).to(orig_dtype)
+        surprisal_0 = torch.sqrt(eps_0_surp.float().pow(2).mean(dim=-1) + 1e-8)  # [B] fp32
 
-        # Bayesian precision fusion + fast shortcut
+        # Bayesian precision fusion + fast shortcut projected onto unit-RMS concept manifold:
+        #   - Detaching c_hat on the slot-write path (c_hat is supervised directly at every step by
+        #     L_PC and L_lang) eliminates the unnormalized slots -> g_ctx -> f_pred -> w_fast -> z_0
+        #     recurrent Jacobian feedback loop across long documents (512B..4096B).
+        #   - Applying self.norm_ponder guarantees z_0 lives on the exact same unit-RMS sphere
+        #     whether Pondering skips (L_m=0) or iterates (L_m=1..8), matching dcpa-core-rs.
+        c_hat_z = c_hat.detach()
+        eps_0 = (pi_eff * (c_fused.float() - c_hat_z.float())).to(orig_dtype)
         z_cur = (
-            (pi_m * c_hat.float() + prec_bu_f32 * c_fused.float())
-            / (pi_m + prec_bu_f32 + self.cfg.eps)
+            (pi_m_sg * c_hat_z.float() + prec_bu_f32 * c_fused.float())
+            / (pi_m_sg + prec_bu_f32 + self.cfg.eps)
         ).to(orig_dtype)
-        z_cur = z_cur + (1.0 - ach_f32).unsqueeze(-1).to(orig_dtype) * self.w_fast(eps_0)
+        z_cur = self.norm_ponder(
+            z_cur + (1.0 - ach_f32).unsqueeze(-1).to(orig_dtype) * self.w_fast(eps_0)
+        )
 
         # 2. Event-Driven Pondering (L_max = 8) + Switch MoE load-balancing aux loss
         if static_mode:
@@ -534,19 +548,27 @@ class BCGPC(nn.Module):
 
             for l_idx in range(self.cfg.l_max):
                 thresh = self.cfg.tau_skip if l_idx == 0 else self.cfg.tau_halt
+                prev_active_f = active.float()
                 still_surprised = surp_cur > thresh
                 active = active & still_surprised
 
-                # Differentiable STE ponder counter masked by active_mask
-                soft_act = torch.sigmoid((surp_cur - thresh) / 0.1) * active_mask.float()
+                # Differentiable STE ponder counter gated strictly on samples still active entering step l_idx
+                soft_act = torch.sigmoid((surp_cur - thresh) / 0.25) * prev_active_f
                 hard_act = active.float()
                 ste_act = (hard_act - soft_act).detach() + soft_act
                 ponder_steps = ponder_steps + ste_act
 
+                if self.training and l_idx > 0:
+                    z_in = z_cur.detach() + 0.5 * (z_cur - z_cur.detach())
+                    eps_in = eps_cur.detach() + 0.5 * (eps_cur - eps_cur.detach())
+                else:
+                    z_in = z_cur
+                    eps_in = eps_cur
+
                 # Zero-sync fused 4-BMM pondering (zero .any() / nonzero() graph breaks!)
-                r_all = self.cross_attn.forward_with_kv(z_cur, k_prev, v_prev)
+                r_all = self.cross_attn.forward_with_kv(z_in, k_prev, v_prev)
                 delta_all, bal_l = self.moe(
-                    eps_cur + r_all,
+                    eps_in + r_all,
                     static_shape=True,
                     sample_mask=active,
                     packed_weights=eff_packed_w,
@@ -554,7 +576,7 @@ class BCGPC(nn.Module):
                 moe_bal_sum = moe_bal_sum + bal_l
                 moe_bal_count = moe_bal_count + (active.float().sum() > 0.0).float()
 
-                z_cand = self.norm_ponder(z_cur + self.cfg.ponder_eta * delta_all).to(z_cur.dtype)
+                z_cand = self.norm_ponder(z_in + self.cfg.ponder_eta * delta_all).to(z_cur.dtype)
                 act_col = active.unsqueeze(-1)
                 z_cur = torch.where(act_col, z_cand, z_cur)
 
@@ -562,7 +584,7 @@ class BCGPC(nn.Module):
                     pi_eff * (c_fused.float() - self.w_gen(z_cand).float())
                 ).to(orig_dtype)
                 eps_cur = torch.where(act_col, eps_cand, eps_cur)
-                surp_cand = eps_cand.float().norm(dim=-1) / math.sqrt(D)
+                surp_cand = torch.sqrt(eps_cand.float().pow(2).mean(dim=-1) + 1e-8)
                 surp_cur = torch.where(active, surp_cand, surp_cur)
 
             moe_bal_loss = moe_bal_sum / moe_bal_count.clamp_min(1.0)
@@ -589,9 +611,14 @@ class BCGPC(nn.Module):
 
         a_ij = a_tilde[:, pi_idx, pj_idx, :]  # [B, 72, d_r]
 
-        wl_all = self.w_l(s_tilde)  # [B, K+1, d_m]
-        wr_all = self.w_r(s_tilde)  # [B, K+1, d_m]
-        h_merge = torch.tanh(wl_all[:, pi_idx, :] + wr_all[:, pj_idx, :] + self.w_edge_score(a_ij))
+        # Decouple discrete 72-pair merge router inputs from the recurrent slot/edge carrier Jacobian:
+        # router weights (w_l, w_r, w_edge_score, w_merge) receive exact Gumbel-STE gradients without
+        # injecting an O(||S||_2 / tau_m) discrete slot-swap Jacobian back into slots_{m-1}.
+        s_tilde_score = s_tilde.detach()
+        a_ij_score = a_ij.detach()
+        wl_all = self.w_l(s_tilde_score)  # [B, K+1, d_m]
+        wr_all = self.w_r(s_tilde_score)  # [B, K+1, d_m]
+        h_merge = torch.tanh(wl_all[:, pi_idx, :] + wr_all[:, pj_idx, :] + self.w_edge_score(a_ij_score))
         m_score = self.w_merge(h_merge).squeeze(-1).float()  # [B, 72] fp32
 
         # Precision Island #3 (Red Line #1) + Branchless Slot-0 Pinning Mask (Spec 2 / Red Line #3)
@@ -610,12 +637,12 @@ class BCGPC(nn.Module):
                 if use_gumbel:
                     u_rand = torch.rand_like(m_score_f)
                     gumbel = -torch.log(-torch.log(u_rand + 1e-7) + 1e-7)
-                    logits_eff = torch.where(
+                    unscaled_logits = torch.where(
                         eps_u > 0.0,
                         torch.log(merge_probs.clamp_min(1e-8)) - pin_penalty,
-                        scaled_logits,
+                        m_score_f,
                     )
-                    y_soft = F.softmax(logits_eff + gumbel, dim=-1)
+                    y_soft = F.softmax((unscaled_logits + gumbel) / tau_eff, dim=-1)
                 else:
                     y_soft = merge_probs
                 win_idx = y_soft.argmax(dim=-1)  # [B]

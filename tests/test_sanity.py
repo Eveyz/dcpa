@@ -142,14 +142,29 @@ def test_causality_and_varlen_isolation():
     diff_f = (out_a.sgsc.f_stem[:m_cut] - out_b.sgsc.f_stem[:m_cut]).abs().max().item()
     diff_S = (out_a.s_trace[:m_cut] - out_b.s_trace[:m_cut]).abs().max().item()
     diff_A = (out_a.a_trace[:m_cut] - out_b.a_trace[:m_cut]).abs().max().item()
+    # Strict byte-level PMD causality ALL THE WAY to byte 127 (including inside any segment
+    # straddling byte 128!) — proves ZERO same-segment c_slow[m] autoencoder shortcut leakage!
     diff_pmd_logits = (
-        out_a.pmd.byte_logits[:, : t_cut + 1, :] - out_b.pmd.byte_logits[:, : t_cut + 1, :]
+        out_a.pmd.byte_logits[:, :128, :] - out_b.pmd.byte_logits[:, :128, :]
     ).abs().max().item()
-    bcg_pmd_diff = max(diff_c, diff_f, diff_S, diff_A, diff_pmd_logits)
+    diff_pmd_halt = (
+        out_a.pmd.p_seg_end[:, :128] - out_b.pmd.p_seg_end[:, :128]
+    ).abs().max().item()
+
+    # Also verify Stage D (Hippocampus enabled) has ZERO same-segment fast-weight or c_slow leakage up to byte 127!
+    with torch.no_grad():
+        out_da = model(x_a, lang_1, stage="D", tau_s=0.35, tau_m=0.25, use_broca_cq=False, write_threshold_override=0.0)
+        out_db = model(x_b, lang_1, stage="D", tau_s=0.35, tau_m=0.25, use_broca_cq=False, write_threshold_override=0.0)
+    diff_pmd_stage_d = (
+        out_da.pmd.byte_logits[:, :128, :] - out_db.pmd.byte_logits[:, :128, :]
+    ).abs().max().item()
+
+    bcg_pmd_diff = max(diff_c, diff_f, diff_S, diff_A, diff_pmd_logits, diff_pmd_halt, diff_pmd_stage_d)
 
     print(
         f"[Test 1B] t_cut={t_cut}, m_cut={m_cut}: diff_c={diff_c:.3e}, diff_f={diff_f:.3e}, "
-        f"diff_S={diff_S:.3e}, diff_A={diff_A:.3e}, diff_pmd_logits={diff_pmd_logits:.3e}"
+        f"diff_S={diff_S:.3e}, diff_A={diff_A:.3e}, diff_pmd_logits(:128)={diff_pmd_logits:.3e}, "
+        f"diff_pmd_stage_D(:128)={diff_pmd_stage_d:.3e}"
     )
     assert bcg_pmd_diff <= 1e-7, f"1B FAIL: cross-segment/decoder causality diff={bcg_pmd_diff}"
 

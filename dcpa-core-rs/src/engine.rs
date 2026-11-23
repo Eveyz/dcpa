@@ -464,15 +464,21 @@ impl DcpaEngine {
         let inv_sqrt_d = 1.0 / sqrtf(d as f32);
         let surprisal_0 = l2_norm_f32(&self.scratch.vec_d_d) * inv_sqrt_d;
 
-        // Bayesian precision fusion + fast path
+        // Bayesian precision fusion + fast path projected onto unit-RMS concept manifold (norm_ponder)
         linear_f32(&self.scratch.vec_d_d, &self.weights.bcg_w_fast, None, &mut self.scratch.vec_d_e);
         for i in 0..d {
             let pi_td = self.scratch.vec_d_c[i];
             let pi_bu = self.scratch.hip_prec_bu[i].max(0.0);
             let fused = (pi_td * self.scratch.vec_d_b[i] + pi_bu * self.scratch.hip_c_fused[i])
                 / (pi_td + pi_bu + cfg.eps);
-            self.scratch.vec_d_g[i] = fused + one_minus_ach * self.scratch.vec_d_e[i];
+            self.scratch.vec_d_e[i] = fused + one_minus_ach * self.scratch.vec_d_e[i];
         }
+        rmsnorm_f32(
+            &self.scratch.vec_d_e,
+            &self.weights.bcg_norm_ponder,
+            cfg.eps,
+            &mut self.scratch.vec_d_g,
+        );
 
         // Event-driven pondering loop (L_max = 4; immediate shortcut when surprisal <= tau_skip!)
         let mut surp_cur = surprisal_0;

@@ -653,7 +653,14 @@ class CheckpointManager:
                 if canon in clean_sd:
                     remapped[tk] = clean_sd[canon]
             target_mod.load_state_dict(remapped, strict=True)
+        # Preserve active YAML config's `base_lr` per group across resume so LR tuning in YAML
+        # takes effect immediately while retaining 100% of AdamW momentum (exp_avg / exp_avg_sq).
+        configured_base_lrs = [
+            float(g.get("base_lr", g["lr"])) for g in optimizer.param_groups
+        ]
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        for g, cfg_blr in zip(optimizer.param_groups, configured_base_lrs):
+            g["base_lr"] = cfg_blr
         if hasattr(controller, "load_state_dict"):
             controller.load_state_dict(ckpt.get("scheduler_state"))
         if watchdog is not None:

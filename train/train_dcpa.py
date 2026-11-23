@@ -51,7 +51,9 @@ from train.colab_drive_sync import (
     ABDriveSyncManager,
     CheckpointTrigger,
     MILESTONE_STEPS,
+    RunLogTee,
     assert_not_drive_path,
+    restore_drive_log_file,
     sync_file_to_drive,
 )
 from train.curriculum_state_machine import (
@@ -536,176 +538,219 @@ def run_training(
     eff_logs_dir.mkdir(parents=True, exist_ok=True)
     eff_export_dir.mkdir(parents=True, exist_ok=True)
 
-    # Hardware detection & auto grad-accum sharding (Iron Law #1 + Deliverable 1)
-    yaml_target_bytes = hw_cfg.get("target_tokens_bytes_per_step")
-    profile = detect_hardware_profile(
-        preferred=device_str,
-        deterministic=deterministic,
-        target_tokens_bytes_per_step=(
-            target_tokens_bytes_per_step
-            if target_tokens_bytes_per_step is not None
-            else (int(yaml_target_bytes) if (yaml_target_bytes is not None and device_str == "cuda") else None)
-        ),
-    )
-    device = profile.device
-    allow_tf32 = False if deterministic else bool(hw_cfg.get("allow_tf32", True))
-    configure_cuda_tf32(device, allow=allow_tf32)
-    reset_peak_memory_stats(device)
+    # Restore append-only Drive logs onto fresh NVMe before appending so Colab reconnects
+    # preserve full continuous training telemetry across sessions.
+    restore_drive_log_file(drive_logs_dir, eff_logs_dir, "metrics.jsonl")
+    restore_drive_log_file(drive_logs_dir, eff_logs_dir, "watchdog_events.jsonl")
 
-    use_bf16 = bool(profile.use_bf16 and hw_cfg.get("bf16_autocast", True) and not deterministic)
-    if hw_cfg.get("use_grad_scaler", False):
-        raise ValueError("Red Line #1 violation: GradScaler is strictly forbidden with bfloat16!")
-
-    eff_target_bytes = (
-        int(target_tokens_bytes_per_step)
-        if target_tokens_bytes_per_step is not None
-        else int(profile.target_tokens_bytes_per_step)
-    )
-    eff_micro_bytes = (
-        int(micro_batch_bytes)
-        if micro_batch_bytes is not None
-        else min(int(profile.micro_batch_bytes), eff_target_bytes)
-    )
-    eff_micro_bytes = max(64, eff_micro_bytes)
-    grad_accum_steps = max(1, math.ceil(eff_target_bytes / eff_micro_bytes))
-    actual_step_bytes = eff_micro_bytes * grad_accum_steps
-
-    print(describe_hardware_profile(profile), flush=True)
-    print(
-        f"[Plan] preset={eff_preset} | total_steps={eff_total_steps:,} | "
-        f"boundaries={list(eff_boundaries)} | micro_batch_bytes={eff_micro_bytes:,} | "
-        f"grad_accum_steps={grad_accum_steps} | effective_bytes_per_step={actual_step_bytes:,} | "
-        f"bf16={use_bf16} | grad_scaler=False",
-        flush=True,
-    )
-
-    seed_everything(seed, device=device)
-    cfg = build_dcpa_config(eff_preset, yaml_cfg)
-    model = DCPAModel(cfg).to(device)
-    optimizer = create_dcpa_optimizer(model, optimizer_cfg=opt_cfg)
-    grad_clip_norm = float(opt_cfg.get("grad_clip_norm", cfg.grad_clip_norm))
-
-    # Selective static-shape torch.compile on Hotspot A (BCG step) & Hotspot B (SGSC/PMD scans) ONLY
-    req_compile_mode = (
-        compile_mode
-        if compile_mode is not None
-        else str(hw_cfg.get("compile_mode", "none"))
-    )
-    compile_report = configure_model_compile(
-        model,
-        compile_mode=req_compile_mode,
-        device=device,
-        doc_bucket_size=int(hw_cfg.get("compile_doc_bucket_size", 16)),
-        cache_size_limit=int(hw_cfg.get("compile_cache_size_limit", 64)),
-        allow_cpu_compile=allow_cpu_compile,
-    )
-    print(
-        f"[Compile] requested={compile_report.requested_mode} -> effective={compile_report.effective_mode} "
-        f"| backend={compile_report.backend} | hotspots={list(compile_report.compiled_hotspots)} "
-        f"| doc_bucket={compile_report.doc_bucket_size} | cache_limit={compile_report.cache_size_limit}"
-        + (f" ({compile_report.fallback_reason})" if compile_report.fallback_reason else ""),
-        flush=True,
-    )
-
-    controller = CurriculumController(curriculum_cfg=curr_cfg, stage_boundaries=eff_boundaries)
-
-    if watchdog_warmup_steps is not None:
-        wd_cfg["rule_bcd_warmup_steps"] = int(watchdog_warmup_steps)
-    wd_cfg["max_consecutive_rollbacks"] = int(max_consecutive_meltdowns)
-    watchdog = SelfHealingWatchdog(
-        watchdog_cfg=wd_cfg,
-        base_seed=seed,
-        events_log_path=eff_logs_dir / "watchdog_events.jsonl",
-    )
-
-    eff_healthy_every = (
-        int(save_every_steps)
-        if save_every_steps is not None
-        else int(ck_cfg.get("healthy_save_every_steps", 1000))
-    )
-    eff_milestone_every = (
-        int(milestone_every_steps)
-        if milestone_every_steps is not None
-        else int(ck_cfg.get("milestone_every_steps", 5000))
-    )
-    eff_probe_every = (
-        int(probe_every_steps)
-        if probe_every_steps is not None
-        else int(vp_cfg.get("probe_every_steps", 500))
-    )
-    eff_console_every = (
-        int(console_every_steps)
-        if console_every_steps is not None
-        else int(vp_cfg.get("console_every_steps", 50))
-    )
-    eff_stage_milestones = (
-        milestone_steps if milestone_steps is not None else controller.stage_boundary_milestones()
-    )
-
-    ckpt_mgr = CheckpointManager(
-        ckpt_dir=eff_ckpt_dir,
-        healthy_save_every_steps=eff_healthy_every,
-        milestone_every_steps=eff_milestone_every,
-        stage_boundaries=eff_stage_milestones,
-    )
-
-    # Optional Colab A/B Ping-Pong Drive sync + 10-minute wall-clock trigger (Iron Law #3)
-    sync_mgr: Optional[ABDriveSyncManager] = None
-    if drive_sync_dir is not None:
-        sync_mgr = ABDriveSyncManager(
-            local_cache_dir=local_cache,
-            drive_sync_dir=drive_sync_dir,
-            milestone_steps=eff_stage_milestones if eff_stage_milestones else MILESTONE_STEPS,
-        )
-    wall_trigger = CheckpointTrigger(
-        save_every_steps=eff_healthy_every,
-        save_every_minutes=save_every_minutes,
+    run_log = RunLogTee(
+        local_logs_dir=eff_logs_dir,
+        drive_logs_dir=drive_logs_dir,
+        sync_interval_seconds=max(30.0, float(heartbeat_seconds)),
         clock=clock,
     )
-
-    # Hot NVMe Ragged byte stream (+ optional Stage 3 cap_reasoning & cap_writing 35% mix)
-    train_bin = (Path(data_dir) / "train.bin") if data_dir is not None else None
-    train_idx = (Path(data_dir) / "train.idx") if data_dir is not None else None
-    val_bin = (Path(data_dir) / "val.bin") if data_dir is not None else None
-    val_idx = (Path(data_dir) / "val.idx") if data_dir is not None else None
-    s3_cap_ratio = float(curr_cfg.get("stage3", {}).get("cap_mix_ratio", 0.35))
-    cap_dir_path = Path(cap_data_dir) if cap_data_dir is not None else None
-    stream = _DynamicRaggedCursorStream(
-        train_bin,
-        train_idx,
-        seed=seed,
-        cap_data_dir=cap_dir_path,
-        stage3_cap_mix_ratio=s3_cap_ratio,
-    )
-    if stream.has_shards:
-        print(f"[Data] Opened NVMe Ragged UTF-8 stream: {train_bin}", flush=True)
-    if stream._cap_shards:
+    run_log.__enter__()
+    _exit_exc: tuple[Any, Any, Any] = (None, None, None)
+    stream: Optional[_DynamicRaggedCursorStream] = None
+    try:
         print(
-            f"[Data] Stage 3 capability mix active ({s3_cap_ratio*100:.0f}%): "
-            f"{[p[0].name for p in stream._cap_shards]}",
+            f"[Logs] Local console log: {run_log.local_log_path}"
+            + (
+                f" | Drive mirror: {Path(drive_logs_dir) / run_log.log_filename} & train_latest.log"
+                if drive_logs_dir is not None
+                else ""
+            ),
+            flush=True,
+        )
+        # Hardware detection & auto grad-accum sharding (Iron Law #1 + Deliverable 1)
+        yaml_target_bytes = hw_cfg.get("target_tokens_bytes_per_step")
+        profile = detect_hardware_profile(
+            preferred=device_str,
+            deterministic=deterministic,
+            target_tokens_bytes_per_step=(
+                target_tokens_bytes_per_step
+                if target_tokens_bytes_per_step is not None
+                else (int(yaml_target_bytes) if (yaml_target_bytes is not None and device_str == "cuda") else None)
+            ),
+        )
+        device = profile.device
+        allow_tf32 = False if deterministic else bool(hw_cfg.get("allow_tf32", True))
+        configure_cuda_tf32(device, allow=allow_tf32)
+        reset_peak_memory_stats(device)
+
+        use_bf16 = bool(profile.use_bf16 and hw_cfg.get("bf16_autocast", True) and not deterministic)
+        if hw_cfg.get("use_grad_scaler", False):
+            raise ValueError("Red Line #1 violation: GradScaler is strictly forbidden with bfloat16!")
+
+        eff_target_bytes = (
+            int(target_tokens_bytes_per_step)
+            if target_tokens_bytes_per_step is not None
+            else int(profile.target_tokens_bytes_per_step)
+        )
+        eff_micro_bytes = (
+            int(micro_batch_bytes)
+            if micro_batch_bytes is not None
+            else min(int(profile.micro_batch_bytes), eff_target_bytes)
+        )
+        eff_micro_bytes = max(64, eff_micro_bytes)
+        grad_accum_steps = max(1, math.ceil(eff_target_bytes / eff_micro_bytes))
+        actual_step_bytes = eff_micro_bytes * grad_accum_steps
+
+        print(describe_hardware_profile(profile), flush=True)
+        print(
+            f"[Plan] preset={eff_preset} | total_steps={eff_total_steps:,} | "
+            f"boundaries={list(eff_boundaries)} | micro_batch_bytes={eff_micro_bytes:,} | "
+            f"grad_accum_steps={grad_accum_steps} | effective_bytes_per_step={actual_step_bytes:,} | "
+            f"bf16={use_bf16} | grad_scaler=False",
             flush=True,
         )
 
-    # Resume handling (auto: Colab A/B Ping-Pong first if configured, else local CheckpointManager)
-    start_step = 0
-    resumed_from_step = 0
-    fallback_resume_used = False
-    best_val_metric = float("inf")
+        seed_everything(seed, device=device)
+        cfg = build_dcpa_config(eff_preset, yaml_cfg)
+        model = DCPAModel(cfg).to(device)
+        optimizer = create_dcpa_optimizer(model, optimizer_cfg=opt_cfg)
+        grad_clip_norm = float(opt_cfg.get("grad_clip_norm", cfg.grad_clip_norm))
 
-    if resume and resume.lower() != "none":
-        if resume.lower() == "auto":
-            loaded_ckpt: Optional[dict[str, Any]] = None
-            if sync_mgr is not None:
-                res = sync_mgr.load_latest_auto(map_location=device)
-                if res is not None:
-                    loaded_ckpt = res.checkpoint
-                    fallback_resume_used = res.fallback_triggered
-            if loaded_ckpt is None:
-                latest_local = ckpt_mgr.find_latest_checkpoint()
-                if latest_local is not None:
-                    loaded_ckpt = ckpt_mgr.load_checkpoint(latest_local, map_location=device)
-                    print(f"[Resume] Loaded local checkpoint: {latest_local}", flush=True)
-            if loaded_ckpt is not None:
+        # Selective static-shape torch.compile on Hotspot A (BCG step) & Hotspot B (SGSC/PMD scans) ONLY
+        req_compile_mode = (
+            compile_mode
+            if compile_mode is not None
+            else str(hw_cfg.get("compile_mode", "none"))
+        )
+        compile_report = configure_model_compile(
+            model,
+            compile_mode=req_compile_mode,
+            device=device,
+            doc_bucket_size=int(hw_cfg.get("compile_doc_bucket_size", 16)),
+            cache_size_limit=int(hw_cfg.get("compile_cache_size_limit", 64)),
+            allow_cpu_compile=allow_cpu_compile,
+        )
+        print(
+            f"[Compile] requested={compile_report.requested_mode} -> effective={compile_report.effective_mode} "
+            f"| backend={compile_report.backend} | hotspots={list(compile_report.compiled_hotspots)} "
+            f"| doc_bucket={compile_report.doc_bucket_size} | cache_limit={compile_report.cache_size_limit}"
+            + (f" ({compile_report.fallback_reason})" if compile_report.fallback_reason else ""),
+            flush=True,
+        )
+
+        controller = CurriculumController(curriculum_cfg=curr_cfg, stage_boundaries=eff_boundaries)
+
+        if watchdog_warmup_steps is not None:
+            wd_cfg["rule_bcd_warmup_steps"] = int(watchdog_warmup_steps)
+        wd_cfg["max_consecutive_rollbacks"] = int(max_consecutive_meltdowns)
+        watchdog = SelfHealingWatchdog(
+            watchdog_cfg=wd_cfg,
+            base_seed=seed,
+            events_log_path=eff_logs_dir / "watchdog_events.jsonl",
+        )
+
+        eff_healthy_every = (
+            int(save_every_steps)
+            if save_every_steps is not None
+            else int(ck_cfg.get("healthy_save_every_steps", 1000))
+        )
+        eff_milestone_every = (
+            int(milestone_every_steps)
+            if milestone_every_steps is not None
+            else int(ck_cfg.get("milestone_every_steps", 5000))
+        )
+        eff_probe_every = (
+            int(probe_every_steps)
+            if probe_every_steps is not None
+            else int(vp_cfg.get("probe_every_steps", 500))
+        )
+        eff_console_every = (
+            int(console_every_steps)
+            if console_every_steps is not None
+            else int(vp_cfg.get("console_every_steps", 50))
+        )
+        eff_stage_milestones = (
+            milestone_steps if milestone_steps is not None else controller.stage_boundary_milestones()
+        )
+
+        ckpt_mgr = CheckpointManager(
+            ckpt_dir=eff_ckpt_dir,
+            healthy_save_every_steps=eff_healthy_every,
+            milestone_every_steps=eff_milestone_every,
+            stage_boundaries=eff_stage_milestones,
+        )
+
+        # Optional Colab A/B Ping-Pong Drive sync + 10-minute wall-clock trigger (Iron Law #3)
+        sync_mgr: Optional[ABDriveSyncManager] = None
+        if drive_sync_dir is not None:
+            sync_mgr = ABDriveSyncManager(
+                local_cache_dir=local_cache,
+                drive_sync_dir=drive_sync_dir,
+                milestone_steps=eff_stage_milestones if eff_stage_milestones else MILESTONE_STEPS,
+            )
+        wall_trigger = CheckpointTrigger(
+            save_every_steps=eff_healthy_every,
+            save_every_minutes=save_every_minutes,
+            clock=clock,
+        )
+
+        # Hot NVMe Ragged byte stream (+ optional Stage 3 cap_reasoning & cap_writing 35% mix)
+        train_bin = (Path(data_dir) / "train.bin") if data_dir is not None else None
+        train_idx = (Path(data_dir) / "train.idx") if data_dir is not None else None
+        val_bin = (Path(data_dir) / "val.bin") if data_dir is not None else None
+        val_idx = (Path(data_dir) / "val.idx") if data_dir is not None else None
+        s3_cap_ratio = float(curr_cfg.get("stage3", {}).get("cap_mix_ratio", 0.35))
+        cap_dir_path = Path(cap_data_dir) if cap_data_dir is not None else None
+        stream = _DynamicRaggedCursorStream(
+            train_bin,
+            train_idx,
+            seed=seed,
+            cap_data_dir=cap_dir_path,
+            stage3_cap_mix_ratio=s3_cap_ratio,
+        )
+        if stream.has_shards:
+            print(f"[Data] Opened NVMe Ragged UTF-8 stream: {train_bin}", flush=True)
+        if stream._cap_shards:
+            print(
+                f"[Data] Stage 3 capability mix active ({s3_cap_ratio*100:.0f}%): "
+                f"{[p[0].name for p in stream._cap_shards]}",
+                flush=True,
+            )
+
+        # Resume handling (auto: Colab A/B Ping-Pong first if configured, else local CheckpointManager)
+        start_step = 0
+        resumed_from_step = 0
+        resumed_stage_id = -1
+        fallback_resume_used = False
+        best_val_metric = float("inf")
+
+        if resume and resume.lower() != "none":
+            if resume.lower() == "auto":
+                loaded_ckpt: Optional[dict[str, Any]] = None
+                if sync_mgr is not None:
+                    res = sync_mgr.load_latest_auto(map_location=device)
+                    if res is not None:
+                        loaded_ckpt = res.checkpoint
+                        fallback_resume_used = res.fallback_triggered
+                if loaded_ckpt is None:
+                    latest_local = ckpt_mgr.find_latest_checkpoint()
+                    if latest_local is not None:
+                        loaded_ckpt = ckpt_mgr.load_checkpoint(latest_local, map_location=device)
+                        print(f"[Resume] Loaded local checkpoint: {latest_local}", flush=True)
+                if loaded_ckpt is not None:
+                    start_step, restored_cursor = CheckpointManager.restore_into(
+                        loaded_ckpt,
+                        model=model,
+                        optimizer=optimizer,
+                        controller=controller,
+                        watchdog=watchdog,
+                        preserve_watchdog_repairs=False,
+                        restore_rng=True,
+                    )
+                    stream.restore_cursor(restored_cursor)
+                    resumed_from_step = start_step
+                    resumed_stage_id = int(loaded_ckpt.get("stage_id", -1))
+                    best_val_metric = float(loaded_ckpt.get("best_val_metric", loaded_ckpt.get("best_loss", float("inf"))))
+                    ckpt_mgr.last_healthy_step = start_step
+                    wall_trigger.mark_saved(start_step)
+            else:
+                explicit = Path(resume)
+                loaded_ckpt = ckpt_mgr.load_checkpoint(explicit, map_location=device)
                 start_step, restored_cursor = CheckpointManager.restore_into(
                     loaded_ckpt,
                     model=model,
@@ -717,55 +762,46 @@ def run_training(
                 )
                 stream.restore_cursor(restored_cursor)
                 resumed_from_step = start_step
+                resumed_stage_id = int(loaded_ckpt.get("stage_id", -1))
                 best_val_metric = float(loaded_ckpt.get("best_val_metric", loaded_ckpt.get("best_loss", float("inf"))))
                 ckpt_mgr.last_healthy_step = start_step
                 wall_trigger.mark_saved(start_step)
-        else:
-            explicit = Path(resume)
-            loaded_ckpt = ckpt_mgr.load_checkpoint(explicit, map_location=device)
-            start_step, restored_cursor = CheckpointManager.restore_into(
-                loaded_ckpt,
+                print(f"[Resume] Restored explicit checkpoint {explicit} at step={start_step}", flush=True)
+
+        def _eval_metric_regime(st_id: int) -> str:
+            if st_id == 1:
+                return "autoencoder"
+            if st_id in (2, 3):
+                return "causal_lm"
+            return "wug_fastmap"
+
+        current_stage_id: int = -1
+        last_stage_str: str = "A"
+        last_metrics: dict[str, float] = {}
+        loss_history: dict[int, float] = {}
+        rollback_events: list[dict[str, Any]] = []
+        saves_performed = 0
+        steps_since_start = 0
+        t_run_start = clock()
+        last_heartbeat_t = t_run_start
+        header_printed = False
+        interrupted_sig: Optional[str] = None
+
+        def _build_ckpt_payload(completed_step: int, st_id: int) -> dict[str, Any]:
+            return CheckpointManager.build_payload(
+                step=completed_step,
+                stage_id=st_id,
                 model=model,
                 optimizer=optimizer,
-                controller=controller,
-                watchdog=watchdog,
-                preserve_watchdog_repairs=False,
-                restore_rng=True,
+                scheduler_state=controller.state_dict(),
+                dynamic_loss_multipliers=watchdog.state_dict(),
+                dataloader_cursor=dict(stream.cursor),
+                best_val_metric=best_val_metric,
+                config_dict=cfg.to_dict(),
+                hardware_tier=profile.tier,
             )
-            stream.restore_cursor(restored_cursor)
-            resumed_from_step = start_step
-            best_val_metric = float(loaded_ckpt.get("best_val_metric", loaded_ckpt.get("best_loss", float("inf"))))
-            ckpt_mgr.last_healthy_step = start_step
-            wall_trigger.mark_saved(start_step)
-            print(f"[Resume] Restored explicit checkpoint {explicit} at step={start_step}", flush=True)
 
-    current_stage_id: int = -1
-    last_stage_str: str = "A"
-    last_metrics: dict[str, float] = {}
-    loss_history: dict[int, float] = {}
-    rollback_events: list[dict[str, Any]] = []
-    saves_performed = 0
-    steps_since_start = 0
-    t_run_start = clock()
-    last_heartbeat_t = t_run_start
-    header_printed = False
-    interrupted_sig: Optional[str] = None
-
-    def _build_ckpt_payload(completed_step: int, st_id: int) -> dict[str, Any]:
-        return CheckpointManager.build_payload(
-            step=completed_step,
-            stage_id=st_id,
-            model=model,
-            optimizer=optimizer,
-            scheduler_state=controller.state_dict(),
-            dynamic_loss_multipliers=watchdog.state_dict(),
-            dataloader_cursor=dict(stream.cursor),
-            best_val_metric=best_val_metric,
-            config_dict=cfg.to_dict(),
-            hardware_tier=profile.tier,
-        )
-
-    try:
+        run_log.sync_to_drive(force=True)
         with PreemptionSignalGuard() as sig_guard:
             step_idx = start_step
             while step_idx < eff_total_steps:
@@ -774,8 +810,16 @@ def run_training(
                 last_stage_str = sc.model_stage
 
                 if sc.stage_id != current_stage_id:
+                    prev_stage = current_stage_id if current_stage_id > 0 else resumed_stage_id
+                    if prev_stage > 0 and _eval_metric_regime(prev_stage) != _eval_metric_regime(sc.stage_id):
+                        # Reset best_val_metric across incompatible evaluation regimes
+                        # (e.g., Stage 1 autoencoder ~0.000 BPC -> Stage 2 causal predictive LM BPC,
+                        # or Stage 3 causal LM -> Stage 4 Wug target BPC) so best_model.pt stays live!
+                        best_val_metric = float("inf")
+                        watchdog.clear_window()
                     freeze_stats = apply_stage_freeze(model, sc.stage_id)
                     current_stage_id = sc.stage_id
+                    resumed_stage_id = sc.stage_id
                     print(
                         f"[Stage] Entering Stage {sc.stage_id} ({sc.model_stage}: {sc.stage_name}) "
                         f"at step={completed_step:,}/{eff_total_steps:,} | "
@@ -894,6 +938,7 @@ def run_training(
                         f"skip_batches={action.skip_batches} | new_seed={action.new_seed}",
                         flush=True,
                     )
+                    run_log.sync_to_drive(force=True)
                     if ckpt_mgr.last_healthy_path.exists():
                         healthy_ckpt = ckpt_mgr.load_checkpoint(ckpt_mgr.last_healthy_path, map_location=device)
                         restored_step, restored_cursor = CheckpointManager.restore_into(
@@ -921,6 +966,8 @@ def run_training(
                 optimizer.step()
                 watchdog.tick_post_healthy_step(completed_step)
                 steps_since_start += 1
+                if grad_norm is not None:
+                    accum_metrics["grad_norm"] = float(grad_norm)
                 last_metrics = accum_metrics
                 loss_history[completed_step] = float(accum_metrics["loss_total"])
 
@@ -957,6 +1004,7 @@ def run_training(
                         flush=True,
                     )
                     last_heartbeat_t = now_t
+                    run_log.sync_to_drive(force=False)
 
                 # 500-step zero-grad visual diagnostic probe (isolated RNG so training trajectory is 100% invariant)
                 is_best = False
@@ -1000,6 +1048,7 @@ def run_training(
                     if drive_logs_dir is not None:
                         sync_file_to_drive(eff_logs_dir / "latest_probe.md", drive_logs_dir, dest_name="latest_probe.md")
                         sync_file_to_drive(eff_logs_dir / "metrics.jsonl", drive_logs_dir, dest_name="metrics.jsonl")
+                        run_log.sync_to_drive(force=True)
 
                 # Dual-track atomic checkpointing + optional Colab Drive A/B Ping-Pong sync
                 healthy_due = ckpt_mgr.is_healthy_save_due(completed_step)
@@ -1054,6 +1103,7 @@ def run_training(
                         )
                         wall_trigger.mark_saved(completed_step)
                         saves_performed += 1
+                        run_log.sync_to_drive(force=True)
                     elif wall_due and not healthy_due:
                         # Non-Drive local wall-clock safety save
                         if watchdog.is_healthy_for_checkpoint(completed_step, sc.stage_id, last_metrics):
@@ -1084,6 +1134,12 @@ def run_training(
             if hasattr(os, "sync"):
                 os.sync()
 
+        print(
+            f"[Train] Summary step={step_idx:,}/{eff_total_steps:,} | "
+            f"saves={saves_performed} | rollbacks={watchdog.rollback_count} | "
+            f"best_metric={best_val_metric:.4f}",
+            flush=True,
+        )
         return TrainRunSummary(
             completed_steps=step_idx,
             total_steps=eff_total_steps,
@@ -1102,8 +1158,13 @@ def run_training(
             interrupted_by_signal=interrupted_sig,
             final_lr_multiplier=watchdog.directives.lr_multiplier,
         )
+    except BaseException:
+        _exit_exc = sys.exc_info()
+        raise
     finally:
-        stream.close()
+        if stream is not None:
+            stream.close()
+        run_log.__exit__(*_exit_exc)
         if hasattr(os, "sync"):
             os.sync()
 

@@ -19,11 +19,13 @@ Integrates Deliverables 1-5 and Global Override Iron Laws #1-#5:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import math
 import os
 import random
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,16 +74,19 @@ from train.watchdog_and_ckpt import (
     reseed_all_rngs,
 )
 from utils.device import (
+    DEFAULT_PROD_STEP_BYTES,
     amp_autocast,
     capture_rng_state,
     configure_cuda_tf32,
     describe_hardware_profile,
     detect_hardware_profile,
     get_peak_memory_gb,
+    pin_batch_if_cuda,
     reset_peak_memory_stats,
     restore_rng_state,
     seed_everything,
     synchronize,
+    to_device_async,
 )
 
 
@@ -245,20 +250,23 @@ def _compute_familiar_doc_mask(
 ) -> torch.Tensor:
     """Identify regular replay (familiar) documents vs online Wug episodes in a packed Stage 4 batch."""
     n_docs = int(cu_seqlens.numel()) - 1
-    fam = torch.ones((n_docs,), dtype=torch.bool, device=loss_mask.device)
-    cu_cpu = cu_seqlens.detach().cpu().tolist()
-    for d in range(n_docs):
-        s, e = cu_cpu[d], cu_cpu[d + 1]
-        if wug_target_mask[s:e].any() or (~loss_mask[s:e]).any():
-            fam[d] = False
-    return fam
+    if n_docs <= 0:
+        return torch.ones((0,), dtype=torch.bool, device=loss_mask.device)
+    non_fam_byte = (wug_target_mask.bool() | (~loss_mask.bool())).to(torch.int64)
+    cs = torch.zeros((non_fam_byte.numel() + 1,), dtype=torch.int64, device=loss_mask.device)
+    if non_fam_byte.numel() > 0:
+        cs[1:] = torch.cumsum(non_fam_byte, dim=0)
+    starts = cu_seqlens[:-1].to(torch.int64)
+    ends = cu_seqlens[1:].to(torch.int64)
+    return (cs[ends] - cs[starts]) == 0
 
 
 def _check_active_grads_finite(active_params: Sequence[torch.nn.Parameter]) -> bool:
-    for p in active_params:
-        if p.grad is not None and not torch.isfinite(p.grad).all():
-            return False
-    return True
+    grads = [p.grad for p in active_params if p.grad is not None]
+    if not grads:
+        return True
+    norms = torch._foreach_norm(grads)
+    return bool(torch.isfinite(torch.stack(norms)).all().item())
 
 
 def export_final_safetensors(
@@ -295,7 +303,7 @@ def export_final_safetensors(
 
 
 class _DynamicRaggedCursorStream:
-    """Deterministic cursor-addressable Ragged byte stream adapting automatically to curriculum stage."""
+    """Deterministic cursor-addressable Ragged byte stream with optional CUDA pinned-memory prefetch."""
 
     def __init__(
         self,
@@ -304,6 +312,8 @@ class _DynamicRaggedCursorStream:
         seed: int,
         cap_data_dir: Optional[Path] = None,
         stage3_cap_mix_ratio: float = 0.35,
+        device: Optional[torch.device] = None,
+        prefetch_depth: int = 0,
     ) -> None:
         self.bin_path = bin_path if (bin_path is not None and bin_path.exists()) else None
         self.idx_path = idx_path if (idx_path is not None and idx_path.exists()) else None
@@ -329,6 +339,15 @@ class _DynamicRaggedCursorStream:
             "consumed_bytes": 0,
         }
         self._corpus_bytes: int = int(self.bin_path.stat().st_size) if self.bin_path is not None else 1
+        self._device: torch.device = device if device is not None else torch.device("cpu")
+        self._ds_lock = threading.Lock()
+        self._prefetch_depth = int(prefetch_depth) if (self.has_shards and self._device.type == "cuda") else 0
+        self._prefetch_futures: dict[tuple[Any, ...], Future[dict[str, torch.Tensor]]] = {}
+        self._executor: Optional[ThreadPoolExecutor] = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="dcpa_prefetch")
+            if self._prefetch_depth > 0
+            else None
+        )
 
     def _ensure_cap_dataset(
         self,
@@ -336,8 +355,9 @@ class _DynamicRaggedCursorStream:
         *,
         target_batch_bytes: int,
         max_doc_bytes: int,
+        seed_val: int,
     ) -> RaggedByteDataset:
-        key = (int(target_batch_bytes), int(max_doc_bytes), int(self.cursor["seed"]))
+        key = (int(target_batch_bytes), int(max_doc_bytes), int(seed_val))
         if self._cap_datasets[cap_idx] is not None and self._cap_keys[cap_idx] == key:
             return self._cap_datasets[cap_idx]  # type: ignore[return-value]
         if self._cap_datasets[cap_idx] is not None:
@@ -351,7 +371,7 @@ class _DynamicRaggedCursorStream:
             domain_weights=None,
             wug_ratio=0.0,
             num_batches=10_000_000,
-            seed=int(self.cursor["seed"]) + (cap_idx + 1) * 4099,
+            seed=int(seed_val) + (cap_idx + 1) * 4099,
         )
         self._cap_datasets[cap_idx] = ds
         self._cap_keys[cap_idx] = key
@@ -364,11 +384,12 @@ class _DynamicRaggedCursorStream:
         max_doc_bytes: int,
         domain_weights: Mapping[int, float],
         wug_ratio: float,
+        seed_val: int,
     ) -> Optional[RaggedByteDataset]:
         if not self.has_shards or self.bin_path is None or self.idx_path is None:
             return None
         dw_key = tuple(sorted((int(k), round(float(v), 6)) for k, v in domain_weights.items()))
-        key = (int(target_batch_bytes), int(max_doc_bytes), dw_key, round(float(wug_ratio), 6), int(self.cursor["seed"]))
+        key = (int(target_batch_bytes), int(max_doc_bytes), dw_key, round(float(wug_ratio), 6), int(seed_val))
         if self._ds is not None and self._ds_key == key:
             return self._ds
         if self._ds is not None:
@@ -381,10 +402,82 @@ class _DynamicRaggedCursorStream:
             domain_weights=dict(domain_weights),
             wug_ratio=float(wug_ratio),
             num_batches=10_000_000,
-            seed=int(self.cursor["seed"]),
+            seed=int(seed_val),
         )
         self._ds_key = key
         return self._ds
+
+    @staticmethod
+    def _make_req_key(
+        b_idx: int,
+        target_batch_bytes: int,
+        stage_id: int,
+        max_doc_bytes: int,
+        domain_weights: Mapping[int, float],
+        wug_ratio: float,
+        seed_val: int,
+    ) -> tuple[Any, ...]:
+        dw_key = tuple(sorted((int(k), round(float(v), 6)) for k, v in domain_weights.items()))
+        return (
+            int(b_idx),
+            int(target_batch_bytes),
+            int(stage_id),
+            int(max_doc_bytes),
+            dw_key,
+            round(float(wug_ratio), 6),
+            int(seed_val),
+        )
+
+    def _fetch_one(
+        self,
+        b_idx: int,
+        target_batch_bytes: int,
+        stage_id: int,
+        max_doc_bytes: int,
+        domain_weights: dict[int, float],
+        wug_ratio: float,
+        seed_val: int,
+    ) -> dict[str, torch.Tensor]:
+        use_cap = (
+            stage_id == 3
+            and len(self._cap_shards) > 0
+            and self.stage3_cap_mix_ratio > 0.0
+            and ((b_idx * 37) % 100) < int(round(self.stage3_cap_mix_ratio * 100.0))
+        )
+        with self._ds_lock:
+            if use_cap:
+                c_idx = b_idx % len(self._cap_shards)
+                cap_ds = self._ensure_cap_dataset(
+                    c_idx,
+                    target_batch_bytes=target_batch_bytes,
+                    max_doc_bytes=max_doc_bytes,
+                    seed_val=seed_val,
+                )
+                batch = cap_ds[b_idx]
+            else:
+                ds = self._ensure_dataset(
+                    target_batch_bytes=target_batch_bytes,
+                    max_doc_bytes=max_doc_bytes,
+                    domain_weights=domain_weights,
+                    wug_ratio=wug_ratio,
+                    seed_val=seed_val,
+                )
+                if ds is not None:
+                    batch = ds[b_idx]
+                else:
+                    batch = _sample_synthetic_ragged_batch(
+                        batch_idx=b_idx,
+                        seed=seed_val,
+                        target_bytes=target_batch_bytes,
+                        max_doc_bytes=max_doc_bytes,
+                        wug_ratio=wug_ratio,
+                    )
+        return pin_batch_if_cuda(batch, self._device)
+
+    def _clear_prefetch(self) -> None:
+        for fut in list(self._prefetch_futures.values()):
+            fut.cancel()
+        self._prefetch_futures.clear()
 
     def next_batch(
         self,
@@ -393,43 +486,73 @@ class _DynamicRaggedCursorStream:
         state: CurriculumStepState,
     ) -> dict[str, torch.Tensor]:
         b_idx = int(self.cursor["batch_idx"])
-        use_cap = (
-            state.stage_id == 3
-            and len(self._cap_shards) > 0
-            and self.stage3_cap_mix_ratio > 0.0
-            and ((b_idx * 37) % 100) < int(round(self.stage3_cap_mix_ratio * 100.0))
-        )
-        if use_cap:
-            c_idx = b_idx % len(self._cap_shards)
-            cap_ds = self._ensure_cap_dataset(
-                c_idx,
-                target_batch_bytes=target_batch_bytes,
-                max_doc_bytes=state.max_doc_bytes,
+        seed_val = int(self.cursor["seed"])
+        dw_copy = dict(state.domain_weights)
+
+        if self._executor is not None and self._prefetch_depth > 0:
+            req_key = self._make_req_key(
+                b_idx,
+                target_batch_bytes,
+                state.stage_id,
+                state.max_doc_bytes,
+                dw_copy,
+                state.wug_ratio,
+                seed_val,
             )
-            batch = cap_ds[b_idx]
-        else:
-            ds = self._ensure_dataset(
-                target_batch_bytes=target_batch_bytes,
-                max_doc_bytes=state.max_doc_bytes,
-                domain_weights=state.domain_weights,
-                wug_ratio=state.wug_ratio,
-            )
-            if ds is not None:
-                batch = ds[b_idx]
+            fut = self._prefetch_futures.pop(req_key, None)
+            if fut is not None:
+                batch = fut.result()
             else:
-                batch = _sample_synthetic_ragged_batch(
-                    batch_idx=b_idx,
-                    seed=int(self.cursor["seed"]),
-                    target_bytes=target_batch_bytes,
-                    max_doc_bytes=state.max_doc_bytes,
-                    wug_ratio=state.wug_ratio,
+                self._clear_prefetch()
+                batch = self._fetch_one(
+                    b_idx,
+                    target_batch_bytes,
+                    state.stage_id,
+                    state.max_doc_bytes,
+                    dw_copy,
+                    state.wug_ratio,
+                    seed_val,
                 )
+            for off in range(1, self._prefetch_depth + 1):
+                look_b = b_idx + off
+                look_key = self._make_req_key(
+                    look_b,
+                    target_batch_bytes,
+                    state.stage_id,
+                    state.max_doc_bytes,
+                    dw_copy,
+                    state.wug_ratio,
+                    seed_val,
+                )
+                if look_key not in self._prefetch_futures:
+                    self._prefetch_futures[look_key] = self._executor.submit(
+                        self._fetch_one,
+                        look_b,
+                        int(target_batch_bytes),
+                        int(state.stage_id),
+                        int(state.max_doc_bytes),
+                        dict(dw_copy),
+                        float(state.wug_ratio),
+                        seed_val,
+                    )
+        else:
+            batch = self._fetch_one(
+                b_idx,
+                target_batch_bytes,
+                state.stage_id,
+                state.max_doc_bytes,
+                dw_copy,
+                state.wug_ratio,
+                seed_val,
+            )
+
         self.cursor["batch_idx"] = b_idx + 1
         self.cursor["consumed_bytes"] = int(self.cursor["consumed_bytes"]) + int(batch["x_bytes"].numel())
         self.cursor["epoch"] = int(self.cursor["consumed_bytes"]) // max(self._corpus_bytes, 1)
         return batch
 
     def restore_cursor(self, cursor: Optional[Mapping[str, Any]]) -> None:
+        self._clear_prefetch()
         if not cursor:
             return
         self.cursor["batch_idx"] = int(cursor.get("batch_idx", 0))
@@ -438,15 +561,20 @@ class _DynamicRaggedCursorStream:
         self.cursor["consumed_bytes"] = int(cursor.get("consumed_bytes", 0))
 
     def close(self) -> None:
-        if self._ds is not None:
-            self._ds.close()
-            self._ds = None
-            self._ds_key = None
-        for i, cds in enumerate(self._cap_datasets):
-            if cds is not None:
-                cds.close()
-                self._cap_datasets[i] = None
-                self._cap_keys[i] = None
+        self._clear_prefetch()
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor = None
+        with self._ds_lock:
+            if self._ds is not None:
+                self._ds.close()
+                self._ds = None
+                self._ds_key = None
+            for i, cds in enumerate(self._cap_datasets):
+                if cds is not None:
+                    cds.close()
+                    self._cap_datasets[i] = None
+                    self._cap_keys[i] = None
 
 
 def run_training(
@@ -564,14 +692,23 @@ def run_training(
         )
         # Hardware detection & auto grad-accum sharding (Iron Law #1 + Deliverable 1)
         yaml_target_bytes = hw_cfg.get("target_tokens_bytes_per_step")
+        explicit_target_bytes = (
+            int(target_tokens_bytes_per_step)
+            if target_tokens_bytes_per_step is not None
+            else (
+                int(yaml_target_bytes)
+                if (
+                    yaml_target_bytes is not None
+                    and int(yaml_target_bytes) != DEFAULT_PROD_STEP_BYTES
+                    and device_str == "cuda"
+                )
+                else None
+            )
+        )
         profile = detect_hardware_profile(
             preferred=device_str,
             deterministic=deterministic,
-            target_tokens_bytes_per_step=(
-                target_tokens_bytes_per_step
-                if target_tokens_bytes_per_step is not None
-                else (int(yaml_target_bytes) if (yaml_target_bytes is not None and device_str == "cuda") else None)
-            ),
+            target_tokens_bytes_per_step=explicit_target_bytes,
         )
         device = profile.device
         allow_tf32 = False if deterministic else bool(hw_cfg.get("allow_tf32", True))
@@ -596,20 +733,26 @@ def run_training(
         grad_accum_steps = max(1, math.ceil(eff_target_bytes / eff_micro_bytes))
         actual_step_bytes = eff_micro_bytes * grad_accum_steps
 
+        seed_everything(seed, device=device)
+        cfg = build_dcpa_config(eff_preset, yaml_cfg)
+        model = DCPAModel(cfg).to(device)
+        if device.type == "cuda" and profile.vram_gb >= 88.0:
+            default_wm = 48.0 if cfg.num_experts >= 16 else 52.0
+            model.bcg_checkpoint_vram_watermark_gb = float(
+                hw_cfg.get("bcg_checkpoint_vram_watermark_gb", default_wm)
+            )
+        optimizer = create_dcpa_optimizer(model, optimizer_cfg=opt_cfg)
+        grad_clip_norm = float(opt_cfg.get("grad_clip_norm", cfg.grad_clip_norm))
+
         print(describe_hardware_profile(profile), flush=True)
         print(
             f"[Plan] preset={eff_preset} | total_steps={eff_total_steps:,} | "
             f"boundaries={list(eff_boundaries)} | micro_batch_bytes={eff_micro_bytes:,} | "
             f"grad_accum_steps={grad_accum_steps} | effective_bytes_per_step={actual_step_bytes:,} | "
-            f"bf16={use_bf16} | grad_scaler=False",
+            f"bf16={use_bf16} | grad_scaler=False | "
+            f"bcg_ckpt_watermark_gb={model.bcg_checkpoint_vram_watermark_gb:.1f}",
             flush=True,
         )
-
-        seed_everything(seed, device=device)
-        cfg = build_dcpa_config(eff_preset, yaml_cfg)
-        model = DCPAModel(cfg).to(device)
-        optimizer = create_dcpa_optimizer(model, optimizer_cfg=opt_cfg)
-        grad_clip_norm = float(opt_cfg.get("grad_clip_norm", cfg.grad_clip_norm))
 
         # Selective static-shape torch.compile on Hotspot A (BCG step) & Hotspot B (SGSC/PMD scans) ONLY
         req_compile_mode = (
@@ -622,7 +765,7 @@ def run_training(
             compile_mode=req_compile_mode,
             device=device,
             doc_bucket_size=int(hw_cfg.get("compile_doc_bucket_size", 16)),
-            cache_size_limit=int(hw_cfg.get("compile_cache_size_limit", 64)),
+            cache_size_limit=int(hw_cfg.get("compile_cache_size_limit", 128)),
             allow_cpu_compile=allow_cpu_compile,
         )
         print(
@@ -696,12 +839,15 @@ def run_training(
         val_idx = (Path(data_dir) / "val.idx") if data_dir is not None else None
         s3_cap_ratio = float(curr_cfg.get("stage3", {}).get("cap_mix_ratio", 0.35))
         cap_dir_path = Path(cap_data_dir) if cap_data_dir is not None else None
+        eff_prefetch_depth = int(hw_cfg.get("prefetch_depth", 2)) if device.type == "cuda" else 0
         stream = _DynamicRaggedCursorStream(
             train_bin,
             train_idx,
             seed=seed,
             cap_data_dir=cap_dir_path,
             stage3_cap_mix_ratio=s3_cap_ratio,
+            device=device,
+            prefetch_depth=eff_prefetch_depth,
         )
         if stream.has_shards:
             print(f"[Data] Opened NVMe Ragged UTF-8 stream: {train_bin}", flush=True)
@@ -849,16 +995,22 @@ def run_training(
 
                 for _micro_idx in range(grad_accum_steps):
                     batch = stream.next_batch(target_batch_bytes=eff_micro_bytes, state=sc)
-                    x_bytes = batch["x_bytes"].to(device)
-                    cu_seqlens = batch["cu_seqlens"].to(device)
-                    doc_lang_ids = batch["doc_lang_ids"].to(device)
-                    doc_style_ids = batch.get("doc_style_ids")
-                    doc_style_ids_t = doc_style_ids.to(device) if doc_style_ids is not None else None
-                    doc_pts = batch.get("doc_ponder_tax_scale")
-                    doc_pts_t = doc_pts.to(device) if doc_pts is not None else None
-                    byte_lang_ids = batch["byte_lang_ids"].to(device)
-                    loss_mask = batch["loss_mask"].to(device)
-                    wug_target_mask = batch["wug_target_mask"].to(device)
+                    x_bytes = to_device_async(batch["x_bytes"], device)
+                    cu_seqlens = to_device_async(batch["cu_seqlens"], device)
+                    doc_lang_ids = to_device_async(batch["doc_lang_ids"], device)
+                    doc_style_ids_t = to_device_async(batch.get("doc_style_ids"), device)
+                    doc_pts_t = to_device_async(batch.get("doc_ponder_tax_scale"), device)
+                    byte_lang_ids = to_device_async(batch["byte_lang_ids"], device)
+                    loss_mask = to_device_async(batch["loss_mask"], device)
+                    wug_target_mask = to_device_async(batch["wug_target_mask"], device)
+                    assert (
+                        x_bytes is not None
+                        and cu_seqlens is not None
+                        and doc_lang_ids is not None
+                        and byte_lang_ids is not None
+                        and loss_mask is not None
+                        and wug_target_mask is not None
+                    )
 
                     loss_w = build_byte_loss_weights(
                         x_bytes=x_bytes,
@@ -912,13 +1064,18 @@ def run_training(
                     pre_step_hook(completed_step, model, optimizer, accum_metrics)
 
                 active_params = [p for p in model.parameters() if p.requires_grad]
-                grads_finite = step_loss_finite and _check_active_grads_finite(active_params)
+                grads_finite = step_loss_finite
                 grad_norm: Optional[float] = None
                 if grads_finite and active_params:
-                    gn_t = torch.nn.utils.clip_grad_norm_(active_params, max_norm=grad_clip_norm)
-                    grad_norm = float(gn_t.detach().item())
-                    if not math.isfinite(grad_norm):
-                        grads_finite = False
+                    if any(p.grad is not None for p in active_params):
+                        gn_t = torch.nn.utils.clip_grad_norm_(active_params, max_norm=grad_clip_norm)
+                        gn_val = float(gn_t.detach().item())
+                        if math.isfinite(gn_val):
+                            grad_norm = gn_val
+                        else:
+                            grads_finite = False
+                    else:
+                        grad_norm = 0.0
 
                 action = watchdog.check_step(
                     step=completed_step,

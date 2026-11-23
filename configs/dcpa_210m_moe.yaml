@@ -94,8 +94,15 @@ hardware:
   use_grad_scaler: false
   compile_mode: auto
   compile_doc_bucket_size: 16
-  compile_cache_size_limit: 64
+  compile_cache_size_limit: 128
+  bcg_checkpoint_vram_watermark_gb: 48.0
+  prefetch_depth: 2
   auto_sharding_tiers:
+    blackwell_or_h200_96g:
+      min_vram_gb: 88.0
+      target_tokens_bytes_per_step: 262144
+      micro_batch_bytes: 262144
+      grad_accum_steps: 1
     h100_or_a100_80g:
       min_vram_gb: 75.0
       micro_batch_bytes: 131072

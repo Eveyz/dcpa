@@ -34,6 +34,7 @@ import numpy as np
 import torch
 
 
+DEFAULT_BLACKWELL_96G_STEP_BYTES: int = 262_144
 DEFAULT_PROD_STEP_BYTES: int = 131_072
 DEFAULT_LOCAL_STEP_BYTES: int = 8_192
 
@@ -165,6 +166,38 @@ def reset_peak_memory_stats(device: torch.device) -> None:
         torch.cuda.reset_peak_memory_stats(device)
 
 
+def get_allocated_memory_gb(device: torch.device) -> float:
+    """Return currently allocated accelerator memory in GB (zero-sync host atomic read on CUDA)."""
+    if device.type == "cuda" and is_cuda_available():
+        return float(torch.cuda.memory_allocated(device)) / float(1024**3)
+    return 0.0
+
+
+def pin_batch_if_cuda(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    """Pin CPU batch tensors into page-locked host memory when targeting a live CUDA device."""
+    if device.type != "cuda" or not is_cuda_available():
+        return batch
+    pinned: dict[str, Any] = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor) and v.device.type == "cpu" and not v.is_pinned():
+            try:
+                pinned[k] = v.pin_memory()
+            except Exception:
+                pinned[k] = v
+        else:
+            pinned[k] = v
+    return pinned
+
+
+def to_device_async(tensor: Optional[torch.Tensor], device: torch.device) -> Optional[torch.Tensor]:
+    """Move tensor to target device using non-blocking DMA when source is pinned CPU -> CUDA."""
+    if tensor is None:
+        return None
+    if device.type == "cuda" and tensor.device.type == "cpu":
+        return tensor.to(device, non_blocking=bool(tensor.is_pinned()))
+    return tensor.to(device)
+
+
 def get_peak_memory_gb(device: torch.device) -> float:
     """Return peak allocated accelerator memory in GB (or host process RSS GB on CPU/MPS fallback)."""
     if device.type == "cuda" and is_cuda_available():
@@ -219,7 +252,13 @@ def select_hardware_tier(
     """
     dtype_key = device_type.strip().lower()
     if dtype_key == "cuda":
-        if vram_gb >= 75.0:
+        tier_default_target = DEFAULT_PROD_STEP_BYTES
+        if vram_gb >= 88.0:
+            tier = "blackwell_or_h200_96g"
+            base_micro = DEFAULT_BLACKWELL_96G_STEP_BYTES
+            base_accum = 1
+            tier_default_target = DEFAULT_BLACKWELL_96G_STEP_BYTES
+        elif vram_gb >= 75.0:
             tier = "h100_or_a100_80g"
             base_micro = 131_072
             base_accum = 1
@@ -236,11 +275,11 @@ def select_hardware_tier(
             base_micro = 16_384
             base_accum = 8
 
-        target = DEFAULT_PROD_STEP_BYTES if target_tokens_bytes_per_step is None else int(target_tokens_bytes_per_step)
+        target = tier_default_target if target_tokens_bytes_per_step is None else int(target_tokens_bytes_per_step)
         if target <= 0:
             raise ValueError(f"target_tokens_bytes_per_step must be > 0, got {target}")
 
-        if target == DEFAULT_PROD_STEP_BYTES:
+        if target == tier_default_target:
             micro = base_micro
             accum = base_accum
         else:

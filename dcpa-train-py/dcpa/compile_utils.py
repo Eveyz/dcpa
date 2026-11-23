@@ -96,7 +96,7 @@ def configure_model_compile(
     device: torch.device,
     *,
     doc_bucket_size: int = DEFAULT_DOC_BUCKET_SIZE,
-    cache_size_limit: int = 64,
+    cache_size_limit: int = 128,
     allow_cpu_compile: bool = False,
     cpu_backend: str = "aot_eager",
 ) -> CompileReport:
@@ -111,6 +111,10 @@ def configure_model_compile(
         setattr(model, "enable_doc_bucketing", False)
     if hasattr(model, "doc_bucket_size"):
         setattr(model, "doc_bucket_size", int(doc_bucket_size))
+    if hasattr(model, "bcg_pc"):
+        bcg_unwrapped = unwrap_compiled_module(getattr(model, "bcg_pc"))
+        if hasattr(bcg_unwrapped, "disable_compiled_subkernels"):
+            bcg_unwrapped.disable_compiled_subkernels()
 
     if eff_mode == "none":
         return CompileReport(
@@ -139,13 +143,13 @@ def configure_model_compile(
 
     hotspots: list[str] = []
 
-    # --- Hotspot A: BCG-PC single-step concept graph kernel (OptimizedModule wrapping) ---
-    # Enable static_kernel_mode=True so the entire step compiles into ONE zero-sync, zero-graph-break
-    # Inductor kernel using 4 fused batched torch.bmm MoE kernels & precomputed SlotCrossAttention KV!
+    # --- Hotspot A: BCG-PC single-step concept graph kernel + compacted Pondering/MoE sub-kernels ---
     if hasattr(model, "bcg_pc"):
         bcg_raw = unwrap_compiled_module(getattr(model, "bcg_pc"))
         if hasattr(bcg_raw, "set_static_kernel_mode"):
             bcg_raw.set_static_kernel_mode(True)
+        if hasattr(bcg_raw, "enable_compiled_subkernels"):
+            bcg_raw.enable_compiled_subkernels(**compile_kwargs)
         compiled_bcg = torch.compile(bcg_raw, **compile_kwargs)
         setattr(model, "bcg_pc", compiled_bcg)
         if hasattr(model, "enable_doc_bucketing"):

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -94,6 +94,24 @@ def build_perm_bank(k_slots: int) -> tuple[torch.Tensor, torch.Tensor, torch.Ten
     return perm_bank, pair_i, pair_j, pair_u, pair_v
 
 
+def _coarse_bucket_count(n: int, bucket: int = 16) -> int:
+    """Round active sample/expert count `n >= 1` up to a bounded set of Tensor-Core-aligned buckets."""
+    b = max(1, int(bucket))
+    n_pos = max(1, int(n))
+    if n_pos <= b:
+        return b
+    if n_pos <= b * 2:
+        return b * 2
+    if n_pos <= b * 16:
+        step = b * 2
+        return ((n_pos + step - 1) // step) * step
+    if n_pos <= b * 32:
+        step = b * 4
+        return ((n_pos + step - 1) // step) * step
+    step = b * 8
+    return ((n_pos + step - 1) // step) * step
+
+
 class TwoLayerSwiGLUExpert(nn.Module):
     """Two-layer Pre-RMSNorm SwiGLU residual micro-expert with hidden dimension 1.5*D (Table 5.2)."""
 
@@ -157,6 +175,117 @@ class SparseMicroMoE(nn.Module):
             w_d2 = w_d2.to(dtype=dtype)
         return w_gu1.contiguous(), w_d1.contiguous(), w_gu2.contiguous(), w_d2.contiguous()
 
+    def _experts_4bmm_impl(
+        self,
+        x_e: torch.Tensor,
+        w_gu1: torch.Tensor,
+        w_d1: torch.Tensor,
+        w_gu2: torch.Tensor,
+        w_d2: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pure static-shape 4-BMM 2-layer Pre-RMSNorm SwiGLU expert kernel on `[E, C, D]`."""
+        g1, u1 = torch.bmm(x_e, w_gu1).chunk(2, dim=-1)  # [E, C, H]
+        x1 = x_e + torch.bmm(F.silu(g1) * u1, w_d1)  # [E, C, D]
+        x_n2 = (x1.float() * torch.rsqrt(x1.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)).to(x_e.dtype)
+        g2, u2 = torch.bmm(x_n2, w_gu2).chunk(2, dim=-1)  # [E, C, H]
+        return x1 + torch.bmm(F.silu(g2) * u2, w_d2)  # [E, C, D]
+
+    def _resolve_packed_weights(
+        self,
+        dtype: torch.dtype,
+        packed_weights: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if packed_weights is None:
+            return self.pack_weights(dtype=dtype)
+        w_gu1, w_d1, w_gu2, w_d2 = packed_weights
+        if w_gu1.dtype != dtype:
+            return w_gu1.to(dtype), w_d1.to(dtype), w_gu2.to(dtype), w_d2.to(dtype)
+        return w_gu1, w_d1, w_gu2, w_d2
+
+    def forward_compacted_bmm(
+        self,
+        x: torch.Tensor,
+        n_valid: int,
+        sample_mask: Optional[torch.Tensor] = None,
+        packed_weights: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        compiled_experts_fn: Optional[Callable[..., torch.Tensor]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Lossless capacity-compacted Top-2 4-BMM MoE dispatch on bucketed active tokens `[N_pad, D]`.
+
+        Mathematically equivalent (zero token dropping, zero atomic `index_add_` nondeterminism) to
+        dense `[E, N_pad, D]` dispatch while shrinking `[E, N_pad, D] -> [E, C_cap, D]` whenever
+        per-expert max load `C_cap < N_pad` (2.5x-3.2x smaller on 8-expert 48M, ~8x smaller on 32-expert 210M!).
+        """
+        N, D = x.shape
+        if N == 0 or n_valid <= 0:
+            return torch.zeros_like(x), torch.zeros((), device=x.device, dtype=torch.float32)
+
+        E = self.num_experts
+        top_k = self.top_k
+        x_norm = (x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)).to(x.dtype)
+        logits = self.router(x_norm).float()  # [N, E]
+        router_probs = F.softmax(logits, dim=-1)  # [N, E] fp32
+        top_vals, top_idx = torch.topk(logits, k=top_k, dim=-1)  # [N, top_k]
+        gates = F.softmax(top_vals, dim=-1).to(x.dtype)  # [N, top_k]
+
+        if sample_mask is None:
+            mask_f = torch.ones((N, 1), device=x.device, dtype=torch.float32)
+        else:
+            mask_f = sample_mask.float().view(N, 1)
+        m_sum = mask_f.sum()
+        denom = m_sum.clamp_min(1.0)
+        has_any = (m_sum > 0.0).float()
+        p_e = (router_probs * mask_f).sum(dim=0) / denom  # [E]
+        dispatch_oh = F.one_hot(top_idx, num_classes=E).float().sum(dim=1) / float(top_k)
+        f_e = (dispatch_oh * mask_f).sum(dim=0) / denom  # [E]
+        aux_bal = has_any * float(E) * (f_e.detach() * p_e).sum()
+
+        w_gu1, w_d1, w_gu2, w_d2 = self._resolve_packed_weights(x.dtype, packed_weights)
+        experts_fn = compiled_experts_fn if compiled_experts_fn is not None else self._experts_4bmm_impl
+
+        # Small active batches on <=8 experts fit in L2 cache directly without bincount/argsort overhead
+        if N <= 48 and E <= 8:
+            x_e = x_norm.unsqueeze(0).expand(E, -1, -1)
+            gate_full = torch.zeros((N, E), device=x.device, dtype=x.dtype).scatter_add(1, top_idx, gates)
+            y_all = experts_fn(x_e, w_gu1, w_d1, w_gu2, w_d2)
+            return torch.einsum("ne,end->nd", gate_full, y_all), aux_bal
+
+        valid_top_idx = top_idx[:n_valid]  # [n_valid, top_k]
+        counts = torch.bincount(valid_top_idx.reshape(-1), minlength=E)  # [E]
+        c_cap = _coarse_bucket_count(max(1, int(counts.max().item())), bucket=16)
+
+        if c_cap >= N:
+            x_e = x_norm.unsqueeze(0).expand(E, -1, -1)
+            gate_full = torch.zeros((N, E), device=x.device, dtype=x.dtype).scatter_add(1, top_idx, gates)
+            y_all = experts_fn(x_e, w_gu1, w_d1, w_gu2, w_d2)
+            return torch.einsum("ne,end->nd", gate_full, y_all), aux_bal
+
+        M = n_valid * top_k
+        flat_e = valid_top_idx.reshape(-1)
+        flat_tok = torch.arange(n_valid, device=x.device, dtype=torch.int64).unsqueeze(1).expand(n_valid, top_k).reshape(-1)
+        flat_gate = gates[:n_valid].reshape(-1)
+        perm = torch.argsort(flat_e, stable=True)
+        e_sorted = flat_e[perm]
+        tok_sorted = flat_tok[perm]
+        gate_sorted = flat_gate[perm]
+
+        cu_e = torch.zeros((E + 1,), device=x.device, dtype=torch.int64)
+        cu_e[1:] = torch.cumsum(counts, dim=0)
+        slot_in_e = torch.arange(M, device=x.device, dtype=torch.int64) - cu_e[e_sorted]
+        linear_pos = e_sorted * c_cap + slot_in_e
+
+        x_pack = torch.zeros((E * c_cap, D), device=x.device, dtype=x.dtype)
+        x_pack[linear_pos] = x_norm[tok_sorted]
+        y_e = experts_fn(x_pack.view(E, c_cap, D), w_gu1, w_d1, w_gu2, w_d2)
+
+        y_sorted = y_e.reshape(E * c_cap, D)[linear_pos] * gate_sorted.unsqueeze(-1)
+        y_pairs = torch.empty((M, D), device=x.device, dtype=x.dtype)
+        y_pairs[perm] = y_sorted
+        out_valid = y_pairs.view(n_valid, top_k, D).sum(dim=1)
+        if n_valid < N:
+            return torch.cat([out_valid, torch.zeros((N - n_valid, D), device=x.device, dtype=x.dtype)], dim=0), aux_bal
+        return out_valid, aux_bal
+
     def forward(
         self,
         x: torch.Tensor,
@@ -195,22 +324,9 @@ class SparseMicroMoE(nn.Module):
         if static_shape or x.device.type == "mps" or torch.compiler.is_compiling():
             gate_full = torch.zeros((x.shape[0], self.num_experts), device=x.device, dtype=x.dtype)
             gate_full = gate_full.scatter_add(1, top_idx, gates)
-            if packed_weights is None:
-                w_gu1, w_d1, w_gu2, w_d2 = self.pack_weights(dtype=x.dtype)
-            else:
-                w_gu1, w_d1, w_gu2, w_d2 = packed_weights
-                if w_gu1.dtype != x.dtype:
-                    w_gu1 = w_gu1.to(x.dtype)
-                    w_d1 = w_d1.to(x.dtype)
-                    w_gu2 = w_gu2.to(x.dtype)
-                    w_d2 = w_d2.to(x.dtype)
-
+            w_gu1, w_d1, w_gu2, w_d2 = self._resolve_packed_weights(x.dtype, packed_weights)
             x_e = x.unsqueeze(0).expand(self.num_experts, -1, -1)  # [E, N, D]
-            g1, u1 = torch.bmm(x_e, w_gu1).chunk(2, dim=-1)  # [E, N, H]
-            x1 = x_e + torch.bmm(F.silu(g1) * u1, w_d1)  # [E, N, D]
-            x_n2 = (x1.float() * torch.rsqrt(x1.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)).to(x.dtype)
-            g2, u2 = torch.bmm(x_n2, w_gu2).chunk(2, dim=-1)  # [E, N, H]
-            y_all = x1 + torch.bmm(F.silu(g2) * u2, w_d2)  # [E, N, D]
+            y_all = self._experts_4bmm_impl(x_e, w_gu1, w_d1, w_gu2, w_d2)
             out = torch.einsum("ne,end->nd", gate_full, y_all)
             return out, aux_bal
 
@@ -322,12 +438,32 @@ class BCGPC(nn.Module):
         self.w_omega = nn.Linear(D, 1, bias=False)
         self.kappa_omega = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
         self._static_kernel_mode: bool = False
+        self._compiled_pre_ponder: Optional[Callable[..., Any]] = None
+        self._compiled_ponder_router: Optional[Callable[..., Any]] = None
+        self._compiled_experts_bmm: Optional[Callable[..., Any]] = None
+        self._compiled_ponder_update: Optional[Callable[..., Any]] = None
+        self._compiled_post_merge: Optional[Callable[..., Any]] = None
 
         self._init_weights()
 
     def set_static_kernel_mode(self, enabled: bool) -> None:
         """Toggle branchless static-shape kernel mode for `torch.compile(..., dynamic=False)`."""
         self._static_kernel_mode = bool(enabled)
+
+    def enable_compiled_subkernels(self, **compile_kwargs: Any) -> None:
+        """Compile static-shape pre-ponder, active-compacted ponder/MoE, and post-merge sub-kernels."""
+        self._compiled_pre_ponder = torch.compile(self._pre_ponder_impl, **compile_kwargs)
+        self._compiled_ponder_router = torch.compile(self._ponder_router_impl, **compile_kwargs)
+        self._compiled_experts_bmm = torch.compile(self.moe._experts_4bmm_impl, **compile_kwargs)
+        self._compiled_ponder_update = torch.compile(self._ponder_update_impl, **compile_kwargs)
+        self._compiled_post_merge = torch.compile(self._post_ponder_merge_impl, **compile_kwargs)
+
+    def disable_compiled_subkernels(self) -> None:
+        self._compiled_pre_ponder = None
+        self._compiled_ponder_router = None
+        self._compiled_experts_bmm = None
+        self._compiled_ponder_update = None
+        self._compiled_post_merge = None
 
     def _init_weights(self) -> None:
         # Initialize f_prec bias so Softplus(bias) ~ 1.0 and w_gen near identity so pondering
@@ -449,7 +585,7 @@ class BCGPC(nn.Module):
         moe_bal_loss = moe_bal_sum / moe_bal_count.clamp_min(1.0)
         return z_cur, ponder_steps, moe_bal_loss
 
-    def forward(
+    def _pre_ponder_impl(
         self,
         slots: torch.Tensor,
         edges: torch.Tensor,
@@ -457,51 +593,20 @@ class BCGPC(nn.Module):
         c_fused: torch.Tensor,
         prec_bu: torch.Tensor,
         ach: torch.Tensor,
-        tau_m: torch.Tensor,
-        active_mask: torch.Tensor,
-        merge_uniform_mix: torch.Tensor,
-        slot0_pinned: Optional[torch.Tensor] = None,
-        pin_trigger: Optional[torch.Tensor] = None,
-        use_gumbel: bool = True,
-        update_c0_ema: bool = True,
-        packed_moe_w_gu1: Optional[torch.Tensor] = None,
-        packed_moe_w_d1: Optional[torch.Tensor] = None,
-        packed_moe_w_gu2: Optional[torch.Tensor] = None,
-        packed_moe_w_d2: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, ...]:
-        """Hotspot A (`bcg_step_kernel`): single-step concept graph transition kernel.
-
-        Designed for `torch.compile(..., dynamic=False)` on bucketed document batches `[V_pad, ...]`:
-          - In `static_mode` (CUDA `torch.compile` & MPS): 100% zero-sync, zero-graph-break fused
-            Inductor graph using 4 batched `torch.bmm` MoE kernels (12x fewer GEMM launches!) and
-            precomputed `SlotCrossAttention` K/V (8x less KV projection work).
-          - In eager CPU mode (`static_mode=False`): uses event-driven sparse pondering + Top-2 MoE.
-        """
-        B, D = c_fused.shape
-        K = self.cfg.k_slots
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Static-shape pre-ponder graph readout, prior/precision prediction, and Bayesian fusion."""
         orig_dtype = c_fused.dtype
-        static_mode = self._static_kernel_mode or c_fused.device.type == "mps" or torch.compiler.is_compiling()
-        packed_weights = (
-            (packed_moe_w_gu1, packed_moe_w_d1, packed_moe_w_gu2, packed_moe_w_d2)
-            if packed_moe_w_gu1 is not None
-            and packed_moe_w_d1 is not None
-            and packed_moe_w_gu2 is not None
-            and packed_moe_w_d2 is not None
-            else None
-        )
-
-        pinned_cur = (
-            torch.zeros((B,), device=c_fused.device, dtype=torch.float32)
-            if slot0_pinned is None
-            else slot0_pinned.float()
-        )
-        trig_cur = (
-            torch.zeros((B,), device=c_fused.device, dtype=torch.float32)
-            if pin_trigger is None
-            else pin_trigger.float()
-        )
-
-        # 1. Top-down prior prediction & smoothly bounded precision-weighted residual
         s_bar_prev, g_ctx = self.message_pass(slots, edges, salience)
         c_hat = self.f_pred_2(F.silu(self.f_pred_1(g_ctx)))  # [B, D]
         pi_raw = F.softplus(self.f_prec_2(F.silu(self.f_prec_1(g_ctx))).float()) + 1e-4  # [B, D] fp32
@@ -518,81 +623,75 @@ class BCGPC(nn.Module):
         surprisal_0 = torch.sqrt(eps_0_surp.float().pow(2).mean(dim=-1) + 1e-8)  # [B] fp32
 
         # Bayesian precision fusion + fast shortcut projected onto unit-RMS concept manifold:
-        #   - Detaching c_hat on the slot-write path (c_hat is supervised directly at every step by
-        #     L_PC and L_lang) eliminates the unnormalized slots -> g_ctx -> f_pred -> w_fast -> z_0
-        #     recurrent Jacobian feedback loop across long documents (512B..4096B).
+        #   - Detaching c_hat on the slot-write path eliminates the unnormalized slots -> g_ctx ->
+        #     f_pred -> w_fast -> z_0 recurrent Jacobian feedback loop across long documents.
         #   - Applying self.norm_ponder guarantees z_0 lives on the exact same unit-RMS sphere
         #     whether Pondering skips (L_m=0) or iterates (L_m=1..8), matching dcpa-core-rs.
         c_hat_z = c_hat.detach()
         eps_0 = (pi_eff * (c_fused.float() - c_hat_z.float())).to(orig_dtype)
-        z_cur = (
+        z_0 = (
             (pi_m_sg * c_hat_z.float() + prec_bu_f32 * c_fused.float())
             / (pi_m_sg + prec_bu_f32 + self.cfg.eps)
         ).to(orig_dtype)
-        z_cur = self.norm_ponder(
-            z_cur + (1.0 - ach_f32).unsqueeze(-1).to(orig_dtype) * self.w_fast(eps_0)
+        z_0 = self.norm_ponder(
+            z_0 + (1.0 - ach_f32).unsqueeze(-1).to(orig_dtype) * self.w_fast(eps_0)
         )
+        k_prev, v_prev = self.cross_attn.project_kv(s_bar_prev)
+        return s_bar_prev, g_ctx, c_hat, pi_m, pi_eff, surprisal_0, eps_0, z_0, k_prev, v_prev
 
-        # 2. Event-Driven Pondering (L_max = 8) + Switch MoE load-balancing aux loss
-        if static_mode:
-            eps_cur = eps_0
-            surp_cur = surprisal_0
-            active = active_mask.bool()
-            ponder_steps = torch.zeros((B,), device=c_fused.device, dtype=torch.float32)
-            moe_bal_sum = torch.zeros((), device=c_fused.device, dtype=torch.float32)
-            moe_bal_count = torch.zeros((), device=c_fused.device, dtype=torch.float32)
+    def _ponder_router_impl(
+        self,
+        z_in: torch.Tensor,
+        eps_in: torch.Tensor,
+        k_act: torch.Tensor,
+        v_act: torch.Tensor,
+    ) -> torch.Tensor:
+        """Static-shape SlotCrossAttention query over compacted active surprised concepts `[N_pad, D]`."""
+        return eps_in + self.cross_attn.forward_with_kv(z_in, k_act, v_act)
 
-            # Precompute SlotCrossAttention K/V & packed MoE weights ONCE across all L_max steps!
-            k_prev, v_prev = self.cross_attn.project_kv(s_bar_prev)
-            eff_packed_w = packed_weights if packed_weights is not None else self.moe.pack_weights(dtype=orig_dtype)
+    def _ponder_update_impl(
+        self,
+        z_in: torch.Tensor,
+        delta_act: torch.Tensor,
+        c_fused_act: torch.Tensor,
+        pi_eff_act: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Static-shape Pondering state & residual update on compacted active concepts `[N_pad, D]`."""
+        orig_dtype = c_fused_act.dtype
+        z_next = self.norm_ponder(z_in + self.cfg.ponder_eta * delta_act).to(orig_dtype)
+        eps_next = (pi_eff_act * (c_fused_act.float() - self.w_gen(z_next).float())).to(orig_dtype)
+        surp_next = torch.sqrt(eps_next.float().pow(2).mean(dim=-1) + 1e-8)
+        return z_next, eps_next, surp_next
 
-            for l_idx in range(self.cfg.l_max):
-                thresh = self.cfg.tau_skip if l_idx == 0 else self.cfg.tau_halt
-                prev_active_f = active.float()
-                still_surprised = surp_cur > thresh
-                active = active & still_surprised
-
-                # Differentiable STE ponder counter gated strictly on samples still active entering step l_idx
-                soft_act = torch.sigmoid((surp_cur - thresh) / 0.25) * prev_active_f
-                hard_act = active.float()
-                ste_act = (hard_act - soft_act).detach() + soft_act
-                ponder_steps = ponder_steps + ste_act
-
-                if self.training and l_idx > 0:
-                    z_in = z_cur.detach() + 0.5 * (z_cur - z_cur.detach())
-                    eps_in = eps_cur.detach() + 0.5 * (eps_cur - eps_cur.detach())
-                else:
-                    z_in = z_cur
-                    eps_in = eps_cur
-
-                # Zero-sync fused 4-BMM pondering (zero .any() / nonzero() graph breaks!)
-                r_all = self.cross_attn.forward_with_kv(z_in, k_prev, v_prev)
-                delta_all, bal_l = self.moe(
-                    eps_in + r_all,
-                    static_shape=True,
-                    sample_mask=active,
-                    packed_weights=eff_packed_w,
-                )
-                moe_bal_sum = moe_bal_sum + bal_l
-                moe_bal_count = moe_bal_count + (active.float().sum() > 0.0).float()
-
-                z_cand = self.norm_ponder(z_in + self.cfg.ponder_eta * delta_all).to(z_cur.dtype)
-                act_col = active.unsqueeze(-1)
-                z_cur = torch.where(act_col, z_cand, z_cur)
-
-                eps_cand = (
-                    pi_eff * (c_fused.float() - self.w_gen(z_cand).float())
-                ).to(orig_dtype)
-                eps_cur = torch.where(act_col, eps_cand, eps_cur)
-                surp_cand = torch.sqrt(eps_cand.float().pow(2).mean(dim=-1) + 1e-8)
-                surp_cur = torch.where(active, surp_cand, surp_cur)
-
-            moe_bal_loss = moe_bal_sum / moe_bal_count.clamp_min(1.0)
-            z_star = z_cur  # [B, D]
-        else:
-            z_star, ponder_steps, moe_bal_loss = self._ponder_loop_sparse(
-                z_cur, eps_0, surprisal_0, s_bar_prev, c_fused, pi_eff, active_mask
-            )
+    def _post_ponder_merge_impl(
+        self,
+        slots: torch.Tensor,
+        edges: torch.Tensor,
+        salience: torch.Tensor,
+        z_star: torch.Tensor,
+        surprisal_0: torch.Tensor,
+        tau_m: torch.Tensor,
+        active_mask: torch.Tensor,
+        merge_uniform_mix: torch.Tensor,
+        pinned_cur: torch.Tensor,
+        trig_cur: torch.Tensor,
+        use_gumbel: bool,
+        gumbel_u: Optional[torch.Tensor] = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Static-shape candidate slot expansion, 72-pair Gumbel-STE merge, LogSumExp salience, and Slot-0 latch."""
+        B = z_star.shape[0]
+        K = self.cfg.k_slots
 
         # 3. Candidate slot expansion (K -> K+1)
         s_tilde = torch.cat([slots, z_star.unsqueeze(1)], dim=1)  # [B, K+1, D]
@@ -611,9 +710,7 @@ class BCGPC(nn.Module):
 
         a_ij = a_tilde[:, pi_idx, pj_idx, :]  # [B, 72, d_r]
 
-        # Decouple discrete 72-pair merge router inputs from the recurrent slot/edge carrier Jacobian:
-        # router weights (w_l, w_r, w_edge_score, w_merge) receive exact Gumbel-STE gradients without
-        # injecting an O(||S||_2 / tau_m) discrete slot-swap Jacobian back into slots_{m-1}.
+        # Decouple discrete 72-pair merge router inputs from the recurrent slot/edge carrier Jacobian
         s_tilde_score = s_tilde.detach()
         a_ij_score = a_ij.detach()
         wl_all = self.w_l(s_tilde_score)  # [B, K+1, d_m]
@@ -622,7 +719,7 @@ class BCGPC(nn.Module):
         m_score = self.w_merge(h_merge).squeeze(-1).float()  # [B, 72] fp32
 
         # Precision Island #3 (Red Line #1) + Branchless Slot-0 Pinning Mask (Spec 2 / Red Line #3)
-        with fp32_island(c_fused.device):
+        with fp32_island(z_star.device):
             pin_penalty = 1e4 * pinned_cur.unsqueeze(-1) * self.pin_mask_72  # [B, 72] fp32
             m_score_f = m_score.float() - pin_penalty
             tau_eff = tau_m.float().clamp_min(1e-4)
@@ -635,7 +732,7 @@ class BCGPC(nn.Module):
 
             if self.training:
                 if use_gumbel:
-                    u_rand = torch.rand_like(m_score_f)
+                    u_rand = torch.rand_like(m_score_f) if gumbel_u is None else gumbel_u.float()
                     gumbel = -torch.log(-torch.log(u_rand + 1e-7) + 1e-7)
                     unscaled_logits = torch.where(
                         eps_u > 0.0,
@@ -661,7 +758,7 @@ class BCGPC(nn.Module):
         p_mat_s = p_mat.to(s_tilde.dtype)
         p_mat_a = p_mat.to(a_tilde.dtype)
 
-        b_arange = torch.arange(B, device=c_fused.device)
+        b_arange = torch.arange(B, device=z_star.device)
         s_i_win = s_tilde[b_arange, win_i]  # [B, D]
         s_j_win = s_tilde[b_arange, win_j]  # [B, D]
         a_ij_win = a_tilde[b_arange, win_i, win_j]  # [B, d_r]
@@ -676,24 +773,20 @@ class BCGPC(nn.Module):
             slot_corr = win_u_oh.unsqueeze(-1) * corr_win.unsqueeze(1)  # [B, K, D]
             s_cand_new = (torch.einsum("bka,bad->bkd", p_mat_s, s_tilde) + slot_corr).to(slots.dtype)
         else:
-            # 100% branchless, zero-ULP exact eval slot placement (compile-friendly!)
             win_u = pu_idx[win_idx]  # [B]
             win_v = self.pair_v[win_idx]  # [B]
-            k_ids = torch.arange(K, device=c_fused.device).unsqueeze(0)  # [1, K]
+            k_ids = torch.arange(K, device=z_star.device).unsqueeze(0)  # [1, K]
             is_u = (k_ids == win_u.unsqueeze(1)).unsqueeze(-1)  # [B, K, 1]
-            is_v = (k_ids == win_v.unsqueeze(1)).unsqueeze(-1)  # [B, K, 1] (False if win_v == K)
+            is_v = (k_ids == win_v.unsqueeze(1)).unsqueeze(-1)  # [B, K, 1]
             s_cand_new = torch.where(is_u, s_merged_win.to(slots.dtype).unsqueeze(1), slots)
             s_cand_new = torch.where(is_v, z_star.to(slots.dtype).unsqueeze(1), s_cand_new)
 
-        # Factored two-stage edge tensor contraction: P_m @ A_tilde @ P_m^T
-        # `.contiguous()` preserves exact canonical [B, K, K, d_r] strides across steps (0 Dynamo recompiles!)
         a_tmp = torch.einsum("bka,bacr->bkcr", p_mat_a, a_tilde)
         a_cand_new = torch.einsum("blc,bkcr->bklr", p_mat_a, a_tmp).to(edges.dtype).contiguous()
 
-        # 5. Exact LogSumExp Slot Salience Conservation Equation strictly in float32 (Precision Island #3)
         slot0_bool = self.slot0_onehot > 0.5  # [K]
         already_pinned_b = pinned_cur > 0.5  # [B]
-        with fp32_island(c_fused.device):
+        with fp32_island(z_star.device):
             omega_old_decayed = salience.float() - self.cfg.delta_decay  # [B, K]
             omega_cand = (
                 F.linear(z_star.float(), self.w_omega.weight.float()).squeeze(-1)
@@ -715,10 +808,8 @@ class BCGPC(nn.Module):
                 omega_cand_new,
             )
 
-        # Bit-exact static-shape Slot-0 invariance when already pinned (0.0 drift even in bf16!)
         s_cand_new = torch.where(already_pinned_b.view(B, 1, 1) & slot0_bool.view(1, K, 1), slots, s_cand_new)
 
-        # Mask state updates strictly by active_mask (shields finished docs & padded virtual bucket slots!)
         am_s = active_mask.view(B, 1, 1)
         am_e = active_mask.view(B, 1, 1, 1)
         am_w = active_mask.view(B, 1)
@@ -726,9 +817,6 @@ class BCGPC(nn.Module):
         a_new = torch.where(am_e, a_cand_new, edges)
         omega_new = torch.where(am_w, omega_cand_new, salience.float())
 
-        # 6. Branchless Slot-0 Thesis Latch on SCRATCH_END (`\x1dE\n`) or first `\x1fA\n` (Spec 2)
-        # S_{m,0} <- RMSNorm(g_m), omega_{m,0} <- max(omega_{m,0}, 2.0), slot0_pinned <- 1.0
-        # Reuse `e_proj_post = tanh(W_e(a_new))` once across pre-latch g_post and post-latch s_bar_post!
         e_proj_post = torch.tanh(self.w_e(a_new))  # [B, K, K, D]
         _, g_post = self._message_pass_with_eproj(s_new, e_proj_post, omega_new)
         do_pin = active_mask.bool() & (trig_cur > 0.5) & (pinned_cur < 0.5)  # [B]
@@ -742,11 +830,373 @@ class BCGPC(nn.Module):
         omega_new = torch.where(do_pin_w, torch.maximum(omega_new, torch.full_like(omega_new, 2.0)), omega_new)
         slot0_pinned_next = torch.where(do_pin, torch.ones_like(pinned_cur), pinned_cur)
 
-        # Update neutral concept center c_0 via EMA strictly over active docs
+        s_bar_post, _ = self._message_pass_with_eproj(s_new, e_proj_post, omega_new)
+        return (
+            s_new,
+            a_new,
+            omega_new,
+            s_bar_post,
+            win_idx,
+            win_i,
+            win_j,
+            merge_probs,
+            alpha,
+            slot0_pinned_next,
+        )
+
+    def forward_fast_dispatch(
+        self,
+        slots: torch.Tensor,
+        edges: torch.Tensor,
+        salience: torch.Tensor,
+        c_fused: torch.Tensor,
+        prec_bu: torch.Tensor,
+        ach: torch.Tensor,
+        tau_m: torch.Tensor,
+        active_mask: torch.Tensor,
+        merge_uniform_mix: torch.Tensor,
+        slot0_pinned: Optional[torch.Tensor] = None,
+        pin_trigger: Optional[torch.Tensor] = None,
+        use_gumbel: bool = True,
+        update_c0_ema: bool = True,
+        packed_moe_w_gu1: Optional[torch.Tensor] = None,
+        packed_moe_w_d1: Optional[torch.Tensor] = None,
+        packed_moe_w_gu2: Optional[torch.Tensor] = None,
+        packed_moe_w_d2: Optional[torch.Tensor] = None,
+        gumbel_u: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Fast event-driven BCG-PC dispatcher with early-exit Pondering & lossless compacted Top-2 MoE.
+
+        Skips dead Pondering iterations (`l_idx = 2..7` once `active` empties) and compacts active
+        surprised rows + per-expert capacities into fixed Tensor-Core buckets while running all heavy
+        math inside static-shape `torch.compile(..., dynamic=False)` sub-kernels!
+        """
+        if self._compiled_pre_ponder is None and c_fused.device.type == "cpu":
+            return self.forward(
+                slots,
+                edges,
+                salience,
+                c_fused,
+                prec_bu,
+                ach,
+                tau_m,
+                active_mask,
+                merge_uniform_mix,
+                slot0_pinned,
+                pin_trigger,
+                use_gumbel=use_gumbel,
+                update_c0_ema=update_c0_ema,
+                packed_moe_w_gu1=packed_moe_w_gu1,
+                packed_moe_w_d1=packed_moe_w_d1,
+                packed_moe_w_gu2=packed_moe_w_gu2,
+                packed_moe_w_d2=packed_moe_w_d2,
+                gumbel_u=gumbel_u,
+            )
+
+        B, _ = c_fused.shape
+        dev = c_fused.device
+        orig_dtype = c_fused.dtype
+        packed_weights = (
+            (packed_moe_w_gu1, packed_moe_w_d1, packed_moe_w_gu2, packed_moe_w_d2)
+            if packed_moe_w_gu1 is not None
+            and packed_moe_w_d1 is not None
+            and packed_moe_w_gu2 is not None
+            and packed_moe_w_d2 is not None
+            else None
+        )
+        eff_packed_w = packed_weights if packed_weights is not None else self.moe.pack_weights(dtype=orig_dtype)
+
+        pinned_cur = (
+            torch.zeros((B,), device=dev, dtype=torch.float32)
+            if slot0_pinned is None
+            else slot0_pinned.float()
+        )
+        trig_cur = (
+            torch.zeros((B,), device=dev, dtype=torch.float32)
+            if pin_trigger is None
+            else pin_trigger.float()
+        )
+
+        pre_fn = self._compiled_pre_ponder if self._compiled_pre_ponder is not None else self._pre_ponder_impl
+        router_fn = self._compiled_ponder_router if self._compiled_ponder_router is not None else self._ponder_router_impl
+        update_fn = self._compiled_ponder_update if self._compiled_ponder_update is not None else self._ponder_update_impl
+        post_fn = self._compiled_post_merge if self._compiled_post_merge is not None else self._post_ponder_merge_impl
+
+        _s_bar_prev, g_ctx, c_hat, pi_m, pi_eff, surprisal_0, eps_cur, z_cur, k_prev, v_prev = pre_fn(
+            slots, edges, salience, c_fused, prec_bu, ach
+        )
+
+        surp_cur = surprisal_0
+        active = active_mask.bool()
+        ponder_steps = torch.zeros((B,), device=dev, dtype=torch.float32)
+        moe_bal_sum = torch.zeros((), device=dev, dtype=torch.float32)
+        moe_bal_count = torch.zeros((), device=dev, dtype=torch.float32)
+
+        for l_idx in range(self.cfg.l_max):
+            thresh = self.cfg.tau_skip if l_idx == 0 else self.cfg.tau_halt
+            prev_active_f = active.float()
+            still_surprised = surp_cur > thresh
+            active = active & still_surprised
+
+            # Exact STE ponder counter before early-exit check (0.0 ULP drift vs full L_max loop!)
+            soft_act = torch.sigmoid((surp_cur - thresh) / 0.25) * prev_active_f
+            hard_act = active.float()
+            ste_act = (hard_act - soft_act).detach() + soft_act
+            ponder_steps = ponder_steps + ste_act
+
+            act_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
+            n_act = int(act_idx.numel())
+            if n_act == 0:
+                break
+
+            if n_act == B:
+                z_act = z_cur
+                eps_act = eps_cur
+                if self.training and l_idx > 0:
+                    z_act = z_act.detach() + 0.5 * (z_act - z_act.detach())
+                    eps_act = eps_act.detach() + 0.5 * (eps_act - eps_act.detach())
+                router_in = router_fn(z_act, eps_act, k_prev, v_prev)
+                delta_act, bal_l = self.moe.forward_compacted_bmm(
+                    router_in,
+                    n_valid=B,
+                    sample_mask=None,
+                    packed_weights=eff_packed_w,
+                    compiled_experts_fn=self._compiled_experts_bmm,
+                )
+                moe_bal_sum = moe_bal_sum + bal_l
+                moe_bal_count = moe_bal_count + 1.0
+                z_cur, eps_cur, surp_cur = update_fn(z_act, delta_act, c_fused, pi_eff)
+            else:
+                n_pad = _coarse_bucket_count(n_act, bucket=16) if self._compiled_pre_ponder is not None else n_act
+                pad_n = n_pad - n_act
+                if pad_n > 0:
+                    safe_idx = torch.cat([act_idx, torch.zeros((pad_n,), device=dev, dtype=torch.long)], dim=0)
+                    pad_mask: Optional[torch.Tensor] = torch.arange(n_pad, device=dev) < n_act
+                else:
+                    safe_idx = act_idx
+                    pad_mask = None
+
+                z_act = z_cur[safe_idx]
+                eps_act = eps_cur[safe_idx]
+                if self.training and l_idx > 0:
+                    z_act = z_act.detach() + 0.5 * (z_act - z_act.detach())
+                    eps_act = eps_act.detach() + 0.5 * (eps_act - eps_act.detach())
+
+                router_in = router_fn(z_act, eps_act, k_prev[safe_idx], v_prev[safe_idx])
+                delta_act, bal_l = self.moe.forward_compacted_bmm(
+                    router_in,
+                    n_valid=n_act,
+                    sample_mask=pad_mask,
+                    packed_weights=eff_packed_w,
+                    compiled_experts_fn=self._compiled_experts_bmm,
+                )
+                moe_bal_sum = moe_bal_sum + bal_l
+                moe_bal_count = moe_bal_count + 1.0
+
+                z_next_p, eps_next_p, surp_next_p = update_fn(
+                    z_act, delta_act, c_fused[safe_idx], pi_eff[safe_idx]
+                )
+                z_next = z_cur.clone()
+                z_next[act_idx] = z_next_p[:n_act]
+                z_cur = z_next
+
+                eps_next = eps_cur.clone()
+                eps_next[act_idx] = eps_next_p[:n_act]
+                eps_cur = eps_next
+
+                surp_next = surp_cur.clone()
+                surp_next[act_idx] = surp_next_p[:n_act]
+                surp_cur = surp_next
+
+        moe_bal_loss = moe_bal_sum / moe_bal_count.clamp_min(1.0)
+        z_star = z_cur
+
+        (
+            s_new,
+            a_new,
+            omega_new,
+            s_bar_post,
+            win_idx,
+            win_i,
+            win_j,
+            merge_probs,
+            alpha,
+            slot0_pinned_next,
+        ) = post_fn(
+            slots,
+            edges,
+            salience,
+            z_star,
+            surprisal_0,
+            tau_m,
+            active_mask,
+            merge_uniform_mix,
+            pinned_cur,
+            trig_cur,
+            use_gumbel,
+            gumbel_u,
+        )
+
         if self.training and update_c0_ema:
             self.update_c0_from_slots(s_new, active_mask)
 
-        s_bar_post, _ = self._message_pass_with_eproj(s_new, e_proj_post, omega_new)
+        return (
+            z_star,
+            g_ctx,
+            c_hat,
+            pi_m,
+            surprisal_0,
+            ponder_steps,
+            s_new,
+            a_new,
+            omega_new,
+            s_bar_post,
+            win_idx,
+            win_i,
+            win_j,
+            merge_probs,
+            alpha,
+            slot0_pinned_next,
+            moe_bal_loss,
+        )
+
+    def forward(
+        self,
+        slots: torch.Tensor,
+        edges: torch.Tensor,
+        salience: torch.Tensor,
+        c_fused: torch.Tensor,
+        prec_bu: torch.Tensor,
+        ach: torch.Tensor,
+        tau_m: torch.Tensor,
+        active_mask: torch.Tensor,
+        merge_uniform_mix: torch.Tensor,
+        slot0_pinned: Optional[torch.Tensor] = None,
+        pin_trigger: Optional[torch.Tensor] = None,
+        use_gumbel: bool = True,
+        update_c0_ema: bool = True,
+        packed_moe_w_gu1: Optional[torch.Tensor] = None,
+        packed_moe_w_d1: Optional[torch.Tensor] = None,
+        packed_moe_w_gu2: Optional[torch.Tensor] = None,
+        packed_moe_w_d2: Optional[torch.Tensor] = None,
+        gumbel_u: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Hotspot A (`bcg_step_kernel`): single-step concept graph transition kernel.
+
+        Designed for `torch.compile(..., dynamic=False)` on bucketed document batches `[V_pad, ...]`:
+          - In `static_mode` (CUDA `torch.compile` & MPS): 100% zero-sync, zero-graph-break fused
+            Inductor graph using 4 batched `torch.bmm` MoE kernels (12x fewer GEMM launches!) and
+            precomputed `SlotCrossAttention` K/V (8x less KV projection work).
+          - In eager CPU mode (`static_mode=False`): uses event-driven sparse pondering + Top-2 MoE.
+        """
+        B, _ = c_fused.shape
+        orig_dtype = c_fused.dtype
+        static_mode = self._static_kernel_mode or c_fused.device.type == "mps" or torch.compiler.is_compiling()
+        packed_weights = (
+            (packed_moe_w_gu1, packed_moe_w_d1, packed_moe_w_gu2, packed_moe_w_d2)
+            if packed_moe_w_gu1 is not None
+            and packed_moe_w_d1 is not None
+            and packed_moe_w_gu2 is not None
+            and packed_moe_w_d2 is not None
+            else None
+        )
+
+        pinned_cur = (
+            torch.zeros((B,), device=c_fused.device, dtype=torch.float32)
+            if slot0_pinned is None
+            else slot0_pinned.float()
+        )
+        trig_cur = (
+            torch.zeros((B,), device=c_fused.device, dtype=torch.float32)
+            if pin_trigger is None
+            else pin_trigger.float()
+        )
+
+        s_bar_prev, g_ctx, c_hat, pi_m, pi_eff, surprisal_0, eps_0, z_cur, k_prev, v_prev = self._pre_ponder_impl(
+            slots, edges, salience, c_fused, prec_bu, ach
+        )
+
+        # 2. Event-Driven Pondering (L_max = 8) + Switch MoE load-balancing aux loss
+        if static_mode:
+            eps_cur = eps_0
+            surp_cur = surprisal_0
+            active = active_mask.bool()
+            ponder_steps = torch.zeros((B,), device=c_fused.device, dtype=torch.float32)
+            moe_bal_sum = torch.zeros((), device=c_fused.device, dtype=torch.float32)
+            moe_bal_count = torch.zeros((), device=c_fused.device, dtype=torch.float32)
+
+            eff_packed_w = packed_weights if packed_weights is not None else self.moe.pack_weights(dtype=orig_dtype)
+
+            for l_idx in range(self.cfg.l_max):
+                thresh = self.cfg.tau_skip if l_idx == 0 else self.cfg.tau_halt
+                prev_active_f = active.float()
+                still_surprised = surp_cur > thresh
+                active = active & still_surprised
+
+                soft_act = torch.sigmoid((surp_cur - thresh) / 0.25) * prev_active_f
+                hard_act = active.float()
+                ste_act = (hard_act - soft_act).detach() + soft_act
+                ponder_steps = ponder_steps + ste_act
+
+                if self.training and l_idx > 0:
+                    z_in = z_cur.detach() + 0.5 * (z_cur - z_cur.detach())
+                    eps_in = eps_cur.detach() + 0.5 * (eps_cur - eps_cur.detach())
+                else:
+                    z_in = z_cur
+                    eps_in = eps_cur
+
+                r_all = self.cross_attn.forward_with_kv(z_in, k_prev, v_prev)
+                delta_all, bal_l = self.moe(
+                    eps_in + r_all,
+                    static_shape=True,
+                    sample_mask=active,
+                    packed_weights=eff_packed_w,
+                )
+                moe_bal_sum = moe_bal_sum + bal_l
+                moe_bal_count = moe_bal_count + (active.float().sum() > 0.0).float()
+
+                z_cand, eps_cand, surp_cand = self._ponder_update_impl(z_in, delta_all, c_fused, pi_eff)
+                act_col = active.unsqueeze(-1)
+                z_cur = torch.where(act_col, z_cand, z_cur)
+                eps_cur = torch.where(act_col, eps_cand, eps_cur)
+                surp_cur = torch.where(active, surp_cand, surp_cur)
+
+            moe_bal_loss = moe_bal_sum / moe_bal_count.clamp_min(1.0)
+            z_star = z_cur  # [B, D]
+        else:
+            z_star, ponder_steps, moe_bal_loss = self._ponder_loop_sparse(
+                z_cur, eps_0, surprisal_0, s_bar_prev, c_fused, pi_eff, active_mask
+            )
+
+        (
+            s_new,
+            a_new,
+            omega_new,
+            s_bar_post,
+            win_idx,
+            win_i,
+            win_j,
+            merge_probs,
+            alpha,
+            slot0_pinned_next,
+        ) = self._post_ponder_merge_impl(
+            slots,
+            edges,
+            salience,
+            z_star,
+            surprisal_0,
+            tau_m,
+            active_mask,
+            merge_uniform_mix,
+            pinned_cur,
+            trig_cur,
+            use_gumbel,
+            gumbel_u,
+        )
+
+        # Update neutral concept center c_0 via EMA strictly over active docs
+        if self.training and update_c0_ema:
+            self.update_c0_from_slots(s_new, active_mask)
 
         return (
             z_star,

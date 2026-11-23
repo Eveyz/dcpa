@@ -33,6 +33,12 @@ from dcpa.ops.fp32 import fp32_island
 from dcpa.ops.ragged import ragged_local_offsets, ragged_segment_sum
 from dcpa.ops.scan import parallel_diag_scan
 
+try:
+    from utils.device import get_allocated_memory_gb as _get_allocated_memory_gb
+except ImportError:
+    def _get_allocated_memory_gb(_device: torch.device) -> float:
+        return 0.0
+
 
 class _DampedBoundedCarry(torch.autograd.Function):
     """Exact bit-identical forward carry with spectral-safe per-sample backward RMS clamping.
@@ -158,9 +164,12 @@ class DCPAModel(nn.Module):
         # Document-dimension bucketing (multiples of 16) enabled automatically under torch.compile
         self.enable_doc_bucketing: bool = False
         self.doc_bucket_size: int = 16
-        # Per-step activation checkpointing across unrolled BCG-PC concept steps cuts Stage 2-4
-        # VRAM by ~20-40x (prevents 60+ GB activation OOM at 128 KB/step on 48M & 210M-MoE).
+        # Activation checkpointing across unrolled BCG-PC concept steps:
+        #   - On <= 80GB GPUs (`bcg_checkpoint_vram_watermark_gb == 0.0`), checkpoints every step.
+        #   - On >= 88GB GPUs (e.g. 95.6GB G4 Blackwell, `watermark_gb == 52.0`), skips recomputation
+        #     while live allocated VRAM < watermark_gb and automatically engages checkpointing above it!
         self.bcg_grad_checkpointing: bool = True
+        self.bcg_checkpoint_vram_watermark_gb: float = 0.0
 
     def _bcg_step_checkpointed_fn(
         self,
@@ -179,8 +188,10 @@ class DCPAModel(nn.Module):
         w_d1: torch.Tensor,
         w_gu2: torch.Tensor,
         w_d2: torch.Tensor,
+        gumbel_u: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
-        return self.bcg_pc(
+        bcg_raw = getattr(self.bcg_pc, "_orig_mod", self.bcg_pc)
+        return bcg_raw.forward_fast_dispatch(
             in_slots,
             in_edges,
             in_sal,
@@ -198,6 +209,7 @@ class DCPAModel(nn.Module):
             packed_moe_w_d1=w_d1,
             packed_moe_w_gu2=w_gu2,
             packed_moe_w_d2=w_d2,
+            gumbel_u=gumbel_u,
         )
 
     def count_parameters(self) -> dict[str, int]:
@@ -585,12 +597,16 @@ class DCPAModel(nn.Module):
                     return min(bucket, cap)
                 if n <= bucket * 2:
                     return min(bucket * 2, cap)
-                if n <= bucket * 4:
-                    return min(bucket * 4, cap)
-                step_b = bucket * 2
+                if n <= bucket * 16:
+                    step_b = bucket * 2
+                    return min(((n + step_b - 1) // step_b) * step_b, cap)
+                if n <= bucket * 32:
+                    step_b = bucket * 4
+                    return min(((n + step_b - 1) // step_b) * step_b, cap)
+                step_b = bucket * 8
                 return min(((n + step_b - 1) // step_b) * step_b, cap)
 
-            V_eff = _coarse_bucket_v(V, max(V, ((V + bucket * 2 - 1) // (bucket * 2)) * (bucket * 2))) if use_bucketing else V
+            V_eff = _coarse_bucket_v(V, 1 << 30) if use_bucketing else V
             pad_v = V_eff - V
 
             pts_base = (
@@ -850,7 +866,8 @@ class DCPAModel(nn.Module):
 
                 # Pre-pack MoE expert weights into 4 batched-GEMM tensors ONCE per forward()!
                 # Saves E*6 sequential GEMMs & eliminates m_max * L_max redundant fp32->bf16 weight casts.
-                w_gu1, w_d1, w_gu2, w_d2 = self.bcg_pc.moe.pack_weights(dtype=sgsc_out.c_slow.dtype)
+                bcg_raw = getattr(self.bcg_pc, "_orig_mod", self.bcg_pc)
+                w_gu1, w_d1, w_gu2, w_d2 = bcg_raw.moe.pack_weights(dtype=sgsc_out.c_slow.dtype)
 
                 # Hoist cortical bottom-up precision pi_cort ONCE across all m_total segments when
                 # Hippocampus is disabled (Stages B/C): skips m_max dead dg_lex + topk(4096, 32) calls!
@@ -963,7 +980,23 @@ class DCPAModel(nn.Module):
                         in_sal = g_state.salience
                     assert g_state.slot0_pinned is not None
 
-                    if self.training and torch.is_grad_enabled() and self.bcg_grad_checkpointing:
+                    # Pre-sample 72-pair Gumbel uniform noise ONCE outside checkpointing:
+                    #   1. Eliminates 100% of fork_rng CUDA generator save/restore syncs (`preserve_rng_state=False`).
+                    #   2. Guarantees bit-identical RNG trajectory whether watermark checkpointing is engaged or bypassed!
+                    gumbel_u_step: Optional[torch.Tensor] = (
+                        torch.rand((cur_v, num_pairs), device=device, dtype=torch.float32)
+                        if self.training
+                        else None
+                    )
+                    watermark_gb = float(self.bcg_checkpoint_vram_watermark_gb)
+                    use_ckpt_step = bool(
+                        self.training
+                        and torch.is_grad_enabled()
+                        and self.bcg_grad_checkpointing
+                        and (watermark_gb <= 0.0 or _get_allocated_memory_gb(device) >= watermark_gb)
+                    )
+                    if use_ckpt_step:
+                        assert gumbel_u_step is not None
                         bcg_step_out = torch_checkpoint(
                             self._bcg_step_checkpointed_fn,
                             in_slots,
@@ -981,13 +1014,14 @@ class DCPAModel(nn.Module):
                             w_d1,
                             w_gu2,
                             w_d2,
+                            gumbel_u_step,
                             use_reentrant=False,
-                            preserve_rng_state=True,
+                            preserve_rng_state=False,
                         )
                         # Update neutral concept center c_0 ONCE outside checkpoint (never doubled on bwd!)
-                        self.bcg_pc.update_c0_from_slots(bcg_step_out[6], active_mask)
+                        bcg_raw.update_c0_from_slots(bcg_step_out[6], active_mask)
                     else:
-                        bcg_step_out = self.bcg_pc(
+                        bcg_step_out = bcg_raw.forward_fast_dispatch(
                             in_slots,
                             in_edges,
                             in_sal,
@@ -1005,6 +1039,7 @@ class DCPAModel(nn.Module):
                             packed_moe_w_d1=w_d1,
                             packed_moe_w_gu2=w_gu2,
                             packed_moe_w_d2=w_d2,
+                            gumbel_u=gumbel_u_step,
                         )
                     (
                         z_star_step,

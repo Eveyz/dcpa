@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import random
+import threading
 from pathlib import Path
 from typing import Iterator, Optional, Sequence
 
@@ -290,23 +291,32 @@ class RaggedByteDataset(Dataset):
         # Lazy per-process mmap handle (never pickled across DataLoader workers)
         self._bin_mmap: Optional[np.memmap] = None
         self._mmap_pid: int = -1
+        self._mmap_lock = threading.Lock()
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
         state["_bin_mmap"] = None
         state["_mmap_pid"] = -1
+        state.pop("_mmap_lock", None)
         return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._mmap_lock = threading.Lock()
 
     def _get_mmap(self) -> np.memmap:
         pid = os.getpid()
         if self._bin_mmap is None or self._mmap_pid != pid:
-            self._bin_mmap = np.memmap(self.bin_path, dtype=np.uint8, mode="r")
-            self._mmap_pid = pid
+            with self._mmap_lock:
+                if self._bin_mmap is None or self._mmap_pid != pid:
+                    self._bin_mmap = np.memmap(self.bin_path, dtype=np.uint8, mode="r")
+                    self._mmap_pid = pid
         return self._bin_mmap
 
     def close(self) -> None:
-        self._bin_mmap = None
-        self._mmap_pid = -1
+        with self._mmap_lock:
+            self._bin_mmap = None
+            self._mmap_pid = -1
 
     def __len__(self) -> int:
         return self.num_batches

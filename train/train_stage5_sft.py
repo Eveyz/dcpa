@@ -50,9 +50,11 @@ from utils.device import (
     describe_hardware_profile,
     detect_hardware_profile,
     get_peak_memory_gb,
+    pin_batch_if_cuda,
     reset_peak_memory_stats,
     seed_everything,
     synchronize,
+    to_device_async,
 )
 
 
@@ -320,6 +322,8 @@ def run_stage5_sft(
     seed_everything(seed, device=device)
 
     model = load_dcpa_model_from_weights(weights_path, config_path=config_path, device=device)
+    if device.type == "cuda" and profile.vram_gb >= 88.0:
+        model.bcg_checkpoint_vram_watermark_gb = 48.0 if model.cfg.num_experts >= 16 else 52.0
     freeze_info = apply_stage5_surgical_freeze(model)
     optimizer = torch.optim.AdamW(freeze_info["param_groups"], betas=(0.9, 0.95), eps=1.0e-8)
 
@@ -393,16 +397,15 @@ def run_stage5_sft(
             accum_m: dict[str, float] = {}
             for _ in range(grad_accum):
                 ds_sel = train_datasets[batch_cursor % len(train_datasets)]
-                batch = ds_sel[batch_cursor // len(train_datasets)]
+                batch = pin_batch_if_cuda(ds_sel[batch_cursor // len(train_datasets)], device)
                 batch_cursor += 1
-                x_b = batch["x_bytes"].to(device)
-                msk = batch["sft_loss_mask"].to(device)
-                cu = batch["cu_seqlens"].to(device)
-                lids = batch["doc_lang_ids"].to(device)
-                sids = batch.get("doc_style_ids")
-                sids_t = sids.to(device) if sids is not None else None
-                pts = batch.get("doc_ponder_tax_scale")
-                pts_t = pts.to(device) if pts is not None else None
+                x_b = to_device_async(batch["x_bytes"], device)
+                msk = to_device_async(batch["sft_loss_mask"], device)
+                cu = to_device_async(batch["cu_seqlens"], device)
+                lids = to_device_async(batch["doc_lang_ids"], device)
+                sids_t = to_device_async(batch.get("doc_style_ids"), device)
+                pts_t = to_device_async(batch.get("doc_ponder_tax_scale"), device)
+                assert x_b is not None and msk is not None and cu is not None and lids is not None
 
                 loss_w = build_sft_byte_loss_weights(
                     x_b, msk, eot_weight=eot_weight, tool_ctrl_weight=tool_ctrl_weight

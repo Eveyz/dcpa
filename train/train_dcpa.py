@@ -851,6 +851,12 @@ def run_training(
         )
         if stream.has_shards:
             print(f"[Data] Opened NVMe Ragged UTF-8 stream: {train_bin}", flush=True)
+        elif eff_total_steps >= 1000:
+            raise FileNotFoundError(
+                f"Production training (total_steps={eff_total_steps:,}) requires real corpus shards at "
+                f"{train_bin} and {train_idx}! Restore corpus onto local NVMe first (run Cell 3) — "
+                "refusing to fall back to synthetic smoke data and overwrite checkpoints."
+            )
         if stream._cap_shards:
             print(
                 f"[Data] Stage 3 capability mix active ({s3_cap_ratio*100:.0f}%): "

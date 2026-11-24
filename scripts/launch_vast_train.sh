@@ -2,7 +2,7 @@
 # Vast.ai One-Command Multi-GPU Launcher for DCPA (Data -> Stage 1..4 DDP -> Stage 5 SFT DDP)
 #
 # Examples:
-#   # Recommended 1-week run on 4x A100 SXM4 80GB (~2.68B MoE-64, 11.8 GB STEM+Code shards, inside tmux):
+#   # Recommended 1-week run on 4x A100 SXM4 80GB (~2.68B MoE-64, ~12.1 GB EN/ZH + Py/JS + Reasoning/Instruct/ToolCall shards):
 #   bash scripts/launch_vast_train.sh --tmux=dcpa
 #
 #   # Faster 1.8B MoE-64 variant or larger 3.5B MoE-64 variant:

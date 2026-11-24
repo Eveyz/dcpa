@@ -36,14 +36,17 @@ for _p in (str(REPO_ROOT), str(TRAIN_PY)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from data.build_cap_instruct import build_cap_instruct_corpus
+from data.build_cap_reasoning import build_cap_reasoning_corpus
 from data.build_sft_stage5 import build_stage5_sft_corpus
 from data.prepare_vast_corpus import prepare_vast_corpus, verify_all_shards
-from data.ragged_dataloader import IDX_RECORD_FMT, RaggedByteDataset
+from data.ragged_dataloader import IDX_DTYPE, IDX_RECORD_FMT, RaggedByteDataset
 from dcpa.config import DCPAConfig
-from dcpa.modules.bcg_pc import SparseMicroMoE
+from dcpa.modules.bcg_pc import BCGPC, SparseMicroMoE
 from train.curriculum_state_machine import hash_named_parameters
 from train.train_dcpa import build_dcpa_config, run_training
 from train.train_stage5_sft import run_stage5_sft
+from utils.chat_protocol import verify_mask_alignment
 
 
 def _find_free_port() -> int:
@@ -53,7 +56,7 @@ def _find_free_port() -> int:
 
 
 def _write_synthetic_multitier_corpus(out_dir: Path) -> None:
-    """Create a deterministic 5-domain `.bin/.idx` shard spanning all 4 length tiers."""
+    """Create a deterministic 4-domain `(0:en, 1:zh, 3:py, 5:js)` `.bin/.idx` shard spanning all 4 length tiers."""
     out_dir.mkdir(parents=True, exist_ok=True)
     tier_lengths = (220, 780, 1550, 3100)
     rng = np.random.default_rng(2026)
@@ -63,7 +66,7 @@ def _write_synthetic_multitier_corpus(out_dir: Path) -> None:
         idx_p = out_dir / f"{split}.idx"
         offset = 0
         with bin_p.open("wb") as fb, idx_p.open("wb") as fi:
-            for lid in range(5):
+            for lid in (0, 1, 3, 5):
                 for d_len in tier_lengths:
                     for j in range(docs_per_cell):
                         # Pure valid ASCII bytes (`a`..`z`, spaces, newline)
@@ -138,7 +141,7 @@ def test_ragged_length_bucketing_homogeneity_cross_rank_sync_and_unbiased_domain
     data_dir = tmp_path / "tiered_data"
     _write_synthetic_multitier_corpus(data_dir)
 
-    target_weights = {0: 0.35, 1: 0.25, 2: 0.15, 3: 0.15, 4: 0.10}
+    target_weights = {0: 0.38, 1: 0.42, 3: 0.10, 5: 0.10}
     world_size = 4
     ds = RaggedByteDataset(
         bin_path=data_dir / "train.bin",
@@ -160,7 +163,7 @@ def test_ragged_length_bucketing_homogeneity_cross_rank_sync_and_unbiased_domain
                     return ti
             raise AssertionError(f"Unexpected doc_len={doc_len}")
 
-        lang_byte_counts = {lid: 0 for lid in range(5)}
+        lang_byte_counts = {lid: 0 for lid in (0, 1, 3, 5)}
         total_sampled_bytes = 0
 
         for logical_b in range(80):
@@ -381,6 +384,7 @@ def test_v2_presets_and_vast_orchestrator_dry_run_and_scripts(tmp_path: Path) ->
     assert set(plan["commands"].keys()) == {
         "corpus_5domain",
         "cap_reasoning",
+        "cap_instruct",
         "cap_writing",
         "cap_toolcall",
         "stage5_sft",
@@ -405,3 +409,169 @@ def test_v2_presets_and_vast_orchestrator_dry_run_and_scripts(tmp_path: Path) ->
     assert "--nproc_per_node=4" in proc.stdout
     assert "dcpa_v2_4xa100.yaml" in proc.stdout
     assert "train_stage5_sft.py" in proc.stdout
+
+
+def test_bcg_pc_dynamo_single_graph_zero_breaks() -> None:
+    """Verify static-shape `scatter_add` MoE routing eliminates all `torch.bincount` graph breaks."""
+    if not hasattr(F, "grouped_mm"):
+        pytest.skip("PyTorch build lacks torch.nn.functional.grouped_mm")
+
+    torch._dynamo.reset()
+    cfg = DCPAConfig(
+        d_s=64,
+        d_concept=128,
+        k_slots=8,
+        d_r=32,
+        d_merge=64,
+        d_h=512,
+        s_active=16,
+        d_l=64,
+        num_experts=8,
+        top_k_experts=2,
+        expert_hidden=192,
+        l_max=4,
+    )
+    bcg = BCGPC(cfg).to(torch.bfloat16).train()
+    bcg.set_static_kernel_mode(True)
+    for m in bcg.modules():
+        if isinstance(m, SparseMicroMoE):
+            m.allow_cpu_grouped_mm = True
+
+    B, D = 4, cfg.d_concept
+    st = bcg.init_state(B, device=torch.device("cpu"), dtype=torch.bfloat16)
+    c_in = torch.randn(B, D, dtype=torch.bfloat16)
+    prec = torch.ones(B, D, dtype=torch.bfloat16)
+    ach = torch.zeros(B, dtype=torch.bfloat16)
+    tau = torch.tensor(0.3, dtype=torch.float32)
+    am = torch.tensor([True, True, True, False])
+    mix = torch.tensor(0.0, dtype=torch.float32)
+    trig = torch.zeros(B, dtype=torch.bfloat16)
+
+    explanation = torch._dynamo.explain(bcg)(
+        st.slots,
+        st.edges,
+        st.salience,
+        c_in,
+        prec,
+        ach,
+        tau,
+        am,
+        mix,
+        st.slot0_pinned,
+        trig,
+        False,
+        False,
+    )
+    assert explanation.graph_count == 1, (
+        f"BCGPC shattered into {explanation.graph_count} graphs! Breaks: {explanation.break_reasons}"
+    )
+    assert len(explanation.break_reasons) == 0
+
+
+def test_bayes_length_bucketing_asymmetric_domain_lengths_zero_bias(tmp_path: Path) -> None:
+    """Regression test: when EN docs are short (220B) and JS docs are long (3000B),
+    byte-mass outer tier weighting must match unbucketed byte-share closely without 13x short-doc bias.
+    """
+    asym_dir = tmp_path / "asym_data"
+    asym_dir.mkdir(parents=True, exist_ok=True)
+    bin_p = asym_dir / "train.bin"
+    idx_p = asym_dir / "train.idx"
+    rng = np.random.default_rng(1234)
+
+    offset = 0
+    with bin_p.open("wb") as fb, idx_p.open("wb") as fi:
+        # Domain 0 (EN): 64 short docs (220 bytes -> band 0)
+        for _ in range(64):
+            body = rng.integers(97, 123, size=219, dtype=np.uint8).tobytes() + b"\n"
+            fb.write(body)
+            fi.write(struct.pack(IDX_RECORD_FMT, offset, 220, 0, 1, 1, 0))
+            offset += 220
+        # Domain 5 (JS): 64 long docs (3000 bytes -> band 3)
+        for _ in range(64):
+            body = rng.integers(97, 123, size=2999, dtype=np.uint8).tobytes() + b"\n"
+            fb.write(body)
+            fi.write(struct.pack(IDX_RECORD_FMT, offset, 3000, 5, 1, 4, 0))
+            offset += 3000
+
+    # Under unbucketed doc-draw (`p_0 = 0.5, p_5 = 0.5`), expected byte share of JS (5) is:
+    #   3000 / (220 + 3000) = 0.9317!
+    # Under the old doc-count tier bug, band 0 and band 3 each got 50% of batches (packing 18 short docs vs 1.3 long docs),
+    # collapsing JS byte share from 93.2% down to ~50%!
+    expected_js_byte_share = 3000.0 / (220.0 + 3000.0)
+    ds_bucket = RaggedByteDataset(
+        bin_path=bin_p,
+        idx_path=idx_p,
+        target_batch_bytes=8192,
+        max_doc_bytes=4096,
+        domain_weights={0: 0.5, 5: 0.5},
+        wug_ratio=0.0,
+        seed=2026,
+        length_bucketing=True,
+    )
+    try:
+        assert ds_bucket._use_tiered_buckets is True
+        b0, b5 = 0, 0
+        for i in range(120):
+            batch = ds_bucket.get_batch(i)
+            cu = batch["cu_seqlens"].tolist()
+            lens = [cu[k + 1] - cu[k] for k in range(len(cu) - 1)]
+            for lid_v, ln_v in zip(batch["doc_lang_ids"].tolist(), lens):
+                if int(lid_v) == 0:
+                    b0 += int(ln_v)
+                elif int(lid_v) == 5:
+                    b5 += int(ln_v)
+        emp_js_share = b5 / max(b0 + b5, 1)
+        assert abs(emp_js_share - expected_js_byte_share) < 0.04, (
+            f"Byte-mass tier weighting biased asymmetric lengths: emp_js={emp_js_share:.3f} vs exp={expected_js_byte_share:.3f}"
+        )
+    finally:
+        ds_bucket.close()
+
+
+def test_cap_instruct_and_js_reasoning_offline_builders_and_sidecar_mask(tmp_path: Path) -> None:
+    """Verify new `cap_instruct` + JS `cap_reasoning` offline builders, zero JA/Rust,
+    100% `verify_mask_alignment`, and `RaggedByteDataset` `.loss_mask.bin` sidecar loading.
+    """
+    cap_dir = tmp_path / "cap_data"
+    meta_inst = build_cap_instruct_corpus(out_dir=cap_dir, smoke_quota=True, offline=True, seed=202614)
+    meta_reas = build_cap_reasoning_corpus(out_dir=cap_dir, smoke_quota=True, offline=True, seed=202611)
+    assert meta_inst["total_bytes"] >= 1_800_000
+    assert meta_reas["total_bytes"] >= 1_800_000
+
+    # Audit cap_instruct: only active domains {0, 1, 3, 5}, 100% mask alignment
+    idx_inst = np.memmap(cap_dir / "cap_instruct_train.idx", dtype=IDX_DTYPE, mode="r")
+    bin_inst = np.memmap(cap_dir / "cap_instruct_train.bin", dtype=np.uint8, mode="r")
+    msk_inst = np.memmap(cap_dir / "cap_instruct_train.loss_mask.bin", dtype=np.uint8, mode="r")
+    inst_langs = set(np.unique(idx_inst["lang_id"]).tolist())
+    assert inst_langs.issubset({0, 1, 3, 5}), f"Forbidden JA/Rust lang_id in cap_instruct: {inst_langs}"
+    assert {0, 1, 3, 5}.issubset(inst_langs), f"Missing active domain in cap_instruct: {inst_langs}"
+    for i in range(min(80, len(idx_inst))):
+        off, ln = int(idx_inst[i]["offset"]), int(idx_inst[i]["length"])
+        assert verify_mask_alignment(bytes(bin_inst[off : off + ln]), bytes(msk_inst[off : off + ln]))
+    del idx_inst, bin_inst, msk_inst
+
+    # Audit cap_reasoning: includes JS (`lang_id=5`) state-machine traces
+    idx_reas = np.memmap(cap_dir / "cap_reasoning_train.idx", dtype=IDX_DTYPE, mode="r")
+    reas_langs = set(np.unique(idx_reas["lang_id"]).tolist())
+    assert 5 in reas_langs, f"Expected JS (lang_id=5) traces in cap_reasoning, got {reas_langs}"
+    assert 2 not in reas_langs and 4 not in reas_langs
+    del idx_reas
+
+    # Verify RaggedByteDataset automatically loads `.loss_mask.bin` sidecar so User prompts stay False!
+    ds_cap = RaggedByteDataset(
+        bin_path=cap_dir / "cap_instruct_train.bin",
+        idx_path=cap_dir / "cap_instruct_train.idx",
+        target_batch_bytes=4096,
+        max_doc_bytes=2048,
+        wug_ratio=0.0,
+        seed=42,
+    )
+    try:
+        assert ds_cap.mask_path is not None
+        b = ds_cap.get_batch(0)
+        lmask = b["loss_mask"]
+        # Both False (User prompt) and True (Assistant response) bytes MUST appear!
+        assert bool((~lmask).any().item()), "Sidecar .loss_mask.bin failed to mask User prompt bytes False!"
+        assert bool(lmask.any().item()), "Sidecar .loss_mask.bin masked out all Assistant bytes!"
+    finally:
+        ds_cap.close()

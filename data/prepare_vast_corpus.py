@@ -47,6 +47,7 @@ class DataProfileSpec:
     stem_upgrade: bool
     corpus_workers: int
     cap_reasoning_mb: float
+    cap_instruct_mb: float
     cap_writing_mb: float
     cap_toolcall_mb: float
     sft_train_mb: float
@@ -57,12 +58,13 @@ class DataProfileSpec:
 PROFILES: dict[str, DataProfileSpec] = {
     "smoke": DataProfileSpec(
         name="smoke",
-        description="Fast ~18 MB smoke shards across all 5 builders for sanity checks.",
+        description="Fast ~18 MB smoke shards across all 6 builders (EN/ZH/Python/JS + Capabilities).",
         smoke_quota=True,
         corpus_scale_factor=1.0,
         stem_upgrade=False,
         corpus_workers=2,
         cap_reasoning_mb=2.0,
+        cap_instruct_mb=2.0,
         cap_writing_mb=2.0,
         cap_toolcall_mb=2.0,
         sft_train_mb=1.0,
@@ -71,45 +73,48 @@ PROFILES: dict[str, DataProfileSpec] = {
     ),
     "v1_fast": DataProfileSpec(
         name="v1_fast",
-        description="Standard ~720 MB corpus + capability + SFT suite (~60-90s on Vast.ai).",
+        description="Standard ~820 MB EN/ZH/Python/JS corpus + Reasoning/Instruct/Toolcall/Writing + SFT.",
         smoke_quota=False,
         corpus_scale_factor=1.0,
         stem_upgrade=False,
-        corpus_workers=5,
+        corpus_workers=4,
         cap_reasoning_mb=100.0,
-        cap_writing_mb=100.0,
-        cap_toolcall_mb=60.0,
-        sft_train_mb=20.0,
+        cap_instruct_mb=100.0,
+        cap_writing_mb=80.0,
+        cap_toolcall_mb=80.0,
+        sft_train_mb=24.0,
         sft_val_mb=1.0,
         min_free_gb=5.0,
     ),
     "v2_stem_10g": DataProfileSpec(
         name="v2_stem_10g",
-        description="Recommended 4x A100 80GB 1-week corpus (~11.8 GB FineWeb-Edu>=4 + Math + Git AST + Cap + SFT).",
+        description="Recommended 4x A100 80GB 1-week corpus (~12.6 GB EN/ZH STEM + Python/JS AST + Reasoning/Instruct/Toolcall).",
         smoke_quota=False,
         corpus_scale_factor=24.0,
         stem_upgrade=True,
-        corpus_workers=5,
-        cap_reasoning_mb=600.0,
-        cap_writing_mb=500.0,
-        cap_toolcall_mb=250.0,
-        sft_train_mb=120.0,
+        corpus_workers=4,
+        cap_reasoning_mb=700.0,
+        cap_instruct_mb=600.0,
+        cap_writing_mb=350.0,
+        cap_toolcall_mb=350.0,
+        sft_train_mb=140.0,
         sft_val_mb=4.0,
-        min_free_gb=30.0,
+        min_free_gb=32.0,
     ),
     "v2_full_40g": DataProfileSpec(
         name="v2_full_40g",
-        description="Large multi-node / multi-week corpus (~42.5 GB high-purity UTF-8 bytes).",
+        description="Large multi-node / multi-week corpus (~44 GB EN/ZH/Python/JS + full capabilities).",
         smoke_quota=False,
         corpus_scale_factor=90.0,
         stem_upgrade=True,
-        corpus_workers=5,
-        cap_reasoning_mb=1500.0,
-        cap_writing_mb=1200.0,
-        cap_toolcall_mb=600.0,
-        sft_train_mb=250.0,
+        corpus_workers=4,
+        cap_reasoning_mb=1600.0,
+        cap_instruct_mb=1400.0,
+        cap_writing_mb=800.0,
+        cap_toolcall_mb=800.0,
+        sft_train_mb=280.0,
         sft_val_mb=8.0,
-        min_free_gb=90.0,
+        min_free_gb=95.0,
     ),
 }
 
@@ -162,7 +167,7 @@ def verify_shard_triplet(
 
 
 def verify_all_shards(nvme_root: Path) -> dict[str, dict[str, Any]]:
-    """Verify all 5 shard groups (`data`, `cap_reasoning`, `cap_writing`, `cap_toolcall`, `sft`)."""
+    """Verify all 6 shard groups (`data`, `cap_reasoning`, `cap_instruct`, `cap_writing`, `cap_toolcall`, `sft`)."""
     data_dir = nvme_root / "data"
     cap_dir = nvme_root / "cap_data"
     sft_dir = nvme_root / "sft_data"
@@ -182,6 +187,18 @@ def verify_all_shards(nvme_root: Path) -> dict[str, dict[str, Any]]:
                 cap_dir / "cap_reasoning_val.bin",
                 cap_dir / "cap_reasoning_val.idx",
                 cap_dir / "cap_reasoning_val.loss_mask.bin",
+            ),
+        ],
+        "cap_instruct": [
+            (
+                cap_dir / "cap_instruct_train.bin",
+                cap_dir / "cap_instruct_train.idx",
+                cap_dir / "cap_instruct_train.loss_mask.bin",
+            ),
+            (
+                cap_dir / "cap_instruct_val.bin",
+                cap_dir / "cap_instruct_val.idx",
+                cap_dir / "cap_instruct_val.loss_mask.bin",
             ),
         ],
         "cap_writing": [
@@ -309,6 +326,7 @@ def build_job_plan(
     return {
         "corpus_5domain": corpus_cmd,
         "cap_reasoning": _cap_cmd("build_cap_reasoning.py", spec.cap_reasoning_mb, seed + 11),
+        "cap_instruct": _cap_cmd("build_cap_instruct.py", spec.cap_instruct_mb, seed + 14),
         "cap_writing": _cap_cmd("build_cap_writing.py", spec.cap_writing_mb, seed + 12),
         "cap_toolcall": _cap_cmd("build_cap_toolcall.py", spec.cap_toolcall_mb, seed + 13),
         "stage5_sft": sft_cmd,
@@ -352,8 +370,7 @@ def _restore_from_archive(archive_src: str, nvme_root: Path) -> None:
     print(f"[prepare_vast] Extracting {local_archive} into {nvme_root} ...", flush=True)
     if local_archive.name.endswith(".zst"):
         subprocess.run(
-            f'zstd -d -T0 -c "{local_archive}" | tar -xf - -C "{nvme_root}"',
-            shell=True,
+            ["tar", "-I", "zstd -d -T0", "-xf", str(local_archive), "-C", str(nvme_root)],
             check=True,
         )
     else:
@@ -369,8 +386,7 @@ def _pack_archive(nvme_root: Path, out_archive: Path) -> None:
     print(f"[prepare_vast] Packing shards into {out_archive} ...", flush=True)
     if out_archive.name.endswith(".zst") and shutil.which("zstd"):
         subprocess.run(
-            f'tar -cf - -C "{nvme_root}" data cap_data sft_data | zstd -T0 -3 -f -o "{out_archive}"',
-            shell=True,
+            ["tar", "-I", "zstd -T0 -3", "-cf", str(out_archive), "-C", str(nvme_root), "data", "cap_data", "sft_data"],
             check=True,
         )
     else:
@@ -390,7 +406,7 @@ def prepare_vast_corpus(
     pack_archive: Optional[str | Path] = None,
     force: bool = False,
     dry_run: bool = False,
-    max_parallel_jobs: int = 5,
+    max_parallel_jobs: int = 6,
     seed: int = 2026,
     offline_synthetic: bool = False,
 ) -> dict[str, Any]:
@@ -528,8 +544,9 @@ def prepare_vast_corpus(
     if invalid:
         raise RuntimeError(f"Shard integrity verification failed for {invalid}: {json.dumps(final_status, indent=2)}")
 
-    # Clean temporary HuggingFace streaming cache to reclaim NVMe space if requested
-    shutil.rmtree(root / "hf_cache", ignore_errors=True)
+    # Clean temporary HuggingFace streaming datasets/xet cache without deleting auth token files
+    for cache_sub in ("datasets", "xet", "downloads"):
+        shutil.rmtree(root / "hf_cache" / cache_sub, ignore_errors=True)
 
     if pack_archive:
         _pack_archive(root, Path(pack_archive))
@@ -582,7 +599,7 @@ def main() -> None:
         default=None,
         help="Optional output .tar.zst path to snapshot all built shards.",
     )
-    ap.add_argument("--max-parallel-jobs", type=int, default=5)
+    ap.add_argument("--max-parallel-jobs", type=int, default=6)
     ap.add_argument("--seed", type=int, default=2026)
     ap.add_argument("--force", action="store_true", help="Rebuild even if valid shards already exist.")
     ap.add_argument("--offline-synthetic", action="store_true", help="Pass --offline to capability/SFT builders.")

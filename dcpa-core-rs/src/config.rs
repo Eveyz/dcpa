@@ -74,8 +74,11 @@ impl DcpaConfig {
         if self.k_slots < 2 || self.k_slots > 12 {
             return Err("Commandment #2 violation: k_slots must be in [2, 12]");
         }
-        if self.d_s % 64 != 0 || self.d_concept % 64 != 0 {
-            return Err("d_s and d_concept must be multiples of 64 for RoPE & SIMD");
+        if self.d_s == 0 || self.d_s % 64 != 0 || self.d_concept == 0 || self.d_concept % 64 != 0 {
+            return Err("d_s and d_concept must be positive multiples of 64 for RoPE & SIMD");
+        }
+        if self.d_s > crate::state::MAX_STACK_DS {
+            return Err("d_s exceeds MotorCheckpoint MAX_STACK_DS (512)");
         }
         if self.stack_depth != 16 || self.stack_tag_dim != 4 {
             return Err("PMD stack must be 16x4 (128B in bf16)");

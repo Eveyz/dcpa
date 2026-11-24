@@ -109,7 +109,7 @@ def _gen_state_machine_sample(rng: random.Random, idx: int) -> tuple[str, str, s
     Returns `(question, symbolic_chain, answer, lang_id, style_id)`.
     """
     n_vars = rng.randint(4, 9)
-    kind = idx % 4
+    kind = idx % 6
     is_zh = (idx % 3) == 1
     lang_id = 1 if is_zh else 0
 
@@ -200,34 +200,89 @@ def _gen_state_machine_sample(rng: random.Random, idx: int) -> tuple[str, str, s
             ans = f"{target} is {'True (entailed)' if derived else 'False (not entailed)'}."
         return q, _truncate_utf8("; ".join(chain), MAX_SCRATCH_BYTES), ans, lang_id, 0
 
-    # kind == 3: Python function execution / inverse-input trace deduction (cruxeval style)
-    a = rng.randint(2, 9)
-    b = rng.randint(1, 15)
-    xs = [rng.randint(1, 12) for _ in range(rng.randint(3, 5))]
-    mode = rng.choice(["sum_even", "acc_mul", "filter_shift"])
-    if mode == "sum_even":
-        fn_src = f"def f(xs):\n    return sum(x * {a} + {b} for x in xs if x % 2 == 0)"
-        evens = [x for x in xs if x % 2 == 0]
-        terms = [x * a + b for x in evens]
-        res = sum(terms)
-        chain = f"evens={evens}; terms={terms}; sum={res}"
-    elif mode == "acc_mul":
-        fn_src = f"def f(xs):\n    acc = {b}\n    for x in xs:\n        acc = (acc + x) % {a * 7 + 3}\n    return acc"
-        mod = a * 7 + 3
-        acc = b
-        st = [f"a0={acc}"]
-        for i, x in enumerate(xs, 1):
-            acc = (acc + x) % mod
-            st.append(f"a{i}={acc}")
-        res = acc
-        chain = "; ".join(st)
+    if kind == 3:
+        # Python function execution / inverse-input trace deduction (cruxeval style)
+        a = rng.randint(2, 9)
+        b = rng.randint(1, 15)
+        xs = [rng.randint(1, 12) for _ in range(rng.randint(3, 5))]
+        mode = rng.choice(["sum_even", "acc_mul", "filter_shift"])
+        if mode == "sum_even":
+            fn_src = f"def f(xs):\n    return sum(x * {a} + {b} for x in xs if x % 2 == 0)"
+            evens = [x for x in xs if x % 2 == 0]
+            terms = [x * a + b for x in evens]
+            res = sum(terms)
+            chain = f"evens={evens}; terms={terms}; sum={res}"
+        elif mode == "acc_mul":
+            fn_src = f"def f(xs):\n    acc = {b}\n    for x in xs:\n        acc = (acc + x) % {a * 7 + 3}\n    return acc"
+            mod = a * 7 + 3
+            acc = b
+            st = [f"a0={acc}"]
+            for i, x in enumerate(xs, 1):
+                acc = (acc + x) % mod
+                st.append(f"a{i}={acc}")
+            res = acc
+            chain = "; ".join(st)
+        else:
+            fn_src = f"def f(xs):\n    return [x + {b} for x in xs if x >= {a}]"
+            res = [x + b for x in xs if x >= a]
+            chain = f"xs={xs}; ge_{a}={[x for x in xs if x >= a]}; out={res}"
+        q = (
+            f"请推导调用 Python 函数 `f({xs})` 的精确返回值：\n{fn_src}"
+            if is_zh
+            else f"Trace the exact Python return value of `f({xs})`:\n{fn_src}"
+        )
+        ans = repr(res)
+        return q, _truncate_utf8(chain, MAX_SCRATCH_BYTES), ans, 3, 4
+
+    if kind == 4:
+        # JavaScript ES6 filter/map/reduce & closure trace deduction (lang_id=5)
+        a = rng.randint(2, 8)
+        b = rng.randint(1, 12)
+        xs = [rng.randint(1, 11) for _ in range(rng.randint(3, 5))]
+        js_arg = json.dumps(xs)
+        if rng.random() < 0.5:
+            fn_src = f"function f(xs) {{\n  return xs.filter((x) => x % 2 === 1).map((x) => x * {a} - {b});\n}}"
+            odds = [x for x in xs if x % 2 == 1]
+            out_js = [x * a - b for x in odds]
+            chain = f"odds={odds}; map=*{a}-{b}; out={out_js}"
+            ans = json.dumps(out_js)
+        else:
+            fn_src = f"function f(xs) {{\n  return xs.reduce((acc, x) => (x > {a} ? acc + x * 2 : acc + {b}), 0);\n}}"
+            acc = 0
+            steps_js: list[str] = []
+            for i, x in enumerate(xs, 1):
+                acc = acc + x * 2 if x > a else acc + b
+                steps_js.append(f"s{i}={acc}")
+            chain = "; ".join(steps_js)
+            ans = str(acc)
+        q = (
+            f"推导下面 JavaScript 函数执行 `f({js_arg})` 的精确返回值：\n{fn_src}"
+            if is_zh
+            else f"Predict the exact JavaScript return value of `f({js_arg})`:\n{fn_src}"
+        )
+        return q, _truncate_utf8(chain, MAX_SCRATCH_BYTES), ans, 5, 4
+
+    # kind == 5: In-scratchpad constraint satisfaction with hypothesis backtracking (`try -> contra; fix`)
+    x_true = rng.randint(3, 9)
+    y_true = rng.randint(2, 8)
+    while y_true == x_true:
+        y_true = rng.randint(2, 8)
+    s_xy = x_true + y_true
+    p_xy = x_true * y_true
+    wrong_x = max(1, s_xy - 1) if (s_xy - 1) != x_true else max(1, x_true - 1)
+    wrong_y = s_xy - wrong_x
+    chain = (
+        f"x+y={s_xy}, x*y={p_xy}; try ({wrong_x},{wrong_y}) -> prod={wrong_x*wrong_y}!={p_xy} contra; "
+        f"fix ({max(x_true,y_true)},{min(x_true,y_true)}) -> prod={p_xy} ok"
+    )
+    hi_v, lo_v = max(x_true, y_true), min(x_true, y_true)
+    if is_zh:
+        q = f"已知两个正整数满足 x >= y、x + y = {s_xy} 且 x * y = {p_xy}，求 (x, y)。"
+        ans = f"({hi_v}, {lo_v})"
     else:
-        fn_src = f"def f(xs):\n    return [x + {b} for x in xs if x >= {a}]"
-        res = [x + b for x in xs if x >= a]
-        chain = f"xs={xs}; ge_{a}={[x for x in xs if x >= a]}; out={res}"
-    q = f"Trace the exact Python return value of `f({xs})`:\n{fn_src}"
-    ans = repr(res)
-    return q, _truncate_utf8(chain, MAX_SCRATCH_BYTES), ans, 3, 4
+        q = f"Two positive integers satisfy x >= y, x + y = {s_xy}, and x * y = {p_xy}. Find (x, y)."
+        ans = f"({hi_v}, {lo_v})"
+    return q, _truncate_utf8(chain, MAX_SCRATCH_BYTES), ans, lang_id, 0
 
 
 def _stream_hf_reasoning(max_items: int, seed: int) -> Iterator[tuple[str, str, str, int, int]]:

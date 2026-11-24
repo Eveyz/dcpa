@@ -25,7 +25,8 @@ import torch
 import torch.nn as nn
 
 
-DOMAIN_NAMES: tuple[str, ...] = ("en", "zh", "ja", "python", "rust")
+DOMAIN_NAMES: tuple[str, ...] = ("en", "zh", "ja", "python", "rust", "javascript")
+ACTIVE_DOMAIN_IDS: tuple[int, ...] = (0, 1, 3, 5)
 
 HIPPOCAMPUS_SCALAR_GATE_NAMES: frozenset[str] = frozenset(
     {
@@ -356,10 +357,18 @@ def _scale_duration(nominal_steps: int, nominal_stage_len: int, actual_stage_len
     return max(1, min(scaled, actual_stage_len))
 
 
-def _weights_list_to_dict(vals: Sequence[float]) -> dict[int, float]:
-    if len(vals) != 5:
-        raise ValueError(f"Expected 5 domain weights [en, zh, ja, py, rs], got {vals}")
-    return {i: float(v) for i, v in enumerate(vals)}
+def _weights_list_to_dict(vals: Sequence[float] | Mapping[Any, float]) -> dict[int, float]:
+    if isinstance(vals, Mapping):
+        return {int(k): float(v) for k, v in vals.items() if float(v) > 0.0}
+    if len(vals) == 4:
+        # 4-domain v2 layout: [en(0), zh(1), python(3), javascript(5)]
+        return {0: float(vals[0]), 1: float(vals[1]), 3: float(vals[2]), 5: float(vals[3])}
+    if len(vals) == 6:
+        # Full 6-slot layout: [en(0), zh(1), ja(2), python(3), rust(4), javascript(5)]
+        return {i: float(v) for i, v in enumerate(vals) if float(v) > 0.0}
+    if len(vals) == 5:
+        return {i: float(v) for i, v in enumerate(vals) if float(v) > 0.0}
+    raise ValueError(f"Expected 4 [en,zh,py,js], 5, or 6 domain weights, got {vals}")
 
 
 class CurriculumController:
@@ -459,7 +468,7 @@ class CurriculumController:
                 owner_lr_multipliers=owner_mults,
                 max_doc_bytes=int(self.s1_cfg.get("max_doc_bytes", 512)),
                 domain_weights=_weights_list_to_dict(
-                    self.s1_cfg.get("domain_weights", [0.35, 0.35, 0.10, 0.10, 0.10])
+                    self.s1_cfg.get("domain_weights", [0.35, 0.35, 0.15, 0.15])
                 ),
                 wug_ratio=float(self.s1_cfg.get("wug_ratio", 0.0)),
                 tau_s=tau_s,
@@ -546,7 +555,7 @@ class CurriculumController:
                 owner_lr_multipliers=owner_mults,
                 max_doc_bytes=max_doc,
                 domain_weights=_weights_list_to_dict(
-                    self.s2_cfg.get("domain_weights", [0.32, 0.36, 0.10, 0.11, 0.11])
+                    self.s2_cfg.get("domain_weights", [0.32, 0.36, 0.16, 0.16])
                 ),
                 wug_ratio=float(self.s2_cfg.get("wug_ratio", 0.0)),
                 tau_s=tau_s,
@@ -589,7 +598,7 @@ class CurriculumController:
                 owner_lr_multipliers=owner_mults,
                 max_doc_bytes=int(self.s3_cfg.get("max_doc_bytes", 4096)),
                 domain_weights=_weights_list_to_dict(
-                    self.s3_cfg.get("domain_weights", [0.18, 0.22, 0.25, 0.17, 0.18])
+                    self.s3_cfg.get("domain_weights", [0.26, 0.28, 0.23, 0.23])
                 ),
                 wug_ratio=float(self.s3_cfg.get("wug_ratio", 0.0)),
                 tau_s=float(self.s3_cfg.get("tau_s", 0.25)),
@@ -637,7 +646,7 @@ class CurriculumController:
                 owner_lr_multipliers=owner_mults,
                 max_doc_bytes=int(self.s4_cfg.get("max_doc_bytes", 1024)),
                 domain_weights=_weights_list_to_dict(
-                    self.s4_cfg.get("domain_weights", [0.20, 0.20, 0.20, 0.20, 0.20])
+                    self.s4_cfg.get("domain_weights", [0.25, 0.25, 0.25, 0.25])
                 ),
                 wug_ratio=float(self.s4_cfg.get("wug_ratio", 0.50)),
                 tau_s=float(self.s4_cfg.get("tau_s", 0.25)),
@@ -715,19 +724,30 @@ def build_byte_loss_weights(
             w = torch.where(tgt, torch.full_like(w, float(state.wug_target_weight)), w)
         return w.unsqueeze(0)
 
-    if state.stage_id == 3 and state.code_delimiter_focal_weight > 1.0:
+    if state.stage_id == 3:
         b = x_bytes.to(device=device, dtype=torch.int64)
-        lids = byte_lang_ids.to(device=device, dtype=torch.int64)
-        is_code = (lids == 3) | (lids == 4)
-        is_delim = torch.zeros_like(is_code)
-        for code_pt in CODE_DELIMITER_BYTES:
-            is_delim = is_delim | (b == code_pt)
-        boost = is_code & is_delim
-        w = torch.where(
-            boost,
-            torch.full((b.numel(),), float(state.code_delimiter_focal_weight), device=device, dtype=torch.float32),
-            torch.ones((b.numel(),), device=device, dtype=torch.float32),
-        )
+        m_bool = loss_mask.to(device=device, dtype=torch.bool)
+        w = m_bool.to(dtype=torch.float32)
+        if state.code_delimiter_focal_weight > 1.0:
+            lids = byte_lang_ids.to(device=device, dtype=torch.int64)
+            is_code = (lids == 3) | (lids == 4) | (lids == 5)
+            is_delim = torch.zeros_like(is_code)
+            for code_pt in CODE_DELIMITER_BYTES:
+                is_delim = is_delim | (b == code_pt)
+            boost = is_code & is_delim & m_bool
+            w = torch.where(
+                boost,
+                torch.full_like(w, float(state.code_delimiter_focal_weight)),
+                w,
+            )
+        # Boost EOT (0x04) and tool-call framing bytes (0x11 / 0x13) on supervised capability spans
+        is_eot = (b == 0x04) & m_bool
+        is_tool = ((b == 0x11) | (b == 0x13)) & m_bool
+        w = torch.where(is_eot, torch.maximum(w, torch.full_like(w, 1.5)), w)
+        w = torch.where(is_tool, torch.maximum(w, torch.full_like(w, 2.0)), w)
         return w.unsqueeze(0)
+
+    if state.stage_id == 2 and not bool(loss_mask.all().item()):
+        return loss_mask.to(device=device, dtype=torch.float32).unsqueeze(0)
 
     return None

@@ -172,5 +172,24 @@ mod tests {
         let g2 = mem.read_c_from_l(&idx, &val, &mut out2);
         assert_eq!(g1, g2);
         assert_eq!(out1, out2);
+
+        // Verify v2 d_s = 384 (moe_1_8b / moe_2_6b / moe_3_5b) passes validation & MotorCheckpoint capture/restore
+        let mut cfg_384 = cfg.clone();
+        cfg_384.d_s = 384;
+        cfg_384.num_lang_domains = 6;
+        assert!(cfg_384.validate().is_ok());
+        let mut motor_384 = crate::state::MotorState {
+            m: (0..384).map(|i| i as f32 * 0.01).collect(),
+            stack_xi: [[0.25f32; 4]; 16],
+            queue_q: vec![0.0f32; 8],
+            queue_q_init: vec![0.0f32; 8],
+            a_prev: vec![0.0f32; 8 * 16],
+            last_byte: b'x',
+            charge_e: 0.0,
+        };
+        let m_ckpt = crate::state::MotorCheckpoint::capture(&motor_384);
+        motor_384.m.fill(0.0);
+        m_ckpt.restore(&mut motor_384);
+        assert!((motor_384.m[383] - 3.83).abs() < 1e-5);
     }
 }

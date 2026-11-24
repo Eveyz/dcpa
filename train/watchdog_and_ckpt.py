@@ -604,6 +604,14 @@ class CheckpointManager:
         return atomic_torch_save(payload, self.emergency_interrupt_path)
 
     def load_checkpoint(self, path: str | Path, map_location: torch.device | str = "cpu") -> dict[str, Any]:
+        is_cpu = (isinstance(map_location, str) and map_location == "cpu") or (
+            isinstance(map_location, torch.device) and map_location.type == "cpu"
+        )
+        if is_cpu:
+            try:
+                return torch.load(str(path), map_location="cpu", weights_only=False, mmap=True)
+            except (TypeError, RuntimeError):
+                pass
         return torch.load(str(path), map_location=map_location, weights_only=False)
 
     def find_latest_checkpoint(self) -> Optional[Path]:
@@ -617,8 +625,9 @@ class CheckpointManager:
         best_step = -1
         for cand in candidates:
             try:
-                ckpt = torch.load(str(cand), map_location="cpu", weights_only=False)
+                ckpt = self.load_checkpoint(cand, map_location="cpu")
                 st = int(ckpt.get("step", -1))
+                del ckpt
                 if st > best_step:
                     best_step = st
                     best_path = cand
@@ -661,6 +670,8 @@ class CheckpointManager:
         configured_base_lrs = [
             float(g.get("base_lr", g["lr"])) for g in optimizer.param_groups
         ]
+        # Free existing GPU AdamW moment buffers BEFORE materializing restored moments to prevent 2x VRAM spikes
+        optimizer.state.clear()
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         for g, cfg_blr in zip(optimizer.param_groups, configured_base_lrs):
             g["base_lr"] = cfg_blr

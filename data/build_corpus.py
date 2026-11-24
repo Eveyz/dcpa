@@ -49,36 +49,37 @@ from data.ragged_dataloader import IDX_RECORD_FMT, IDX_RECORD_SIZE, utf8_safe_en
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 
-# Domain mapping strictly per Deliverable 1 spec:
-#   0=en, 1=zh, 2=ja, 3=python, 4=rust
+# Domain mapping across the 6 embedding slots (`num_lang_domains = 6`):
+#   Active v2 4-domain core: 0=en, 1=zh, 3=python, 5=javascript
+#   Legacy slots retained for enum stability (0% active quota): 2=ja, 4=rust
 DOMAIN_NAMES: dict[int, str] = {
     0: "en",
     1: "zh",
     2: "ja",
     3: "python",
     4: "rust",
+    5: "javascript",
 }
+ACTIVE_DOMAIN_IDS: tuple[int, ...] = (0, 1, 3, 5)
 
-# Full production quotas (Colab gigabit build: 430 MB Train + 8 MB Val = 438 MB)
+# Full production base quotas (~440 MB Train + 8 MB Val = 448 MB @ scale_factor=1.0; ~10.6 GB @ 24x)
 FULL_TRAIN_QUOTA_BYTES: dict[int, int] = {
-    0: 120 * 1024 * 1024,  # en: 120 MB
-    1: 180 * 1024 * 1024,  # zh: 180 MB (130 MB V2.1 + 50 MB V3)
-    2: 30 * 1024 * 1024,   # ja: 30 MB (50% mono JA + 50% bilingual aligned)
-    3: 55 * 1024 * 1024,   # python: 55 MB
-    4: 45 * 1024 * 1024,   # rust: 45 MB
+    0: 145 * 1024 * 1024,  # en: 145 MB (STEM + FineWeb-Edu + OpenWebMath + BabyLM)
+    1: 185 * 1024 * 1024,  # zh: 185 MB (Fineweb-Edu-Chinese V2.1 4-5 + V3)
+    3: 55 * 1024 * 1024,   # python: 55 MB (AST-gated tiny-codes + idiomatic git repos)
+    5: 55 * 1024 * 1024,   # javascript: 55 MB (AST-gated tiny-codes + idiomatic ES6+ git repos)
 }
 FULL_VAL_QUOTA_BYTES: dict[int, int] = {
     0: 2 * 1024 * 1024,    # en: 2 MB
     1: 2 * 1024 * 1024,    # zh: 2 MB
-    2: 2 * 1024 * 1024,    # ja: 2 MB
-    3: 1 * 1024 * 1024,    # python: 1 MB
-    4: 1 * 1024 * 1024,    # rust: 1 MB
+    3: 2 * 1024 * 1024,    # python: 2 MB
+    5: 2 * 1024 * 1024,    # javascript: 2 MB
 }
 
-# Local M3 Pro smoke quotas (Iron Law #2: 2 MB per lang_id -> ~10 MB total)
+# Local M3 Pro smoke quotas (Iron Law #2: 2 MB per active lang_id -> ~8 MB total)
 SMOKE_BYTES_PER_LANG: int = 2 * 1024 * 1024
-SMOKE_TRAIN_QUOTA_BYTES: dict[int, int] = {lid: int(1.8 * 1024 * 1024) for lid in range(5)}
-SMOKE_VAL_QUOTA_BYTES: dict[int, int] = {lid: int(0.2 * 1024 * 1024) for lid in range(5)}
+SMOKE_TRAIN_QUOTA_BYTES: dict[int, int] = {lid: int(1.8 * 1024 * 1024) for lid in ACTIVE_DOMAIN_IDS}
+SMOKE_VAL_QUOTA_BYTES: dict[int, int] = {lid: int(0.2 * 1024 * 1024) for lid in ACTIVE_DOMAIN_IDS}
 
 # Sub-source numeric IDs stored in `.idx` `source_id` (<u1)
 SOURCE_IDS: dict[str, int] = {
@@ -98,6 +99,7 @@ SOURCE_IDS: dict[str, int] = {
     "git:rust-ecosystem-extended": 14,
     "git:python-ecosystem": 15,
     "wikimedia/wikipedia:20231101.ja": 16,
+    "git:javascript-ecosystem": 17,
 }
 
 # Regexes for text hygiene & code fence extraction
@@ -108,6 +110,7 @@ _RE_STAGE_NOISE = re.compile(
 _RE_DIGITS_ONLY = re.compile(r"^[\d\s\.,:;!?\-+/=%()\[\]{}]+$")
 _RE_KANA = re.compile(r"[\u3040-\u309F\u30A0-\u30FF]")
 _RE_PY_FENCE = re.compile(r"```(?:python|py)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+_RE_JS_FENCE = re.compile(r"```(?:javascript|js|mjs)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 _RE_RS_FENCE = re.compile(r"```(?:rust|rs)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 _RE_ANY_FENCE = re.compile(r"```[a-zA-Z0-9_+-]*\s*\n(.*?)```", re.DOTALL)
 _RE_SFT_TAG = re.compile(r"<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|^\s*(?:USER|ASSISTANT|SYSTEM)\s*:", re.MULTILINE)
@@ -120,9 +123,10 @@ _JA_VALID_ENDINGS = (
 
 # Tree-sitter node types excluded from bracket balance & depth checking
 _STRING_AND_COMMENT_NODE_TYPES: frozenset[str] = frozenset({
-    # Python
-    "string", "string_content", "comment", "interpolated_string",
-    # Rust
+    # Python & JavaScript
+    "string", "string_content", "string_fragment", "template_string", "regex",
+    "comment", "interpolated_string",
+    # Legacy Rust
     "string_literal", "raw_string_literal", "byte_string_literal",
     "raw_byte_string_literal", "char_literal", "byte_literal",
     "line_comment", "block_comment",
@@ -220,18 +224,117 @@ def _split_utf8_paragraphs(text: str, min_bytes: int, max_bytes: int) -> list[by
     return out
 
 
+def validate_js_lexical_brackets(code_bytes: bytes, *, min_bytes: int = 12, max_bytes: int = 8192) -> tuple[bool, int]:
+    """Strict ES6+ JavaScript lexical/quote/comment & 1..16 bracket-depth fallback validator."""
+    n = len(code_bytes)
+    if n < min_bytes or n > max_bytes:
+        return False, 0
+    try:
+        text = code_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return False, 0
+    low = text.lower()
+    if "```" in text or "<html" in low or "<!doctype" in low:
+        return False, 0
+    if not any(kw in text for kw in ("function", "class ", "const ", "let ", "var ", "return", "=>", "export ")):
+        return False, 0
+    # Reject minified single-line bundles (> 280 bytes/line average)
+    lines = text.splitlines()
+    if lines and (n / max(len(lines), 1)) > 280:
+        return False, 0
+
+    b_stack: list[str] = []
+    max_depth = 0
+    i = 0
+    m = len(text)
+    pairs = {")": "(", "]": "[", "}": "{"}
+    while i < m:
+        ch = text[i]
+        nxt = text[i + 1] if (i + 1) < m else ""
+        if ch == "/" and nxt == "/":
+            nl = text.find("\n", i + 2)
+            i = m if nl < 0 else nl + 1
+            continue
+        if ch == "/" and nxt == "*":
+            end_c = text.find("*/", i + 2)
+            if end_c < 0:
+                return False, 0
+            i = end_c + 2
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            closed = False
+            while i < m:
+                c2 = text[i]
+                if c2 == "\\":
+                    i += 2
+                    continue
+                if c2 == "\n":
+                    return False, 0
+                if c2 == quote:
+                    closed = True
+                    i += 1
+                    break
+                i += 1
+            if not closed:
+                return False, 0
+            continue
+        if ch == "`":
+            i += 1
+            closed_t = False
+            while i < m:
+                c2 = text[i]
+                if c2 == "\\":
+                    i += 2
+                    continue
+                if c2 == "`":
+                    closed_t = True
+                    i += 1
+                    break
+                i += 1
+            if not closed_t:
+                return False, 0
+            continue
+        if ch in "([{":
+            b_stack.append(ch)
+            if len(b_stack) > max_depth:
+                max_depth = len(b_stack)
+                if max_depth > 16:
+                    return False, max_depth
+        elif ch in pairs:
+            if not b_stack or b_stack.pop() != pairs[ch]:
+                return False, max_depth
+        i += 1
+
+    if b_stack or max_depth < 1 or max_depth > 16:
+        return False, max_depth
+    return True, max_depth
+
+
 class CodeASTValidator:
-    """Strict 4-part `tree-sitter >= 0.23` AST & 1..16 bracket-depth hard gate for Python & Rust."""
+    """Strict 4-part `tree-sitter >= 0.23` AST & 1..16 bracket-depth hard gate for Python & JavaScript."""
 
     def __init__(self) -> None:
         import tree_sitter_python as tspython
-        import tree_sitter_rust as tsrust
         from tree_sitter import Language, Parser
 
-        self._parsers = {
+        self._parsers: dict[str, Any] = {
             "python": Parser(Language(tspython.language())),
-            "rust": Parser(Language(tsrust.language())),
         }
+        try:
+            import tree_sitter_javascript as tsjs
+
+            self._parsers["javascript"] = Parser(Language(tsjs.language()))
+            self._parsers["js"] = self._parsers["javascript"]
+        except ImportError:
+            pass
+        try:
+            import tree_sitter_rust as tsrust
+
+            self._parsers["rust"] = Parser(Language(tsrust.language()))
+        except ImportError:
+            pass
         self.tree_sitter_active = True
 
     def validate(self, lang: str, code_bytes: bytes) -> tuple[bool, int]:
@@ -241,8 +344,11 @@ class CodeASTValidator:
         if n < 64 or n > 8192:
             return False, 0
 
-        parser = self._parsers.get(lang)
+        lang_key = "javascript" if lang == "js" else lang
+        parser = self._parsers.get(lang_key)
         if parser is None:
+            if lang_key == "javascript":
+                return validate_js_lexical_brackets(code_bytes, min_bytes=64, max_bytes=8192)
             raise ValueError(f"Unsupported code language: {lang}")
 
         # Gate 2: Zero AST errors, zero missing nodes, zero ERROR nodes
@@ -329,10 +435,15 @@ class CodeASTValidator:
 
 
 def extract_code_from_tiny_codes(raw_text: str, lang: str) -> Optional[str]:
-    """Extract pure Python or Rust code body from Markdown fences (stripping all prose/SFT wrappers)."""
+    """Extract pure Python/JavaScript/Rust code body from Markdown fences (stripping prose/SFT wrappers)."""
     if not raw_text:
         return None
-    fence_re = _RE_PY_FENCE if lang == "python" else _RE_RS_FENCE
+    if lang == "python":
+        fence_re = _RE_PY_FENCE
+    elif lang in ("javascript", "js"):
+        fence_re = _RE_JS_FENCE
+    else:
+        fence_re = _RE_RS_FENCE
     matches = fence_re.findall(raw_text)
     if matches:
         # Pick the longest fenced block matching the requested language
@@ -660,10 +771,11 @@ def _stream_ja_opus(mode: str) -> Iterator[tuple[bytes, int]]:
 
 
 def _stream_tiny_codes(lang: str) -> Iterator[tuple[str, int]]:
-    """Stream Python/Rust code candidates from `nampdn-ai/tiny-codes` with fallback `TinyPixel/tiny-codes`."""
+    """Stream Python/JavaScript code candidates from `nampdn-ai/tiny-codes` with fallback `TinyPixel/tiny-codes`."""
     from datasets import load_dataset
 
-    target_lang_cap = "Python" if lang == "python" else "Rust"
+    lang_map_cap = {"python": "Python", "javascript": "JavaScript", "js": "JavaScript", "rust": "Rust"}
+    target_lang_cap = lang_map_cap.get(lang, "Python")
     repos = ("nampdn-ai/tiny-codes", "TinyPixel/tiny-codes")
 
     for repo in repos:
@@ -697,12 +809,15 @@ def _stream_tiny_codes(lang: str) -> Iterator[tuple[str, int]]:
                     raw = row.get("response") or row.get("code") or ""
                 else:
                     raw = row.get("text") or ""
-                    # Fast substring pre-filter before regex extraction
+                    low_raw = raw.lower()
                     if lang == "python":
-                        if "```python" not in raw.lower() and "```py\n" not in raw.lower():
+                        if "```python" not in low_raw and "```py\n" not in low_raw:
+                            continue
+                    elif lang in ("javascript", "js"):
+                        if "```javascript" not in low_raw and "```js\n" not in low_raw:
                             continue
                     else:
-                        if "```rust" not in raw.lower() and "```rs\n" not in raw.lower():
+                        if "```rust" not in low_raw and "```rs\n" not in low_raw:
                             continue
                 if not isinstance(raw, str):
                     continue
@@ -892,6 +1007,55 @@ def _stream_rust_git_repos(extended: bool = False) -> Iterator[tuple[str, int]]:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
 
+def _stream_js_git_repos(extended: bool = False) -> Iterator[tuple[str, int]]:
+    """Shallow git-clone extractor for idiomatic pure-JavaScript (ES6+) ecosystems."""
+    sid = SOURCE_IDS["git:javascript-ecosystem"]
+    core_repos = (
+        "https://github.com/expressjs/express.git",
+        "https://github.com/axios/axios.git",
+        "https://github.com/tj/commander.js.git",
+        "https://github.com/lodash/lodash.git",
+    )
+    ext_repos = (
+        "https://github.com/chalk/chalk.git",
+        "https://github.com/sindresorhus/got.git",
+        "https://github.com/fastify/fastify.git",
+        "https://github.com/pinojs/pino.git",
+        "https://github.com/markedjs/marked.git",
+        "https://github.com/date-fns/date-fns.git",
+    )
+    repos = core_repos + ext_repos if extended else core_repos
+    skip_parts = {"node_modules", "dist", "build", "vendor", "coverage", ".git"}
+    tmp_root = Path(tempfile.mkdtemp(prefix="dcpa_js_repos_"))
+    try:
+        for url in repos:
+            name = url.rsplit("/", 1)[-1].removesuffix(".git")
+            dest = tmp_root / name
+            print(f"  -> [javascript] shallow cloning {url}...", flush=True)
+            res = subprocess.run(
+                ["git", "clone", "--depth", "1", "--quiet", url, str(dest)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if res.returncode != 0:
+                print(f"  [WARN] git clone {url} failed: {res.stderr.strip()}", flush=True)
+                continue
+            for js_file in sorted(list(dest.rglob("*.js")) + list(dest.rglob("*.mjs"))):
+                if js_file.name.endswith(".min.js") or any(p in skip_parts for p in js_file.parts):
+                    continue
+                try:
+                    raw = js_file.read_text(encoding="utf-8", errors="strict")
+                except Exception:
+                    continue
+                stripped = _strip_rust_license_header(raw)
+                if len(stripped) < 64:
+                    continue
+                yield stripped, sid
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
 def _assert_local_output_dir(out_dir: Path) -> None:
     resolved = str(out_dir.resolve())
     if resolved.startswith(("/content/drive", "/mnt/gdrive")):
@@ -1011,15 +1175,15 @@ def _populate_single_domain(
                 emit_fn(acc, doc_b, sid, 0)
                 if (acc.train_bytes + acc.val_bytes) >= ja_enja_cap or acc.done:
                     break
-        if not acc.done:
-            print("  -> [ja | lang_id=2] streaming Helsinki-NLP/opus-100 (en-zh cross-order pairs)...", flush=True)
-            for doc_b, sid in _stream_ja_opus("en_zh_pair"):
-                emit_fn(acc, doc_b, sid, 0)
-                if acc.done:
-                    break
         if not acc.done and scale_factor > 1.5:
             print("  -> [ja | lang_id=2] topping up via wikimedia/wikipedia (20231101.ja)...", flush=True)
             for doc_b, sid in _stream_ja_wikipedia():
+                emit_fn(acc, doc_b, sid, 0)
+                if acc.done:
+                    break
+        if not acc.done:
+            print("  -> [ja | lang_id=2] streaming Helsinki-NLP/opus-100 (en-zh cross-order pairs)...", flush=True)
+            for doc_b, sid in _stream_ja_opus("en_zh_pair"):
                 emit_fn(acc, doc_b, sid, 0)
                 if acc.done:
                     break
@@ -1082,6 +1246,39 @@ def _populate_single_domain(
                     continue
                 code_b = cleaned.encode("utf-8", errors="strict")
                 ok, depth = validator.validate("rust", code_b)
+                if not ok:
+                    acc.code_rejected += 1
+                    continue
+                emit_fn(acc, code_b, sid, depth)
+                if acc.done:
+                    break
+        return _finalize_domain_stat(acc, time.perf_counter() - t0)
+
+    if lang_id == 5:
+        for raw_code, sid in _stream_tiny_codes("javascript"):
+            acc.code_candidates += 1
+            cleaned = normalize_and_validate_text(raw_code)
+            if cleaned is None:
+                acc.code_rejected += 1
+                continue
+            code_b = cleaned.encode("utf-8", errors="strict")
+            ok, depth = validator.validate("javascript", code_b)
+            if not ok:
+                acc.code_rejected += 1
+                continue
+            emit_fn(acc, code_b, sid, depth)
+            if acc.done:
+                break
+        if not acc.done:
+            print("  -> [javascript | lang_id=5] topping up from idiomatic ES6+ JavaScript git repos...", flush=True)
+            for raw_code, sid in _stream_js_git_repos(extended=(scale_factor > 1.2 or stem_upgrade)):
+                acc.code_candidates += 1
+                cleaned = normalize_and_validate_text(raw_code)
+                if cleaned is None:
+                    acc.code_rejected += 1
+                    continue
+                code_b = cleaned.encode("utf-8", errors="strict")
+                ok, depth = validator.validate("javascript", code_b)
                 if not ok:
                     acc.code_rejected += 1
                     continue
@@ -1277,9 +1474,9 @@ def build_corpus(
                         float(scale_factor),
                         bool(stem_upgrade),
                     )
-                    for lid in range(5)
+                    for lid in ACTIVE_DOMAIN_IDS
                 ]
-                with ProcessPoolExecutor(max_workers=min(5, int(workers))) as pool:
+                with ProcessPoolExecutor(max_workers=min(len(ACTIVE_DOMAIN_IDS), int(workers))) as pool:
                     worker_results = list(pool.map(_worker_spool_domain, tasks))
 
                 # Deterministic merge in lang_id = 0..4 order with global leak-free seen_hashes check
@@ -1329,7 +1526,7 @@ def build_corpus(
             finally:
                 shutil.rmtree(spool_dir, ignore_errors=True)
         else:
-            for lid in range(5):
+            for lid in ACTIVE_DOMAIN_IDS:
                 dname = DOMAIN_NAMES[lid]
                 acc = _DomainAccum(lid, dname, train_quotas[lid], val_quotas[lid])
                 domain_stats[dname] = _populate_single_domain(

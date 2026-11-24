@@ -684,7 +684,7 @@ class DCPAChatSession:
 
         tau_step = 1
         stopped_on_eot = False
-        in_code_fence = lang_id in (3, 4)
+        in_code_fence = lang_id in (3, 4, 5)
         in_tool_call = False
         tool_call_buf = bytearray()
         in_scratch = False
@@ -726,7 +726,7 @@ class DCPAChatSession:
                 extra_stack_reset=extra_reset,
             )
 
-            eff_temp = 0.0 if (in_tool_call or in_code_fence or lang_id in (3, 4)) else self.temp
+            eff_temp = 0.0 if (in_tool_call or in_code_fence or lang_id in (3, 4, 5)) else self.temp
             if byte_sampler is not None:
                 next_byte_val = int(byte_sampler(logits[0], step_i, eff_temp))
             elif force_eot_after is not None and step_i >= force_eot_after:
@@ -1049,7 +1049,7 @@ class DCPAChatSession:
             if arg == "auto" or arg in LANG_NAME_TO_ID:
                 self.lang_mode = arg
                 return False, f"[lang] Broca register mode set to `{self.lang_mode}`."
-            return False, "[lang] Usage: /lang auto|zh|en|ja|py|rs"
+            return False, "[lang] Usage: /lang auto|zh|en|py|js"
         if raw.startswith("/sleep"):
             parts = raw.split()
             n_steps = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 50

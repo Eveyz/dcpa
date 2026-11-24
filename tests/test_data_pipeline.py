@@ -39,6 +39,7 @@ from data.ragged_dataloader import (
     utf8_safe_slice,
 )
 from data.wug_generator import (
+    ACTIVE_WUG_LANG_IDS,
     format_episode_annotated,
     inflect_past,
     inflect_plural,
@@ -47,7 +48,8 @@ from data.wug_generator import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_LANG_IDS = {0, 1, 2, 3, 4}  # en, zh, ja, python, rust
+ACTIVE_EXPECTED_LANG_IDS = {0, 1, 3, 5}  # en, zh, python, javascript
+LEGACY_SMOKE_LANG_IDS = {0, 1, 2, 3, 4}  # pre-existing offline smoke cache compatibility
 
 
 @pytest.fixture(scope="module")
@@ -187,15 +189,25 @@ def test_1_zero_padding_and_utf8_boundary_integrity(corpus_dir: Path):
 
 
 def test_2_code_treesitter_blind_audit(corpus_dir: Path):
-    """Test 2: Blind tree-sitter + bracket-stack re-verification on Python (3) & Rust (4) docs."""
+    """Test 2: Blind AST + bracket-stack re-verification on persisted code documents."""
     validator = CodeASTValidator()
     rng = random.Random(42)
 
-    checked_counts = {3: 0, 4: 0}
-    error_counts = {3: 0, 4: 0}
-    depth_ranges = {3: [999, 0], 4: [999, 0]}
+    idx_probe = np.memmap(corpus_dir / "train.idx", dtype=IDX_DTYPE, mode="r")
+    present_lids = set(np.unique(idx_probe["lang_id"]).tolist())
+    del idx_probe
 
-    for lid, lang_name in ((3, "python"), (4, "rust")):
+    code_targets = [(3, "python")]
+    if 5 in present_lids:
+        code_targets.append((5, "javascript"))
+    elif 4 in present_lids:
+        code_targets.append((4, "rust"))
+
+    checked_counts = {lid: 0 for lid, _ in code_targets}
+    error_counts = {lid: 0 for lid, _ in code_targets}
+    depth_ranges = {lid: [999, 0] for lid, _ in code_targets}
+
+    for lid, lang_name in code_targets:
         candidates: list[tuple[Path, int, int, int]] = []
         for split in ("train", "val"):
             bin_p = corpus_dir / f"{split}.bin"
@@ -229,22 +241,24 @@ def test_2_code_treesitter_blind_audit(corpus_dir: Path):
         finally:
             mm_cache.clear()
 
-    total_checked = checked_counts[3] + checked_counts[4]
-    total_errors = error_counts[3] + error_counts[4]
+    total_checked = sum(checked_counts.values())
+    total_errors = sum(error_counts.values())
     err_rate = 100.0 * total_errors / max(total_checked, 1)
+    second_lid, second_name = code_targets[1]
     print(
         f"[PASS Test 2] py_checked={checked_counts[3]} (depth={depth_ranges[3][0]}..{depth_ranges[3][1]}), "
-        f"rs_checked={checked_counts[4]} (depth={depth_ranges[4][0]}..{depth_ranges[4][1]}), "
+        f"{second_name}_checked={checked_counts[second_lid]} (depth={depth_ranges[second_lid][0]}..{depth_ranges[second_lid][1]}), "
         f"errors={total_errors} ({err_rate:.2f}%)",
         flush=True,
     )
-    assert total_errors == 0, f"Blind tree-sitter audit found {total_errors} invalid code docs!"
+    assert total_errors == 0, f"Blind code AST audit found {total_errors} invalid code docs!"
 
 
 def test_3_train_val_zero_leakage_blake2b(corpus_dir: Path):
     """Test 3: Full-scan blake2b hash deduplication & zero Train/Val overlap + .idx integrity."""
     hashes: dict[str, set[bytes]] = {"train": set(), "val": set()}
     seen_langs: dict[str, set[int]] = {"train": set(), "val": set()}
+    allowed_lids = ACTIVE_EXPECTED_LANG_IDS | LEGACY_SMOKE_LANG_IDS
 
     for split in ("train", "val"):
         bin_p = corpus_dir / f"{split}.bin"
@@ -266,7 +280,7 @@ def test_3_train_val_zero_leakage_blake2b(corpus_dir: Path):
                 lid = int(row["lang_id"])
                 assert off == cursor, f"Non-contiguous offset in {split}.idx: {off} != {cursor}"
                 assert length > 0
-                assert lid in EXPECTED_LANG_IDS
+                assert lid in allowed_lids
                 seen_langs[split].add(lid)
 
                 doc_b = bytes(bin_mm[off : off + length])
@@ -279,8 +293,8 @@ def test_3_train_val_zero_leakage_blake2b(corpus_dir: Path):
         finally:
             del idx_arr, bin_mm
 
-    assert seen_langs["train"] == EXPECTED_LANG_IDS
-    assert seen_langs["val"] == EXPECTED_LANG_IDS
+    assert seen_langs["train"] == seen_langs["val"]
+    assert seen_langs["train"] in (ACTIVE_EXPECTED_LANG_IDS, LEGACY_SMOKE_LANG_IDS)
 
     overlap = hashes["train"] & hashes["val"]
     print(
@@ -315,7 +329,7 @@ def test_4_wug_episodes_bidirectional_morphology_and_masks():
     sample_examples: dict[int, str] = {}
 
     for i in range(total_eps):
-        lid = i % 5
+        lid = ACTIVE_WUG_LANG_IDS[i % len(ACTIVE_WUG_LANG_IDS)]
         ep = sample_wug_episode(rng, lid)
 
         assert ep.lang_id == lid
@@ -348,11 +362,11 @@ def test_4_wug_episodes_bidirectional_morphology_and_masks():
         if lid == 0:
             assert ep.target_word != ep.stem, f"EN episode failed to inflect stem {ep.stem!r}"
 
-        # Python & Rust episodes must 100% pass tree-sitter zero-error validation
-        if lid in (3, 4):
-            lang_name = "python" if lid == 3 else "rust"
+        # Python & JavaScript episodes must 100% pass AST + bracket validation
+        if lid in (3, 5):
+            lang_name = "python" if lid == 3 else "javascript"
             ok, depth = validator.validate(lang_name, ep.raw_bytes)
-            assert ok and 1 <= depth <= 16, f"Wug {lang_name} episode failed tree-sitter:\n{ep.text}"
+            assert ok and 1 <= depth <= 16, f"Wug {lang_name} episode failed validation:\n{ep.text}"
             code_checked += 1
 
         if lid not in sample_examples:
@@ -361,7 +375,7 @@ def test_4_wug_episodes_bidirectional_morphology_and_masks():
     pre_pct = 100.0 * pre_count / total_eps
     print(
         f"[PASS Test 4] episodes={total_eps}, pre={pre_count} ({pre_pct:.1f}%), "
-        f"post={post_count} ({100.0 - pre_pct:.1f}%), code_ts_valid={code_checked}/200 (100%)",
+        f"post={post_count} ({100.0 - pre_pct:.1f}%), code_ast_valid={code_checked}/250 (100%)",
         flush=True,
     )
     assert 45.0 <= pre_pct <= 55.0, f"Pre/Post ratio {pre_pct:.1f}% outside [45%, 55%]!"

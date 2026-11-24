@@ -19,8 +19,8 @@ use crate::weights::DcpaWeights;
 
 /// Maximum buffered segment length (hard cap 16 + up to 3 continuation bytes for in-flight UTF-8 char).
 pub const MAX_SEG_CAP: usize = 20;
-/// Maximum supported d_s for stack-allocated MotorCheckpoint (supports up to d_s = 256).
-pub const MAX_STACK_DS: usize = 256;
+/// Maximum supported d_s for stack-allocated MotorCheckpoint (supports d_s = 384..512 in v2 presets).
+pub const MAX_STACK_DS: usize = 512;
 
 /// Module 1 SGSC constant-space streaming state (~388 B active core + fixed segment ring).
 #[derive(Clone)]

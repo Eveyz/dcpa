@@ -38,14 +38,15 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from data.build_corpus import validate_js_lexical_brackets
 from data.ragged_dataloader import IDX_DTYPE, IDX_RECORD_FMT, assert_not_drive_mmap
 from data.wug_generator import (
     _ZH_MORPHEMES,
     _ZH_RARE_CHARS,
+    _fresh_camel_ident,
     _fresh_pascal_ident,
     _fresh_snake_ident,
     _sample_en_pseudo_word,
-    _sample_ja_pseudo_word,
     inflect_past,
     inflect_plural,
     inflect_prog,
@@ -65,33 +66,52 @@ _TS_PARSERS: dict[str, object] = {}
 
 
 def _get_ts_parser(lang: str):
-    if lang not in _TS_PARSERS:
+    lang_key = "javascript" if lang == "js" else lang
+    if lang_key not in _TS_PARSERS:
         from tree_sitter import Language, Parser
 
-        if lang == "python":
+        if lang_key == "python":
             import tree_sitter_python as tsp
 
-            _TS_PARSERS[lang] = Parser(Language(tsp.language()))
-        elif lang == "rust":
+            _TS_PARSERS[lang_key] = Parser(Language(tsp.language()))
+        elif lang_key == "javascript":
+            try:
+                import tree_sitter_javascript as tsjs
+
+                _TS_PARSERS[lang_key] = Parser(Language(tsjs.language()))
+            except ImportError:
+                _TS_PARSERS[lang_key] = None
+        elif lang_key == "rust":
             import tree_sitter_rust as tsr
 
-            _TS_PARSERS[lang] = Parser(Language(tsr.language()))
+            _TS_PARSERS[lang_key] = Parser(Language(tsr.language()))
         else:
             raise ValueError(f"Unsupported tree-sitter lang: {lang}")
-    return _TS_PARSERS[lang]
+    return _TS_PARSERS[lang_key]
 
 
 def is_valid_code_ast(code: str, lang: str) -> bool:
     code_b = code.encode("utf-8", errors="ignore")
     if len(code_b) < 12:
         return False
-    parser = _get_ts_parser(lang)
+    lang_key = "javascript" if lang == "js" else lang
+    parser = _get_ts_parser(lang_key)
+    if parser is None:
+        if lang_key == "javascript":
+            ok, _ = validate_js_lexical_brackets(code_b, min_bytes=12, max_bytes=8192)
+            return ok
+        return False
     tree = parser.parse(code_b)
     return not bool(tree.root_node.has_error)
 
 
 _FORBIDDEN_PY_IMPORTS = re.compile(
     r"^\s*(?:import|from)\s+(numpy|torch|tensorflow|pandas|scipy|requests|flask|django|sklearn|cv2|PIL|matplotlib)\b",
+    re.MULTILINE,
+)
+_FORBIDDEN_JS_IMPORTS = re.compile(
+    r"(?:require\s*\(\s*['\"](?:lodash|axios|express|react|vue|moment|jquery|chalk|fs-extra)['\"]\s*\))"
+    r"|(?:^\s*import\s+.*?\s+from\s+['\"](?:lodash|axios|express|react|vue|moment|jquery|chalk)['\"])",
     re.MULTILINE,
 )
 _FORBIDDEN_RS_CRATES = re.compile(
@@ -103,6 +123,8 @@ _FORBIDDEN_RS_CRATES = re.compile(
 def is_stdlib_only(code: str, lang: str) -> bool:
     if lang == "python":
         return _FORBIDDEN_PY_IMPORTS.search(code) is None
+    if lang in ("javascript", "js"):
+        return _FORBIDDEN_JS_IMPORTS.search(code) is None
     if lang == "rust":
         return _FORBIDDEN_RS_CRATES.search(code) is None
     return True
@@ -114,11 +136,10 @@ def is_stdlib_only(code: str, lang: str) -> bool:
 
 _COLORS_ZH = ("蓝光", "紫光", "翠绿光", "琥珀光", "银白光")
 _COLORS_EN = ("blue", "violet", "emerald", "amber", "silver")
-_COLORS_JA = ("青い光", "紫色の光", "淡い緑の光", "銀色の光")
 
 
 def _sample_bucket_a_dialogue(rng: random.Random) -> EncodedDialogue:
-    domain = rng.randrange(5)  # 0=en, 1=zh, 2=ja, 3=py, 4=rs
+    domain = rng.choice((0, 1, 3, 5))  # 0=en, 1=zh, 3=python, 5=javascript
     add_turn2 = rng.random() < 0.70
 
     if domain == 1:  # ZH rare-Hanzi teaching + causal sentence + live correction
@@ -171,20 +192,6 @@ def _sample_bucket_a_dialogue(rng: random.Random) -> EncodedDialogue:
                 turns.append((t2_u, t2_a))
         return encode_dialogue_turns(turns, lang_id=0, bucket_id=0)
 
-    if domain == 2:  # JA Katakana SOV teaching + correction
-        stem = _sample_ja_pseudo_word(rng)
-        c1, c2 = rng.sample(_COLORS_JA, 2)
-        place = rng.choice(("静かな洞窟", "冷たい渓流", "高い山の岩陰"))
-        kind = rng.choice(("珍しい鉱石", "小さな鳥", "香りの強い野草"))
-        t1_u = f"新しい言葉を覚えてください：「{stem}」は{place}で{c1}を放つ{kind}です。短い例文を作ってください。"
-        t1_a = f"昨日、研究者は{place}で{c1}を放つ{stem}を見つけました。"
-        turns = [(t1_u, t1_a)]
-        if add_turn2:
-            t2_u = f"訂正します。{stem}が放つのは{c1}ではなく{c2}です。文を直してください。"
-            t2_a = f"了解しました。昨日、研究者は{place}で{c2}を放つ{stem}を見つけました。"
-            turns.append((t2_u, t2_a))
-        return encode_dialogue_turns(turns, lang_id=2, bucket_id=0)
-
     if domain == 3:  # Python fresh class/function teaching + method + correction
         cls_name = _fresh_pascal_ident(rng)
         f1 = rng.choice(("cap", "limit", "quota"))
@@ -211,41 +218,39 @@ def _sample_bucket_a_dialogue(rng: random.Random) -> EncodedDialogue:
             turns.append((t2_u, t2_a))
         return encode_dialogue_turns(turns, lang_id=3, bucket_id=0)
 
-    # domain == 4: Rust fresh struct teaching + impl method + live fix
+    # domain == 5: JavaScript ES6 class teaching + method + live follow-up
     st_name = _fresh_pascal_ident(rng)
-    f1 = rng.choice(("cap", "limit", "max_len"))
-    f2 = rng.choice(("used", "len", "filled"))
-    m1 = _fresh_snake_ident(rng)
+    f1 = rng.choice(("cap", "limit", "maxLen"))
+    f2 = rng.choice(("used", "count", "filled"))
+    m1 = _fresh_camel_ident(rng)
     code1 = (
-        f"struct {st_name} {{\n"
-        f"    {f1}: usize,\n"
-        f"    {f2}: usize,\n"
-        f"}}\n\n"
-        f"impl {st_name} {{\n"
-        f"    fn {m1}(&self) -> usize {{\n"
-        f"        self.{f1}.saturating_sub(self.{f2})\n"
-        f"    }}\n"
+        f"class {st_name} {{\n"
+        f"  constructor({f1}, {f2}) {{\n"
+        f"    this.{f1} = {f1};\n"
+        f"    this.{f2} = {f2};\n"
+        f"  }}\n"
+        f"  {m1}() {{\n"
+        f"    return Math.max(0, this.{f1} - this.{f2});\n"
+        f"  }}\n"
         f"}}"
     )
-    t1_u = f"给定结构体 `struct {st_name} {{ {f1}: usize, {f2}: usize }}`，实现方法 `{m1}(&self) -> usize` 计算剩余容量（防下溢）。"
-    t1_a = f"```rust\n{code1}\n```"
+    t1_u = f"在 JavaScript 中定义类 `{st_name}({f1}, {f2})`，并实现方法 `{m1}()` 返回不小于 0 的剩余容量。"
+    t1_a = f"```javascript\n{code1}\n```"
     turns = [(t1_u, t1_a)]
     if add_turn2:
         code2 = (
-            f"impl {st_name} {{\n"
-            f"    fn can_fit(&self, need: usize) -> bool {{\n"
-            f"        self.{m1}() >= need\n"
-            f"    }}\n"
+            f"function canFit(box, need) {{\n"
+            f"  return box.{m1}() >= need;\n"
             f"}}"
         )
-        t2_u = f"继续为 `{st_name}` 追加 `can_fit(&self, need: usize) -> bool` 方法。"
-        t2_a = f"```rust\n{code2}\n```"
+        t2_u = f"基于 `{st_name}` 的 `{m1}()`，再写一个辅助函数 `canFit(box, need)`。"
+        t2_a = f"```javascript\n{code2}\n```"
         turns.append((t2_u, t2_a))
-    return encode_dialogue_turns(turns, lang_id=4, bucket_id=0)
+    return encode_dialogue_turns(turns, lang_id=5, bucket_id=0)
 
 
 # =============================================================================
-# Bucket B (25%): Self-Contained Pure Python & Rust Micro-Function Q&A
+# Bucket B (25%): Self-Contained Pure Python & JavaScript Micro-Function Q&A
 # =============================================================================
 
 _STDLIB_PY_TEMPLATES: tuple[tuple[str, str], ...] = (
@@ -271,26 +276,26 @@ _STDLIB_PY_TEMPLATES: tuple[tuple[str, str], ...] = (
     ),
 )
 
-_STDLIB_RS_TEMPLATES: tuple[tuple[str, str], ...] = (
+_STDLIB_JS_TEMPLATES: tuple[tuple[str, str], ...] = (
     (
-        "Write a Rust function `sum_positive(xs: &[i32]) -> i64` that sums strictly positive elements.",
-        "fn sum_positive(xs: &[i32]) -> i64 {\n    let mut acc: i64 = 0;\n    for &x in xs {\n        if x > 0 {\n            acc += x as i64;\n        }\n    }\n    acc\n}",
+        "Write a JavaScript function `sumPositive(xs)` that sums strictly positive numbers in an array.",
+        "function sumPositive(xs) {\n  let acc = 0;\n  for (const x of xs) {\n    if (x > 0) {\n      acc += x;\n    }\n  }\n  return acc;\n}",
     ),
     (
-        "写一个 Rust 函数 `is_balanced(s: &str) -> bool`，校验圆括号、方括号与花括号是否配对闭合。",
-        "fn is_balanced(s: &str) -> bool {\n    let mut stack: Vec<u8> = Vec::new();\n    for b in s.bytes() {\n        match b {\n            b'(' | b'[' | b'{' => stack.push(b),\n            b')' => if stack.pop() != Some(b'(') { return false; },\n            b']' => if stack.pop() != Some(b'[') { return false; },\n            b'}' => if stack.pop() != Some(b'{') { return false; },\n            _ => {}\n        }\n    }\n    stack.is_empty()\n}",
+        "写一个 JavaScript 函数 `isBalanced(s)`，校验字符串中的圆括号、方括号与花括号是否严格闭合。",
+        "function isBalanced(s) {\n  const pairs = { ')': '(', ']': '[', '}': '{' };\n  const stack = [];\n  for (const ch of s) {\n    if (ch === '(' || ch === '[' || ch === '{') {\n      stack.push(ch);\n    } else if (ch in pairs) {\n      if (stack.pop() !== pairs[ch]) {\n        return false;\n      }\n    }\n  }\n  return stack.length === 0;\n}",
     ),
     (
-        "Write a Rust function `gcd(mut a: u64, mut b: u64) -> u64` using Euclid's algorithm.",
-        "fn gcd(mut a: u64, mut b: u64) -> u64 {\n    while b != 0 {\n        let r = a % b;\n        a = b;\n        b = r;\n    }\n    a\n}",
+        "Write an ES6 JavaScript function `groupByKey(items, key)` grouping an array of objects by property `key`.",
+        "function groupByKey(items, key) {\n  const out = {};\n  for (const item of items) {\n    const k = item[key];\n    if (!out[k]) {\n      out[k] = [];\n    }\n    out[k].push(item);\n  }\n  return out;\n}",
     ),
     (
-        "Write a Rust function `prefix_sums(xs: &[i32]) -> Vec<i64>` computing cumulative sums.",
-        "fn prefix_sums(xs: &[i32]) -> Vec<i64> {\n    let mut out = Vec::with_capacity(xs.len());\n    let mut acc: i64 = 0;\n    for &x in xs {\n        acc += x as i64;\n        out.push(acc);\n    }\n    out\n}",
+        "Write a JavaScript function `prefixSums(xs)` returning cumulative sums of `xs`.",
+        "function prefixSums(xs) {\n  const out = [];\n  let acc = 0;\n  for (const x of xs) {\n    acc += x;\n    out.push(acc);\n  }\n  return out;\n}",
     ),
     (
-        "Implement `count_utf8_leads(buf: &[u8]) -> usize` in Rust to count UTF-8 characters without allocating.",
-        "fn count_utf8_leads(buf: &[u8]) -> usize {\n    let mut n = 0usize;\n    for &b in buf {\n        if (b & 0xC0) != 0x80 {\n            n += 1;\n        }\n    }\n    n\n}",
+        "用原生 JavaScript 实现 `chunkArray(arr, size)`，将数组按固定长度 `size` 切分为二维数组。",
+        "function chunkArray(arr, size) {\n  const step = Math.max(1, size);\n  const out = [];\n  for (let i = 0; i < arr.length; i += step) {\n    out.push(arr.slice(i, i + step));\n  }\n  return out;\n}",
     ),
 )
 
@@ -298,7 +303,6 @@ _STDLIB_RS_TEMPLATES: tuple[tuple[str, str], ...] = (
 def _sample_offline_bucket_b(rng: random.Random) -> EncodedDialogue:
     if rng.random() < 0.5:
         q, base_code = rng.choice(_STDLIB_PY_TEMPLATES)
-        # Mild identifier variation to preserve diversity while keeping 100% AST validity
         tag = rng.choice(("", "_v2", "_fast", "_clean"))
         if tag and "def " in base_code:
             m = re.search(r"def\s+([a-zA-Z_]\w*)\(", base_code)
@@ -310,28 +314,27 @@ def _sample_offline_bucket_b(rng: random.Random) -> EncodedDialogue:
         assert is_valid_code_ast(base_code, "python")
         return encode_dialogue_turns([(q, f"```python\n{base_code}\n```")], lang_id=3, bucket_id=1)
 
-    q, base_code = rng.choice(_STDLIB_RS_TEMPLATES)
-    tag = rng.choice(("", "_v2", "_safe", "_fast"))
-    if tag and "fn " in base_code:
-        m = re.search(r"fn\s+([a-zA-Z_]\w*)\(", base_code)
+    q, base_code = rng.choice(_STDLIB_JS_TEMPLATES)
+    tag = rng.choice(("", "V2", "Safe", "Fast"))
+    if tag and "function " in base_code:
+        m = re.search(r"function\s+([a-zA-Z_]\w*)\(", base_code)
         if m:
             old_fn = m.group(1)
             new_fn = old_fn + tag
             q = q.replace(old_fn, new_fn)
             base_code = base_code.replace(old_fn, new_fn)
-    assert is_valid_code_ast(base_code, "rust")
-    return encode_dialogue_turns([(q, f"```rust\n{base_code}\n```")], lang_id=4, bucket_id=1)
+    assert is_valid_code_ast(base_code, "javascript")
+    return encode_dialogue_turns([(q, f"```javascript\n{base_code}\n```")], lang_id=5, bucket_id=1)
 
 
 def _stream_hf_bucket_b(rng: random.Random, max_items: int) -> Iterator[EncodedDialogue]:
-    """Stream AST-verified Python/Rust micro-functions from HuggingFaceTB/smoltalk & tiny-codes."""
+    """Stream AST-verified Python/JavaScript micro-functions from tiny-codes."""
     try:
         from datasets import load_dataset
     except ImportError:
         return
 
     yielded = 0
-    # 1. TinyPixel/tiny-codes (ungated mirror of nampdn-ai/tiny-codes)
     for repo in ("TinyPixel/tiny-codes", "nampdn-ai/tiny-codes"):
         if yielded >= max_items:
             return
@@ -341,13 +344,13 @@ def _stream_hf_bucket_b(rng: random.Random, max_items: int) -> Iterator[EncodedD
                 if yielded >= max_items:
                     break
                 lang_raw = str(row.get("programming_language", "")).strip().lower()
-                if lang_raw not in ("python", "rust"):
+                if lang_raw not in ("python", "javascript"):
                     continue
                 prompt = str(row.get("prompt", "")).strip()
                 resp = str(row.get("response", "")).strip()
                 if not prompt or not resp:
                     continue
-                m = re.search(r"```(?:python|rust)?\s*\n(.*?)```", resp, re.DOTALL | re.IGNORECASE)
+                m = re.search(r"```(?:python|javascript|js)?\s*\n(.*?)```", resp, re.DOTALL | re.IGNORECASE)
                 code = m.group(1).strip() if m else resp
                 if not is_stdlib_only(code, lang_raw):
                     continue
@@ -356,7 +359,7 @@ def _stream_hf_bucket_b(rng: random.Random, max_items: int) -> Iterator[EncodedD
                 asst = f"```{lang_raw}\n{code}\n```"
                 if len((prompt + asst).encode("utf-8")) > 1480:
                     continue
-                lid = 3 if lang_raw == "python" else 4
+                lid = 3 if lang_raw == "python" else 5
                 yield encode_dialogue_turns([(prompt, asst)], lang_id=lid, bucket_id=1)
                 yielded += 1
             if yielded > 0:
@@ -366,51 +369,41 @@ def _stream_hf_bucket_b(rng: random.Random, max_items: int) -> Iterator[EncodedD
 
 
 # =============================================================================
-# Bucket C (25%): EN/ZH/JA Logic Reasoning, Concise Summarization & Translation
+# Bucket C (25%): EN/ZH Logic Reasoning, Instruction Following & Translation
 # =============================================================================
 
-_TRANSLATION_TRIPLES: tuple[tuple[str, str, str], ...] = (
+_TRANSLATION_PAIRS: tuple[tuple[str, str], ...] = (
     (
         "The patient carpenter built a sturdy cedar bridge before the autumn rain began.",
         "耐心的木匠在秋雨开始前搭建了一座结实的雪松木桥。",
-        "忍耐強い大工は秋の雨が始まる前に丈夫な杉の橋を建てました。",
     ),
     (
         "When the sensor detects a sudden pressure drop, the valve closes automatically.",
         "当传感器检测到压力骤降时，阀门会自动关闭。",
-        "センサーが急な圧力低下を検知すると、弁は自動的に閉じます。",
     ),
     (
         "Three engineers inspected the memory alignment carefully before shipping the patch.",
         "三位工程师在发布补丁前仔细检查了内存对齐情况。",
-        "三人の技術者はパッチを公開する前にメモリ整列を慎重に確認しました。",
     ),
     (
         "Although the alpine trail was steep, the hikers reached the stone shelter before dusk.",
         "尽管高山小路陡峭，徒步者还是在黄昏前抵达了石屋避难所。",
-        "高山の道は急でしたが、登山者たちは夕暮れ前に石の小屋へ着きました。",
     ),
     (
         "Each module communicates through fixed-size state vectors instead of growing caches.",
         "每个模块通过固定大小的状态向量通信，而不是不断增长的缓存。",
-        "各モジュールは増え続けるキャッシュではなく固定長の状態ベクトルで通信します。",
     ),
 )
 
 
 def _sample_offline_bucket_c(rng: random.Random) -> EncodedDialogue:
-    kind = rng.randint(0, 2)
+    kind = rng.randint(0, 3)
     if kind == 0:
-        # Cross-lingual SVO <-> SOV translation
-        en, zh, ja = rng.choice(_TRANSLATION_TRIPLES)
-        mode = rng.randint(0, 3)
-        if mode == 0:
-            return encode_dialogue_turns([(f"Translate into Japanese (SOV): {en}", ja)], lang_id=2, bucket_id=2)
-        if mode == 1:
-            return encode_dialogue_turns([(f"Translate into English (SVO): {ja}", en)], lang_id=0, bucket_id=2)
-        if mode == 2:
-            return encode_dialogue_turns([(f"请将下面句子翻译成中文：{en}", zh)], lang_id=1, bucket_id=2)
-        return encode_dialogue_turns([(f"次の中国語を日本語（SOV語順）に訳してください：{zh}", ja)], lang_id=2, bucket_id=2)
+        # Cross-lingual EN <-> ZH translation
+        en, zh = rng.choice(_TRANSLATION_PAIRS)
+        if rng.random() < 0.5:
+            return encode_dialogue_turns([(f"请将下面英文准确翻译成中文：{en}", zh)], lang_id=1, bucket_id=2)
+        return encode_dialogue_turns([(f"Translate the following Chinese sentence into natural English: {zh}", en)], lang_id=0, bucket_id=2)
 
     if kind == 1:
         # Compact deductive arithmetic / logical ordering
@@ -426,6 +419,18 @@ def _sample_offline_bucket_c(rng: random.Random) -> EncodedDialogue:
         a_txt = f"单车装运 {a} + {b} = {a + b} 箱；{c} 辆车共装运 ({a + b}) × {c} = {ans} 箱。"
         return encode_dialogue_turns([(q, a_txt)], lang_id=1, bucket_id=2)
 
+    if kind == 2:
+        # Strict JSON / constraint instruction following
+        svc = rng.choice(("auth-gw", "search-api", "ingest-worker", "billing-core"))
+        port = rng.choice((8080, 8443, 9000, 9092))
+        retries = rng.randint(2, 5)
+        payload = json.dumps({"service": svc, "port": port, "retries": retries}, ensure_ascii=False)
+        if rng.random() < 0.5:
+            q = f"Extract a compact JSON object with keys `service`, `port`, and `retries` (no extra prose): service {svc} listens on port {port} with {retries} retries."
+            return encode_dialogue_turns([(q, payload)], lang_id=0, bucket_id=2)
+        q = f"请仅输出包含 `service`、`port`、`retries` 三个字段的紧凑 JSON（不要任何多余解释）：服务 {svc} 监听端口 {port}，最大重试次数为 {retries}。"
+        return encode_dialogue_turns([(q, payload)], lang_id=1, bucket_id=2)
+
     # Concise logic / constraint reasoning
     items = rng.sample(("Alpha", "Beta", "Gamma", "Delta"), 3)
     if rng.random() < 0.5:
@@ -438,7 +443,7 @@ def _sample_offline_bucket_c(rng: random.Random) -> EncodedDialogue:
 
 
 def _stream_hf_bucket_c(max_items: int) -> Iterator[EncodedDialogue]:
-    """Stream short non-encyclopedic dialogues & translation pairs from smoltalk and opus-100."""
+    """Stream short non-encyclopedic EN/ZH instruction dialogues & translation pairs."""
     try:
         from datasets import load_dataset
     except ImportError:
@@ -471,23 +476,22 @@ def _stream_hf_bucket_c(max_items: int) -> Iterator[EncodedDialogue]:
         except Exception:
             continue
 
-    for pair, tgt_label, lid in (("en-ja", "Japanese (SOV)", 2), ("en-zh", "Chinese", 1)):
-        if yielded >= max_items:
-            break
-        try:
-            ds = load_dataset("Helsinki-NLP/opus-100", pair, split="train", streaming=True)
-            for row in ds:
-                if yielded >= max_items:
-                    break
-                tr = row.get("translation") or {}
-                src = str(tr.get("en", "")).strip()
-                tgt = str(tr.get("ja" if lid == 2 else "zh", "")).strip()
-                if 20 <= len(src) <= 240 and 10 <= len(tgt) <= 240:
-                    q = f"Translate into {tgt_label}: {src}"
-                    yield encode_dialogue_turns([(q, tgt)], lang_id=lid, bucket_id=2)
-                    yielded += 1
-        except Exception:
-            continue
+    try:
+        ds_zh = load_dataset("Helsinki-NLP/opus-100", "en-zh", split="train", streaming=True)
+        for row in ds_zh:
+            if yielded >= max_items:
+                break
+            tr = row.get("translation") or {}
+            src = str(tr.get("en", "")).strip()
+            tgt = str(tr.get("zh", "")).strip()
+            if 20 <= len(src) <= 240 and 10 <= len(tgt) <= 240:
+                if yielded % 2 == 0:
+                    yield encode_dialogue_turns([(f"请将下面句子翻译成中文：{src}", tgt)], lang_id=1, bucket_id=2)
+                else:
+                    yield encode_dialogue_turns([(f"Translate into English: {tgt}", src)], lang_id=0, bucket_id=2)
+                yielded += 1
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -502,17 +506,13 @@ _REFUSAL_EN = (
     "My slow weights encode grammar and reasoning operators rather than encyclopedic trivia or live external state. "
     "Tell me the exact definition or figure in one sentence, and I will bind it into fast weights and continue."
 )
-_REFUSAL_JA = (
-    "私のコア重みは文法と推論演算子のみを保持しており、個別の百科事実やリアルタイム情報は記憶していません。"
-    "定義や数値を一文で教えていただければ、即座に高速重みへ記憶して推論を続けます。"
-)
 
 _BUCKET_D_PROMPTS_ZH: tuple[str, ...] = (
     "请问 1847 年某小镇第三任镇长的出生月份是多少？",
     "现在纳斯达克指数的实时点位和成交量是多少？",
     "我们公司内部测试环境的数据库端口和密钥配置是什么？",
     "请告诉我某冷门小行星 2024-XZ99 的精确发现日期。",
-    "明天下午三点东京新宿区的实时降水量预报是多少毫米？",
+    "明天下午三点深圳市南山区的实时降水量预报是多少毫米？",
 )
 _BUCKET_D_PROMPTS_EN: tuple[str, ...] = (
     "What is the exact live stock price of ACME Corp right now?",
@@ -521,16 +521,10 @@ _BUCKET_D_PROMPTS_EN: tuple[str, ...] = (
     "Tell me the exact population recorded in the 1913 census of Silverbrook Village.",
     "What is the current wind speed at Zurich Airport this minute?",
 )
-_BUCKET_D_PROMPTS_JA: tuple[str, ...] = (
-    "現在の東京証券取引所のリアルタイム指数はいくらですか？",
-    "社内テストサーバーの非公開ポート番号を教えてください。",
-    "1882年にある地方自治体の初代議長が就任した正確な日付は何日ですか？",
-)
 
 
 def _sample_bucket_d_dialogue(rng: random.Random) -> EncodedDialogue:
-    r = rng.random()
-    if r < 0.45:
+    if rng.random() < 0.50:
         q = rng.choice(_BUCKET_D_PROMPTS_ZH)
         turns = [(q, _REFUSAL_ZH)]
         if rng.random() < 0.35:
@@ -539,18 +533,14 @@ def _sample_bucket_d_dialogue(rng: random.Random) -> EncodedDialogue:
                 (f"好，记住这个数据：当前指标值是 {val}。请把它的两倍算出来。", f"已写入快权重：指标值为 {val}，它的两倍是 {val * 2}。")
             )
         return encode_dialogue_turns(turns, lang_id=1, bucket_id=3)
-    if r < 0.85:
-        q = rng.choice(_BUCKET_D_PROMPTS_EN)
-        turns = [(q, _REFUSAL_EN)]
-        if rng.random() < 0.35:
-            val = rng.randint(10, 500)
-            turns.append(
-                (f"Got it: the current value is {val}. What is {val} plus 15?", f"Stored in fast memory: {val} + 15 = {val + 15}.")
-            )
-        return encode_dialogue_turns(turns, lang_id=0, bucket_id=3)
-
-    q = rng.choice(_BUCKET_D_PROMPTS_JA)
-    return encode_dialogue_turns([(q, _REFUSAL_JA)], lang_id=2, bucket_id=3)
+    q = rng.choice(_BUCKET_D_PROMPTS_EN)
+    turns = [(q, _REFUSAL_EN)]
+    if rng.random() < 0.35:
+        val = rng.randint(10, 500)
+        turns.append(
+            (f"Got it: the current value is {val}. What is {val} plus 15?", f"Stored in fast memory: {val} + 15 = {val + 15}.")
+        )
+    return encode_dialogue_turns(turns, lang_id=0, bucket_id=3)
 
 
 # =============================================================================
@@ -773,7 +763,7 @@ class SFTByteDataset(Dataset):
         valid_mask = self._lengths <= self.max_doc_bytes
         if self.length_bucketing and self.max_doc_bytes > 512 and int(np.count_nonzero(valid_mask)) > 0:
             edges = [0, 512, 1024, 2048, 1 << 60]
-            counts_t: list[int] = []
+            byte_masses_t: list[float] = []
             for lo, hi in zip(edges[:-1], edges[1:]):
                 if lo >= self.max_doc_bytes:
                     break
@@ -781,12 +771,13 @@ class SFTByteDataset(Dataset):
                 idxs = np.nonzero((self._lengths > lo) & (self._lengths <= eff_hi))[0]
                 if len(idxs) > 0:
                     self._tier_doc_indices.append(idxs)
-                    counts_t.append(len(idxs))
+                    # Weight outer tier selection by byte mass (cancels B / mu_k packing count bias!)
+                    byte_masses_t.append(float(self._lengths[idxs].astype(np.float64).sum()))
             if len(self._tier_doc_indices) > 1:
-                tot_c = float(sum(counts_t))
+                tot_b = sum(byte_masses_t)
                 acc = 0.0
-                for c in counts_t:
-                    acc += float(c) / tot_c
+                for bm in byte_masses_t:
+                    acc += bm / tot_b
                     self._tier_cum_probs.append(acc)
                 self._tier_cum_probs[-1] = 1.0
             else:
@@ -812,7 +803,7 @@ class SFTByteDataset(Dataset):
     def __len__(self) -> int:
         return self.num_batches
 
-    def __getitem__(self, batch_idx: int) -> dict[str, torch.Tensor]:
+    def get_batch(self, batch_idx: int, sync_group: Optional[int] = None) -> dict[str, torch.Tensor]:
         winfo = get_worker_info()
         wid = winfo.id if winfo is not None else 0
         rng = random.Random(self.seed + int(batch_idx) * 1_000_003 + wid * 97)
@@ -829,7 +820,7 @@ class SFTByteDataset(Dataset):
 
         tier_pool: Optional[np.ndarray] = None
         if self._tier_doc_indices:
-            eff_sync = int(batch_idx) // self.bucket_sync_world_size
+            eff_sync = (int(batch_idx) // self.bucket_sync_world_size) if sync_group is None else int(sync_group)
             u_t = random.Random(self.seed + eff_sync * 7919 + 31).random()
             t_idx = len(self._tier_cum_probs) - 1
             for k_i, cp in enumerate(self._tier_cum_probs):
@@ -872,6 +863,9 @@ class SFTByteDataset(Dataset):
             "doc_style_ids": torch.tensor(doc_styles, dtype=torch.long),
             "doc_ponder_tax_scale": torch.tensor(doc_pts, dtype=torch.float32),
         }
+
+    def __getitem__(self, batch_idx: int) -> dict[str, torch.Tensor]:
+        return self.get_batch(batch_idx, sync_group=None)
 
 
 def main() -> None:

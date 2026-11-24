@@ -215,7 +215,7 @@ def _sample_synthetic_ragged_batch(
         rem = budget - cursor
         if rem < 32 and chunks:
             break
-        lid = rng.randrange(5)
+        lid = rng.choice((0, 1, 3, 5))
         if wug_ratio > 0.0 and rng.random() < wug_ratio:
             raw_b, t1_len, tgt_s, tgt_e = sample_wug_episode_fast(rng, lid)
             if len(raw_b) <= rem or not chunks:
@@ -235,8 +235,8 @@ def _sample_synthetic_ragged_batch(
                 continue
 
         doc_cap = min(max_doc, rem)
-        if lid in (3, 4):
-            txt, _ = generate_dyck_sequence(rng, max_depth=6, min_bytes=min(64, doc_cap), rust_flavored=(lid == 4))
+        if lid in (3, 5):
+            txt, _ = generate_dyck_sequence(rng, max_depth=6, min_bytes=min(64, doc_cap), rust_flavored=(lid == 5))
             raw_b = txt.encode("utf-8")[:doc_cap]
         else:
             txt = generate_grid_physics_episode(rng, num_steps=8)
@@ -355,19 +355,24 @@ class _DynamicRaggedCursorStream:
         self._ds: Optional[RaggedByteDataset] = None
         self._ds_key: Optional[tuple[Any, ...]] = None
         self._cap_shards: list[tuple[Path, Path]] = []
+        self._cap_names: list[str] = []
         self._cap_datasets: list[Optional[RaggedByteDataset]] = []
         self._cap_keys: list[Optional[tuple[Any, ...]]] = []
         self.stage3_cap_mix_ratio = float(stage3_cap_mix_ratio)
         if cap_data_dir is not None and cap_data_dir.exists():
-            for pref in ("cap_reasoning", "cap_writing"):
+            for pref in ("cap_reasoning", "cap_instruct", "cap_toolcall", "cap_writing"):
                 bp = cap_data_dir / f"{pref}_train.bin"
                 ip = cap_data_dir / f"{pref}_train.idx"
                 if bp.exists() and ip.exists():
                     self._cap_shards.append((bp, ip))
+                    self._cap_names.append(pref)
                     self._cap_datasets.append(None)
                     self._cap_keys.append(None)
+        self._base_b_idx: int = 0
+        self._phys_base: int = 0
         self.cursor: dict[str, Any] = {
             "batch_idx": 0,
+            "phys_offset": 0,
             "epoch": 0,
             "seed": int(seed),
             "consumed_bytes": 0,
@@ -459,6 +464,7 @@ class _DynamicRaggedCursorStream:
         b_idx: int,
         target_batch_bytes: int,
         stage_id: int,
+        stage_half: int,
         max_doc_bytes: int,
         domain_weights: Mapping[int, float],
         wug_ratio: float,
@@ -469,34 +475,61 @@ class _DynamicRaggedCursorStream:
             int(b_idx),
             int(target_batch_bytes),
             int(stage_id),
+            int(stage_half),
             int(max_doc_bytes),
             dw_key,
             round(float(wug_ratio), 6),
             int(seed_val),
         )
 
+    def _select_cap_shard_idx(self, logical_b: int, *, stage_id: int) -> int:
+        n_cap = len(self._cap_shards)
+        if n_cap <= 1:
+            return 0
+        if stage_id == 2:
+            # Stage-2 warm-in focuses on reasoning & instruction following before tool/long-writing
+            early_idxs = [
+                i for i, nm in enumerate(self._cap_names) if nm in ("cap_reasoning", "cap_instruct")
+            ]
+            if early_idxs:
+                return early_idxs[logical_b % len(early_idxs)]
+        # Weighted capability schedule in Stage 3: reasoning 35%, instruct 30%, toolcall 20%, writing 15%
+        pref_weights = {
+            "cap_reasoning": 35,
+            "cap_instruct": 30,
+            "cap_toolcall": 20,
+            "cap_writing": 15,
+        }
+        slots: list[int] = []
+        for idx_c, nm in enumerate(self._cap_names):
+            slots.extend([idx_c] * pref_weights.get(nm, 20))
+        return slots[(logical_b * 13) % len(slots)]
+
     def _fetch_one(
         self,
         b_idx: int,
         target_batch_bytes: int,
         stage_id: int,
+        stage_half: int,
         max_doc_bytes: int,
         domain_weights: dict[int, float],
         wug_ratio: float,
         seed_val: int,
     ) -> dict[str, torch.Tensor]:
         # Key shard choice AND length-bucket tier on logical `b_idx` so ALL ranks draw homogeneous
-        # document lengths on the same step, while `phys_b_idx` gives each rank disjoint documents!
+        # document lengths on the same step, while `phys_b_idx` gives each rank disjoint documents
+        # AND advances monotonically across elastic world_size changes!
         logical_b = int(b_idx)
-        phys_b_idx = logical_b * self.world_size + self.rank
-        use_cap = (
-            stage_id == 3
-            and len(self._cap_shards) > 0
-            and self.stage3_cap_mix_ratio > 0.0
-            and ((logical_b * 37) % 100) < int(round(self.stage3_cap_mix_ratio * 100.0))
-        )
+        phys_b_idx = self._phys_base + (logical_b - self._base_b_idx) * self.world_size + self.rank
+        cap_prob = 0.0
+        if len(self._cap_shards) > 0 and self.stage3_cap_mix_ratio > 0.0:
+            if stage_id == 3:
+                cap_prob = self.stage3_cap_mix_ratio
+            elif stage_id == 2 and stage_half >= 1:
+                cap_prob = min(0.15, 0.35 * self.stage3_cap_mix_ratio)
+        use_cap = cap_prob > 0.0 and ((logical_b * 37) % 100) < int(round(cap_prob * 100.0))
         if use_cap:
-            c_idx = logical_b % len(self._cap_shards)
+            c_idx = self._select_cap_shard_idx(logical_b, stage_id=stage_id)
             with self._ds_lock:
                 cap_ds = self._ensure_cap_dataset(
                     c_idx,
@@ -540,12 +573,14 @@ class _DynamicRaggedCursorStream:
         b_idx = int(self.cursor["batch_idx"])
         seed_val = int(self.cursor["seed"])
         dw_copy = dict(state.domain_weights)
+        stage_half = 1 if float(state.stage_progress) >= 0.50 else 0
 
         if self._executor is not None and self._prefetch_depth > 0:
             req_key = self._make_req_key(
                 b_idx,
                 target_batch_bytes,
                 state.stage_id,
+                stage_half,
                 state.max_doc_bytes,
                 dw_copy,
                 state.wug_ratio,
@@ -560,6 +595,7 @@ class _DynamicRaggedCursorStream:
                     b_idx,
                     target_batch_bytes,
                     state.stage_id,
+                    stage_half,
                     state.max_doc_bytes,
                     dw_copy,
                     state.wug_ratio,
@@ -571,6 +607,7 @@ class _DynamicRaggedCursorStream:
                     look_b,
                     target_batch_bytes,
                     state.stage_id,
+                    stage_half,
                     state.max_doc_bytes,
                     dw_copy,
                     state.wug_ratio,
@@ -582,6 +619,7 @@ class _DynamicRaggedCursorStream:
                         look_b,
                         int(target_batch_bytes),
                         int(state.stage_id),
+                        stage_half,
                         int(state.max_doc_bytes),
                         dict(dw_copy),
                         float(state.wug_ratio),
@@ -592,13 +630,16 @@ class _DynamicRaggedCursorStream:
                 b_idx,
                 target_batch_bytes,
                 state.stage_id,
+                stage_half,
                 state.max_doc_bytes,
                 dw_copy,
                 state.wug_ratio,
                 seed_val,
             )
 
-        self.cursor["batch_idx"] = b_idx + 1
+        next_b = b_idx + 1
+        self.cursor["batch_idx"] = next_b
+        self.cursor["phys_offset"] = self._phys_base + (next_b - self._base_b_idx) * self.world_size
         self.cursor["consumed_bytes"] = (
             int(self.cursor["consumed_bytes"]) + int(batch["x_bytes"].numel()) * self.world_size
         )
@@ -609,7 +650,12 @@ class _DynamicRaggedCursorStream:
         self._clear_prefetch()
         if not cursor:
             return
-        self.cursor["batch_idx"] = int(cursor.get("batch_idx", 0))
+        restored_b = int(cursor.get("batch_idx", 0))
+        restored_phys = int(cursor.get("phys_offset", restored_b * max(self.world_size, 1)))
+        self._base_b_idx = restored_b
+        self._phys_base = restored_phys
+        self.cursor["batch_idx"] = restored_b
+        self.cursor["phys_offset"] = restored_phys
         self.cursor["epoch"] = int(cursor.get("epoch", 0))
         self.cursor["seed"] = int(cursor.get("seed", self.cursor["seed"]))
         self.cursor["consumed_bytes"] = int(cursor.get("consumed_bytes", 0))
@@ -840,6 +886,20 @@ def run_training(
 
         seed_everything(seed, device=device)
         cfg = build_dcpa_config(eff_preset, yaml_cfg)
+        # Scale matrix/norm LR smoothly by sqrt(yaml_d_concept / cfg.d_concept) when CLI --preset changes width
+        yaml_d_concept = int(yaml_cfg.get("model", {}).get("d_concept", cfg.d_concept) or cfg.d_concept)
+        lr_width_scale = 1.0
+        if yaml_d_concept > 0 and cfg.d_concept > 0 and yaml_d_concept != cfg.d_concept and cfg.d_concept >= 512:
+            lr_width_scale = min(1.45, max(0.75, math.sqrt(float(yaml_d_concept) / float(cfg.d_concept))))
+            w_groups: dict[str, dict[str, Any]] = {}
+            for g_name, g_vals in dict(opt_cfg.get("groups", {})).items():
+                gd = dict(g_vals)
+                if "lr" in gd and g_name != "group_gates_thresholds":
+                    gd["lr"] = float(gd["lr"]) * lr_width_scale
+                w_groups[g_name] = gd
+            if w_groups:
+                opt_cfg = dict(opt_cfg)
+                opt_cfg["groups"] = w_groups
         if lr_batch_scale != 1.0:
             cfg.lr_micro *= lr_batch_scale
             cfg.lr_concept *= lr_batch_scale
@@ -1009,7 +1069,7 @@ def run_training(
             if resume.lower() == "auto":
                 loaded_ckpt: Optional[dict[str, Any]] = None
                 if sync_mgr is not None:
-                    res = sync_mgr.load_latest_auto(map_location=device)
+                    res = sync_mgr.load_latest_auto(map_location="cpu")
                     if res is not None:
                         loaded_ckpt = res.checkpoint
                         fallback_resume_used = res.fallback_triggered
@@ -1019,7 +1079,7 @@ def run_training(
                 if loaded_ckpt is None:
                     latest_local = ckpt_mgr.find_latest_checkpoint()
                     if latest_local is not None:
-                        loaded_ckpt = ckpt_mgr.load_checkpoint(latest_local, map_location=device)
+                        loaded_ckpt = ckpt_mgr.load_checkpoint(latest_local, map_location="cpu")
                         _r0_print(f"[Resume] Loaded local checkpoint: {latest_local}", flush=True)
                 if loaded_ckpt is not None:
                     start_step, restored_cursor = CheckpointManager.restore_into(
@@ -1031,18 +1091,19 @@ def run_training(
                         preserve_watchdog_repairs=False,
                         restore_rng=not dist_ctx.is_distributed,
                     )
+                    resumed_stage_id = int(loaded_ckpt.get("stage_id", -1))
+                    best_val_metric = float(loaded_ckpt.get("best_val_metric", loaded_ckpt.get("best_loss", float("inf"))))
+                    del loaded_ckpt
                     broadcast_model_state(model, dist_ctx)
                     stream.restore_cursor(restored_cursor)
                     if dist_ctx.is_distributed:
                         reseed_all_rngs(int(stream.cursor["seed"]) + dist_ctx.rank * 104729, device=device)
                     resumed_from_step = start_step
-                    resumed_stage_id = int(loaded_ckpt.get("stage_id", -1))
-                    best_val_metric = float(loaded_ckpt.get("best_val_metric", loaded_ckpt.get("best_loss", float("inf"))))
                     ckpt_mgr.last_healthy_step = start_step
                     wall_trigger.mark_saved(start_step)
             else:
                 explicit = Path(resume)
-                loaded_ckpt = ckpt_mgr.load_checkpoint(explicit, map_location=device)
+                loaded_ckpt = ckpt_mgr.load_checkpoint(explicit, map_location="cpu")
                 start_step, restored_cursor = CheckpointManager.restore_into(
                     loaded_ckpt,
                     model=model,
@@ -1052,13 +1113,14 @@ def run_training(
                     preserve_watchdog_repairs=False,
                     restore_rng=not dist_ctx.is_distributed,
                 )
+                resumed_stage_id = int(loaded_ckpt.get("stage_id", -1))
+                best_val_metric = float(loaded_ckpt.get("best_val_metric", loaded_ckpt.get("best_loss", float("inf"))))
+                del loaded_ckpt
                 broadcast_model_state(model, dist_ctx)
                 stream.restore_cursor(restored_cursor)
                 if dist_ctx.is_distributed:
                     reseed_all_rngs(int(stream.cursor["seed"]) + dist_ctx.rank * 104729, device=device)
                 resumed_from_step = start_step
-                resumed_stage_id = int(loaded_ckpt.get("stage_id", -1))
-                best_val_metric = float(loaded_ckpt.get("best_val_metric", loaded_ckpt.get("best_loss", float("inf"))))
                 ckpt_mgr.last_healthy_step = start_step
                 wall_trigger.mark_saved(start_step)
                 _r0_print(f"[Resume] Restored explicit checkpoint {explicit} at step={start_step}", flush=True)
@@ -1265,7 +1327,7 @@ def run_training(
                     _sync_log(force=True)
                     dist_barrier(dist_ctx)
                     if ckpt_mgr.last_healthy_path.exists():
-                        healthy_ckpt = ckpt_mgr.load_checkpoint(ckpt_mgr.last_healthy_path, map_location=device)
+                        healthy_ckpt = ckpt_mgr.load_checkpoint(ckpt_mgr.last_healthy_path, map_location="cpu")
                         restored_step, restored_cursor = CheckpointManager.restore_into(
                             healthy_ckpt,
                             model=model,
@@ -1275,13 +1337,24 @@ def run_training(
                             preserve_watchdog_repairs=True,
                             restore_rng=False,
                         )
+                        del healthy_ckpt
+                        if device.type == "cuda" and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                         broadcast_model_state(model, dist_ctx)
                         stream.restore_cursor(restored_cursor)
-                        stream.cursor["batch_idx"] = int(stream.cursor["batch_idx"]) + int(action.skip_batches)
+                        skip_n = int(action.skip_batches)
+                        stream.cursor["batch_idx"] = int(stream.cursor["batch_idx"]) + skip_n
+                        stream.cursor["phys_offset"] = int(stream.cursor.get("phys_offset", 0)) + skip_n * stream.world_size
+                        stream._base_b_idx = int(stream.cursor["batch_idx"])
+                        stream._phys_base = int(stream.cursor["phys_offset"])
                         step_idx = restored_step
                         current_stage_id = -1  # force exact freeze re-verification on next iteration
                     else:
-                        stream.cursor["batch_idx"] = int(stream.cursor["batch_idx"]) + int(action.skip_batches)
+                        skip_n = int(action.skip_batches)
+                        stream.cursor["batch_idx"] = int(stream.cursor["batch_idx"]) + skip_n
+                        stream.cursor["phys_offset"] = int(stream.cursor.get("phys_offset", 0)) + skip_n * stream.world_size
+                        stream._base_b_idx = int(stream.cursor["batch_idx"])
+                        stream._phys_base = int(stream.cursor["phys_offset"])
 
                     if action.new_seed is not None:
                         stream.cursor["seed"] = int(action.new_seed)
@@ -1303,7 +1376,7 @@ def run_training(
                 loss_history[completed_step] = float(accum_metrics["loss_total"])
 
                 is_final_step = completed_step == eff_total_steps
-                if dist_ctx.is_distributed and sc.stage_id in (2, 3) and (completed_step % 50 == 0 or is_final_step):
+                if dist_ctx.is_distributed and sc.stage_id in (2, 3, 4) and (completed_step % 50 == 0 or is_final_step):
                     sync_tensor_avg_(unwrap_compiled_module(model.bcg_pc).c0, dist_ctx)
 
                 if step_hook is not None:

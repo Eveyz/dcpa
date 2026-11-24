@@ -454,6 +454,23 @@ def _fresh_pascal_ident(rng: random.Random) -> str:
     return f"{p}{m}{tag}"
 
 
+_JS_KEYWORDS: frozenset[str] = frozenset({
+    "break", "case", "catch", "class", "const", "continue", "debugger", "default",
+    "delete", "do", "else", "export", "extends", "false", "finally", "for", "function",
+    "if", "import", "in", "instanceof", "let", "new", "null", "return", "super",
+    "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with",
+    "yield", "async", "await", "of",
+})
+
+
+def _fresh_camel_ident(rng: random.Random) -> str:
+    p = rng.choice(_CODE_PREFIXES_SNAKE)
+    m = rng.choice(_CODE_MID_PASCAL)
+    suf = "".join(rng.choice(_ALPHA_NUM) for _ in range(3))
+    cand = f"{p}{m}{suf}"
+    return cand if cand not in _JS_KEYWORDS else f"bufState{suf}"
+
+
 def _sample_python_episode(rng: random.Random, is_pre: bool, build_tensors: bool = True) -> WugEpisode:
     kind = rng.randint(0, 2)
     if kind == 0:
@@ -581,6 +598,81 @@ def _sample_rust_episode(rng: random.Random, is_pre: bool, build_tensors: bool =
     return _assemble_episode(4, "pre" if is_pre else "post", ident, ident, t1, t2, prefix2, build_tensors=build_tensors)
 
 
+def _sample_js_episode(rng: random.Random, is_pre: bool, build_tensors: bool = True) -> WugEpisode:
+    kind = rng.randint(0, 2)
+    if kind == 0:
+        # Array local binding in Turn 1 -> push & length return in Turn 2 (valid ES6 function)
+        ident = _fresh_camel_ident(rng)
+        cap = rng.choice((8, 16, 32, 64))
+        if not is_pre:
+            t1 = (
+                f"function collectBatch(nextItem) {{\n"
+                f"  const {ident} = Array.from({{ length: {cap} }}, (_, i) => i * 2);\n"
+            )
+        else:
+            t1 = (
+                f"function collectBatch(nextItem) {{\n"
+                f"  const baseSize = {cap};\n"
+                f"  const {ident} = Array.from({{ length: baseSize }}, (_, i) => i * 2);\n"
+            )
+        prefix2 = "  "
+        t2 = f"{prefix2}{ident}.push(nextItem);\n  return {ident}.length;\n}}\n"
+    elif kind == 1:
+        # Fresh ES6 class in Turn 1 -> instantiation & method call in Turn 2
+        ident = _fresh_pascal_ident(rng)
+        lo = rng.choice((2, 4, 8, 16))
+        hi = rng.choice((64, 128, 256, 512))
+        if not is_pre:
+            t1 = (
+                f"class {ident} {{\n"
+                f"  constructor(lo, hi) {{\n"
+                f"    this.lo = lo;\n"
+                f"    this.hi = hi;\n"
+                f"  }}\n"
+                f"  clamp(v) {{\n"
+                f"    return Math.min(this.hi, Math.max(this.lo, v));\n"
+                f"  }}\n"
+                f"}}\n\n"
+            )
+        else:
+            t1 = (
+                f"// Bounded numeric interval clamper storing [lo, hi] limits.\n"
+                f"class {ident} {{\n"
+                f"  constructor(lo, hi) {{\n"
+                f"    this.lo = lo;\n"
+                f"    this.hi = hi;\n"
+                f"  }}\n"
+                f"  clamp(v) {{\n"
+                f"    return Math.min(this.hi, Math.max(this.lo, v));\n"
+                f"  }}\n"
+                f"}}\n\n"
+            )
+        prefix2 = "function applyBounds(x) {\n  const box = new "
+        t2 = f"{prefix2}{ident}({lo}, {hi});\n  return box.clamp(x);\n}}\n"
+    else:
+        # Fresh helper arrow/function in Turn 1 -> invocation in Turn 2
+        ident = _fresh_camel_ident(rng)
+        mult = rng.choice((2, 3, 5, 7))
+        add = rng.choice((1, 4, 9))
+        if not is_pre:
+            t1 = (
+                f"function {ident}(v, cap) {{\n"
+                f"  return Math.min(cap, v * {mult} + {add});\n"
+                f"}}\n\n"
+            )
+        else:
+            t1 = (
+                f"// Scale v by {mult}, add {add}, and cap at the given ceiling.\n"
+                f"function {ident}(v, cap) {{\n"
+                f"  return Math.min(cap, v * {mult} + {add});\n"
+                f"}}\n\n"
+            )
+        prefix2 = "function scoreInput(x) {\n  return "
+        t2 = f"{prefix2}{ident}(x, 256);\n}}\n"
+
+    return _assemble_episode(5, "pre" if is_pre else "post", ident, ident, t1, t2, prefix2, build_tensors=build_tensors)
+
+
 def _assemble_episode(
     lang_id: int,
     definition_order: str,
@@ -646,39 +738,32 @@ _EMPTY_U8 = torch.empty(0, dtype=torch.uint8)
 _EMPTY_BOOL = torch.empty(0, dtype=torch.bool)
 
 
+ACTIVE_WUG_LANG_IDS: tuple[int, ...] = (0, 1, 3, 5)
+
+
 def sample_wug_episode(rng: random.Random, lang_id: int, *, build_tensors: bool = True) -> WugEpisode:
-    """Dynamically synthesize one two-turn Wug Episode for `lang_id` in {0, 1, 2, 3, 4}."""
+    """Dynamically synthesize one two-turn Wug Episode for `lang_id` in {0..5} (active: 0=en,1=zh,3=py,5=js)."""
     is_pre = rng.random() < 0.5
     if lang_id == 0:
-        ep = _sample_en_episode(rng, is_pre=is_pre)
+        ep = _sample_en_episode(rng, is_pre=is_pre, build_tensors=build_tensors)
     elif lang_id == 1:
-        ep = _sample_zh_episode(rng, is_pre=is_pre)
+        ep = _sample_zh_episode(rng, is_pre=is_pre, build_tensors=build_tensors)
     elif lang_id == 2:
-        ep = _sample_ja_episode(rng, is_pre=is_pre)
+        ep = _sample_ja_episode(rng, is_pre=is_pre, build_tensors=build_tensors)
     elif lang_id == 3:
-        ep = _sample_python_episode(rng, is_pre=is_pre)
+        ep = _sample_python_episode(rng, is_pre=is_pre, build_tensors=build_tensors)
     elif lang_id == 4:
-        ep = _sample_rust_episode(rng, is_pre=is_pre)
+        ep = _sample_rust_episode(rng, is_pre=is_pre, build_tensors=build_tensors)
+    elif lang_id == 5:
+        ep = _sample_js_episode(rng, is_pre=is_pre, build_tensors=build_tensors)
     else:
-        raise ValueError(f"Unsupported lang_id={lang_id}; expected one of 0..4")
+        raise ValueError(f"Unsupported lang_id={lang_id}; expected one of 0..5")
     return ep
 
 
 def sample_wug_episode_fast(rng: random.Random, lang_id: int) -> tuple[bytes, int, int, int]:
     """High-throughput zero-tensor variant returning `(raw_bytes, turn1_len, tgt_start, tgt_end)`."""
-    is_pre = rng.random() < 0.5
-    if lang_id == 0:
-        ep = _sample_en_episode(rng, is_pre=is_pre, build_tensors=False)
-    elif lang_id == 1:
-        ep = _sample_zh_episode(rng, is_pre=is_pre, build_tensors=False)
-    elif lang_id == 2:
-        ep = _sample_ja_episode(rng, is_pre=is_pre, build_tensors=False)
-    elif lang_id == 3:
-        ep = _sample_python_episode(rng, is_pre=is_pre, build_tensors=False)
-    elif lang_id == 4:
-        ep = _sample_rust_episode(rng, is_pre=is_pre, build_tensors=False)
-    else:
-        raise ValueError(f"Unsupported lang_id={lang_id}; expected one of 0..4")
+    ep = sample_wug_episode(rng, lang_id, build_tensors=False)
     return ep.raw_bytes, ep.turn1_byte_len, ep.target_byte_start, ep.target_byte_end
 
 

@@ -316,7 +316,9 @@ class SparseMicroMoE(nn.Module):
             e_sorted = flat_e[perm]
             tok_sorted = torch.div(perm, top_k, rounding_mode="floor")
             x_sorted = x_norm[:n_valid][tok_sorted].contiguous()
-            counts = torch.bincount(e_sorted, minlength=E)
+            counts = torch.zeros((E,), device=x.device, dtype=torch.int32).scatter_add(
+                0, e_sorted, torch.ones_like(e_sorted, dtype=torch.int32)
+            )
             offs = torch.cumsum(counts, dim=0, dtype=torch.int32)
             gmm_fn = compiled_grouped_mm_fn if compiled_grouped_mm_fn is not None else self._experts_4grouped_mm_impl
             y_sorted = gmm_fn(x_sorted, offs, w_gu1, w_d1, w_gu2, w_d2)
@@ -431,7 +433,9 @@ class SparseMicroMoE(nn.Module):
                 e_sorted = flat_e[perm]
                 tok_sorted = torch.div(perm, self.top_k, rounding_mode="floor")
                 x_sorted = x[tok_sorted].contiguous()
-                counts = torch.bincount(e_sorted, minlength=self.num_experts)
+                counts = torch.zeros((self.num_experts,), device=x.device, dtype=torch.int32).scatter_add(
+                    0, e_sorted, torch.ones_like(e_sorted, dtype=torch.int32)
+                )
                 offs = torch.cumsum(counts, dim=0, dtype=torch.int32)
                 y_sorted = self._experts_4grouped_mm_impl(x_sorted, offs, w_gu1, w_d1, w_gu2, w_d2)
                 gate_sorted = gates.reshape(-1)[perm].unsqueeze(-1)

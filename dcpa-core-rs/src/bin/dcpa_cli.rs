@@ -487,10 +487,23 @@ fn format_tool_observation_after_suspend(result_text: &str) -> Vec<u8> {
     out
 }
 
-/// Exact language ID mapping matching `utils/chat_protocol.py` (`0=en, 1=zh, 2=ja, 3=py, 4=rs`).
+/// Exact language ID mapping matching `utils/chat_protocol.py` (`0=en, 1=zh, 2=ja, 3=py, 4=rs, 5=js`).
 fn detect_lang_id(text: &str) -> usize {
     let s = text.trim();
     let low = s.to_ascii_lowercase();
+    let js_hits = [
+        "function ",
+        "const ",
+        "=>",
+        "console.log",
+        "export ",
+        "async function",
+        "=== ",
+        "!== ",
+    ]
+    .iter()
+    .filter(|&&kw| s.contains(kw))
+    .count();
     let rust_hits = ["fn ", "let mut ", "impl ", "struct ", "-> ", "usize", "Vec<", "pub fn", "match "]
         .iter()
         .filter(|&&kw| s.contains(kw))
@@ -499,6 +512,14 @@ fn detect_lang_id(text: &str) -> usize {
         .iter()
         .filter(|&&kw| s.contains(kw))
         .count();
+    if low.contains("```javascript")
+        || low.contains("```js")
+        || js_hits >= 2
+        || ((low.contains("javascript") || low.contains("nodejs"))
+            && (s.contains("function") || s.contains("const ") || s.contains("=>") || s.contains("函数")))
+    {
+        return 5;
+    }
     if rust_hits >= 2 || low.contains("```rust") || (low.contains("rust") && (s.contains("struct ") || s.contains("fn "))) {
         return 4;
     }
@@ -532,6 +553,7 @@ fn lang_name(id: usize) -> &'static str {
         2 => "ja",
         3 => "py",
         4 => "rs",
+        5 => "js",
         _ => "en",
     }
 }
@@ -1151,7 +1173,11 @@ fn cmd_chat(dir: &Path) {
                         lang_override = Some(4);
                         println!("[lang] rs (4)");
                     }
-                    _ => println!("Choices: auto | en | zh | ja | py | rs"),
+                    "js" | "javascript" => {
+                        lang_override = Some(5);
+                        println!("[lang] js (5)");
+                    }
+                    _ => println!("Choices: auto | en | zh | py | js"),
                 },
                 "/think" => {
                     if matches!(arg, "show" | "dim" | "hide") {
@@ -1199,7 +1225,7 @@ fn cmd_chat(dir: &Path) {
             let (_, _, p_end) =
                 engine.pmd_step_byte_ex(prev_b, lang_id, active_style_id, tau_step, extra_reset);
 
-            let eff_temp = if in_tool_call || lang_id == 3 || lang_id == 4 {
+            let eff_temp = if in_tool_call || lang_id == 3 || lang_id == 4 || lang_id == 5 {
                 0.0
             } else {
                 temp
@@ -1438,5 +1464,6 @@ mod cli_tests {
         assert_eq!(detect_lang_id("海馬の高速重みについて説明してください"), 2);
         assert_eq!(detect_lang_id("def foo(x):\n    return x + 1"), 3);
         assert_eq!(detect_lang_id("pub fn step(&mut self) -> usize { let mut x = 1; x }"), 4);
+        assert_eq!(detect_lang_id("const sum = (xs) => xs.reduce((a, b) => a + b, 0);"), 5);
     }
 }

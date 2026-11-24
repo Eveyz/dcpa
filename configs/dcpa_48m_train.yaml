@@ -168,8 +168,7 @@ optimizer:
       weight_decay: 0.0
 
 # 100,000-step 4-stage developmental curriculum state machine
-# Domain index mapping matches data/build_corpus.py & data/ragged_dataloader.py:
-#   0 = en, 1 = zh, 2 = ja, 3 = python, 4 = rust
+# Active 4-domain weights order: [en (0), zh (1), python (3), javascript (5)] (ja=2 & rust=4 disabled at 0.0)
 curriculum:
   total_steps: 100000
   stage_boundaries: [0, 15000, 65000, 94000, 100000]
@@ -178,7 +177,7 @@ curriculum:
     model_stage: A
     global_warmup_steps: 2000
     max_doc_bytes: 512
-    domain_weights: [0.35, 0.35, 0.10, 0.10, 0.10]
+    domain_weights: [0.38, 0.42, 0.10, 0.10]
     wug_ratio: 0.0
     tau_s_start: 1.0
     tau_s_end: 0.35
@@ -197,7 +196,7 @@ curriculum:
       - [15000, 512]
       - [35000, 1024]
       - [50000, 2048]
-    domain_weights: [0.32, 0.36, 0.10, 0.11, 0.11]
+    domain_weights: [0.34, 0.40, 0.13, 0.13]
     wug_ratio: 0.0
     tau_m_start: 1.5
     tau_m_end: 0.25
@@ -216,7 +215,7 @@ curriculum:
     model_stage: C
     lr_cosine_end_ratio: 0.25
     max_doc_bytes: 4096
-    domain_weights: [0.18, 0.22, 0.25, 0.17, 0.18]
+    domain_weights: [0.28, 0.34, 0.19, 0.19]
     wug_ratio: 0.0
     tau_m: 0.25
     tau_s: 0.25
@@ -229,7 +228,7 @@ curriculum:
     code_delimiter_focal_weight: 1.5
     code_delimiter_chars: "{}()[]:;\n"
     broca_cq_prob: 0.20
-    cap_mix_ratio: 0.35
+    cap_mix_ratio: 0.45
   stage4:
     name: hippocampal_oneshot_meta_plasticity
     model_stage: D
@@ -237,7 +236,7 @@ curriculum:
     local_warmup_start_factor: 0.01
     lr_scale: 0.25
     max_doc_bytes: 1024
-    domain_weights: [0.20, 0.20, 0.20, 0.20, 0.20]
+    domain_weights: [0.25, 0.25, 0.25, 0.25]
     wug_ratio: 0.50
     wug_target_weight: 3.0
     lambda_ach_reg: 0.5

@@ -127,9 +127,17 @@ class RaggedByteBatchSampler(Sampler[list[tuple[int, int, int]]]):
 
         self.bin_path = Path(bin_path)
         self.idx_path = Path(idx_path)
+        cand_mask = self.bin_path.with_suffix(".loss_mask.bin")
+        self.mask_path: Optional[Path] = (
+            cand_mask
+            if (cand_mask.is_file() and self.bin_path.is_file() and cand_mask.stat().st_size == self.bin_path.stat().st_size)
+            else None
+        )
         if not allow_drive_fuse:
             assert_not_drive_mmap(self.bin_path)
             assert_not_drive_mmap(self.idx_path)
+            if self.mask_path is not None:
+                assert_not_drive_mmap(self.mask_path)
 
         self.target_batch_bytes = int(target_batch_bytes)
         self.max_doc_bytes = int(max_doc_bytes)
@@ -245,9 +253,17 @@ class RaggedByteDataset(Dataset):
 
         self.bin_path = Path(bin_path)
         self.idx_path = Path(idx_path)
+        cand_mask = self.bin_path.with_suffix(".loss_mask.bin")
+        self.mask_path: Optional[Path] = (
+            cand_mask
+            if (cand_mask.is_file() and self.bin_path.is_file() and cand_mask.stat().st_size == self.bin_path.stat().st_size)
+            else None
+        )
         if not allow_drive_fuse:
             assert_not_drive_mmap(self.bin_path)
             assert_not_drive_mmap(self.idx_path)
+            if self.mask_path is not None:
+                assert_not_drive_mmap(self.mask_path)
 
         if not self.bin_path.exists():
             raise FileNotFoundError(f"Missing binary shard: {self.bin_path}")
@@ -303,14 +319,23 @@ class RaggedByteDataset(Dataset):
         if self.length_bucketing and self.wug_ratio == 0.0 and self.max_doc_bytes > 512 and len(self._langs) > 0:
             self._build_length_tier_tables()
 
-        # Lazy per-process mmap handle (never pickled across DataLoader workers)
+        # Lazy per-process mmap handles (never pickled across DataLoader workers)
         self._bin_mmap: Optional[np.memmap] = None
+        self._mask_mmap: Optional[np.memmap] = None
         self._mmap_pid: int = -1
         self._mmap_lock = threading.Lock()
 
     def _build_length_tier_tables(self) -> None:
-        """Partition each domain into power-of-2 byte-length bands preserving exact marginal P(lid, doc)."""
-        # Derive marginal domain probability p_lang[lid] from self._cum_weights
+        """Partition each domain into power-of-2 byte-length bands preserving exact marginal P(lid, doc).
+
+        Crucial Bayes invariance under Constant-Byte-Budget batch packing:
+          - Within band `k`, language `lid` is drawn with doc-count conditional mass
+            `P(lid | band k) propto p_lang[lid] * (N_{lid,k} / N_{lid})`.
+          - One draw from band `k` has expected clipped byte length `mu_k`, so a batch of fixed
+            byte budget `B` packs `~ B / mu_k` documents.
+          - Setting outer tier probability `P(band k) propto m_k * mu_k` (expected clipped byte mass
+            in band `k`) cancels `B / mu_k` identically, guaranteeing 0.0% length or domain bias!
+        """
         p_lang: dict[int, float] = {}
         prev_c = 0.0
         for lid, cw in zip(self._langs, self._cum_weights):
@@ -333,7 +358,8 @@ class RaggedByteDataset(Dataset):
         tier_pools: list[dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = []
 
         for lo, hi in bands:
-            t_mass = 0.0
+            t_doc_mass = 0.0
+            t_byte_mass = 0.0
             l_masses: list[tuple[int, float]] = []
             pools_k: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
             for lid in self._langs:
@@ -349,24 +375,26 @@ class RaggedByteDataset(Dataset):
                 cnt = int(np.count_nonzero(m_band))
                 if cnt == 0:
                     continue
-                joint_p = p_lang[lid] * (float(cnt) / float(n_tot))
-                if joint_p <= 0.0:
+                doc_p = p_lang[lid] * (float(cnt) / float(n_tot))
+                byte_p = p_lang[lid] * (float(eff_lens[m_band].astype(np.float64).sum()) / float(n_tot))
+                if doc_p <= 0.0 or byte_p <= 0.0:
                     continue
-                t_mass += joint_p
-                l_masses.append((lid, joint_p))
+                t_doc_mass += doc_p
+                t_byte_mass += byte_p
+                l_masses.append((lid, doc_p))
                 pools_k[lid] = (
                     self._lang_offsets[lid][m_band],
                     lens_l[m_band],
                     self._lang_sources[lid][m_band],
                     self._lang_styles[lid][m_band],
                 )
-            if t_mass > 0.0 and l_masses:
-                tier_masses.append(t_mass)
+            if t_doc_mass > 0.0 and t_byte_mass > 0.0 and l_masses:
+                tier_masses.append(t_byte_mass)
                 t_lids = [x[0] for x in l_masses]
                 acc_l = 0.0
                 t_cum: list[float] = []
                 for _, jm in l_masses:
-                    acc_l += jm / t_mass
+                    acc_l += jm / t_doc_mass
                     t_cum.append(acc_l)
                 t_cum[-1] = 1.0
                 tier_langs.append(t_lids)
@@ -390,6 +418,7 @@ class RaggedByteDataset(Dataset):
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
         state["_bin_mmap"] = None
+        state["_mask_mmap"] = None
         state["_mmap_pid"] = -1
         state.pop("_mmap_lock", None)
         return state
@@ -404,12 +433,18 @@ class RaggedByteDataset(Dataset):
             with self._mmap_lock:
                 if self._bin_mmap is None or self._mmap_pid != pid:
                     self._bin_mmap = np.memmap(self.bin_path, dtype=np.uint8, mode="r")
+                    self._mask_mmap = (
+                        np.memmap(self.mask_path, dtype=np.uint8, mode="r")
+                        if self.mask_path is not None
+                        else None
+                    )
                     self._mmap_pid = pid
         return self._bin_mmap
 
     def close(self) -> None:
         with self._mmap_lock:
             self._bin_mmap = None
+            self._mask_mmap = None
             self._mmap_pid = -1
 
     def __len__(self) -> int:
@@ -428,11 +463,13 @@ class RaggedByteDataset(Dataset):
     ) -> dict[str, torch.Tensor]:
         """Materialize a zero-padding Ragged batch from `(doc_idx, win_start, win_len)` specs."""
         mm = self._get_mmap()
+        mask_mm = self._mask_mmap
         total_t = sum(seg_len for _, _, seg_len in specs)
         n_docs = len(specs)
 
         x_buf = np.empty(total_t, dtype=np.uint8)
         byte_langs = np.empty(total_t, dtype=np.int64)
+        loss_mask_buf = np.ones(total_t, dtype=np.bool_)
         cu_seqlens = np.empty(n_docs + 1, dtype=np.int32)
         doc_langs = np.empty(n_docs, dtype=np.int64)
         doc_styles = np.empty(n_docs, dtype=np.int64)
@@ -447,6 +484,8 @@ class RaggedByteDataset(Dataset):
             sid = int(self._style_ids[doc_idx])
             src = int(self._source_ids[doc_idx])
             x_buf[cursor : cursor + seg_len] = mm[off : off + seg_len]
+            if mask_mm is not None:
+                loss_mask_buf[cursor : cursor + seg_len] = mask_mm[off : off + seg_len] > 0
             byte_langs[cursor : cursor + seg_len] = lid
             is_doc_start[cursor] = True
             doc_langs[i] = lid
@@ -454,6 +493,9 @@ class RaggedByteDataset(Dataset):
             doc_pts[i] = 0.0 if src == LATENT_REASONING_SOURCE_ID else 1.0
             cursor += seg_len
             cu_seqlens[i + 1] = cursor
+
+        if total_t > 0 and not np.any(loss_mask_buf):
+            loss_mask_buf[-1] = True
 
         return {
             "x_bytes": torch.from_numpy(x_buf),
@@ -463,7 +505,7 @@ class RaggedByteDataset(Dataset):
             "doc_style_ids": torch.from_numpy(doc_styles),
             "doc_ponder_tax_scale": torch.from_numpy(doc_pts),
             "byte_lang_ids": torch.from_numpy(byte_langs),
-            "loss_mask": torch.ones(total_t, dtype=torch.bool),
+            "loss_mask": torch.from_numpy(loss_mask_buf),
             "wug_target_mask": torch.zeros(total_t, dtype=torch.bool),
         }
 
@@ -478,6 +520,7 @@ class RaggedByteDataset(Dataset):
         worker_id = winfo.id if winfo is not None else 0
         rng = random.Random(self.seed + int(batch_idx) * 1000003 + worker_id * 97)
         mm = self._get_mmap()
+        mask_mm = self._mask_mmap
 
         budget = self.target_batch_bytes
         max_doc = self.max_doc_bytes
@@ -569,6 +612,10 @@ class RaggedByteDataset(Dataset):
             if doc_len <= max_doc:
                 w_start = 0
                 w_end = doc_len
+            elif mask_mm is not None:
+                # Preserve leading user prompt / tool header on framed capability dialogues
+                w_start = 0
+                w_end = utf8_safe_end(doc_view, 0, max_doc)
             else:
                 # Pick a random UTF-8-safe window across the full document
                 max_start = doc_len - max_doc
@@ -586,7 +633,7 @@ class RaggedByteDataset(Dataset):
                 continue
 
             if seg_len > rem:
-                if rem < 64 and doc_lang_list:
+                if (rem < 64 or mask_mm is not None) and doc_lang_list:
                     break
                 w_end = utf8_safe_end(doc_view, w_start, rem)
                 seg_len = w_end - w_start
@@ -594,6 +641,8 @@ class RaggedByteDataset(Dataset):
                     break
 
             x_buf[cursor : cursor + seg_len] = doc_view[w_start:w_end]
+            if mask_mm is not None:
+                loss_mask[cursor : cursor + seg_len] = mask_mm[off + w_start : off + w_end] > 0
             byte_langs[cursor : cursor + seg_len] = lid
             doc_lang_list.append(lid)
             doc_style_list.append(int(stys[d_i]))
@@ -602,6 +651,8 @@ class RaggedByteDataset(Dataset):
             cu_list.append(cursor)
 
         total_t = cursor
+        if total_t > 0 and not np.any(loss_mask[:total_t]):
+            loss_mask[total_t - 1] = True
         cu_arr = np.asarray(cu_list, dtype=np.int32)
         doc_lang_arr = np.asarray(doc_lang_list, dtype=np.int64)
         doc_style_arr = np.asarray(doc_style_list, dtype=np.int64)

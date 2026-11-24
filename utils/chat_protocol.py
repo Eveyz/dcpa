@@ -68,6 +68,8 @@ LANG_NAME_TO_ID: dict[str, int] = {
     "python": 3,
     "rs": 4,
     "rust": 4,
+    "js": 5,
+    "javascript": 5,
 }
 LANG_ID_TO_NAME: dict[int, str] = {
     0: "en",
@@ -75,6 +77,7 @@ LANG_ID_TO_NAME: dict[int, str] = {
     2: "ja",
     3: "py",
     4: "rs",
+    5: "js",
 }
 
 STYLE_NAME_TO_ID: dict[str, int] = {
@@ -307,12 +310,23 @@ def build_sft_byte_loss_weights(
 
 
 def detect_lang_id(text: str) -> int:
-    """Lightweight heuristic language/domain detector for `/lang auto` (`0=en,1=zh,2=ja,3=py,4=rust`)."""
+    """Lightweight heuristic language/domain detector for `/lang auto` (`0=en,1=zh,2=ja,3=py,4=rs,5=js`)."""
     s = text.strip()
     low = s.lower()
 
+    js_hits = sum(
+        kw in s
+        for kw in ("function ", "const ", "=>", "console.log", "export ", "async function", "=== ", "!== ")
+    )
     rust_hits = sum(kw in s for kw in ("fn ", "let mut ", "impl ", "struct ", "-> ", "usize", "Vec<", "pub fn", "match "))
     py_hits = sum(kw in s for kw in ("def ", "class ", "import ", "return ", "elif ", "lambda ", "-> int", "-> list"))
+    if (
+        "```javascript" in low
+        or "```js" in low
+        or js_hits >= 2
+        or (("javascript" in low or "nodejs" in low) and ("function" in s or "const " in s or "=>" in s or "函数" in s))
+    ):
+        return 5
     if rust_hits >= 2 or "```rust" in low or ("rust" in low and ("struct " in s or "fn " in s)):
         return 4
     if py_hits >= 2 or "```python" in low or ("python" in low and ("def " in s or "函数" in s or "function" in low)):

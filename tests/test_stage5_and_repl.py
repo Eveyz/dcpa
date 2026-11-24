@@ -112,9 +112,9 @@ def test_1_chat_protocol_mask_alignment_and_sft_corpus_utf8(tmp_path: Path):
             assert torch.all(w_t[eot_idx] == 2.0)
             assert torch.all(w_t[~m_t] == 0.0)
 
-            # Verify Bucket B code blocks pass tree-sitter 100%
+            # Verify Bucket B code blocks pass AST/syntax check 100%
             if bkt == 1:
-                m_code = re.search(r"```(python|rust)\n(.*?)```", text, re.DOTALL)
+                m_code = re.search(r"```(python|javascript)\n(.*?)```", text, re.DOTALL)
                 assert m_code is not None
                 assert is_valid_code_ast(m_code.group(2), m_code.group(1))
                 code_checked += 1
@@ -124,7 +124,7 @@ def test_1_chat_protocol_mask_alignment_and_sft_corpus_utf8(tmp_path: Path):
             split_hashes[split].add(hashlib.blake2b(raw_b, digest_size=16).digest())
 
     assert buckets_seen == {0, 1, 2, 3}, f"Missing SFT buckets: {buckets_seen}"
-    assert langs_seen == {0, 1, 2, 3, 4}, f"Missing languages: {langs_seen}"
+    assert langs_seen == {0, 1, 3, 5}, f"Unexpected active SFT languages: {langs_seen}"
     assert code_checked > 50
     assert len(split_hashes["train"].intersection(split_hashes["val"])) == 0, "Train/Val leakage detected!"
 
@@ -135,13 +135,13 @@ def test_1_chat_protocol_mask_alignment_and_sft_corpus_utf8(tmp_path: Path):
     dlg = encode_dialogue_turns(
         [
             ("Check {{{ brackets.", "Reply text here."),
-            ("Now write Rust.", "fn f() { }"),
+            ("Now write JavaScript.", "function f() { return 1; }"),
         ],
-        lang_id=4,
+        lang_id=5,
     )
     x_raw = torch.tensor(list(dlg.raw_bytes), dtype=torch.uint8, device=dev).unsqueeze(0)
     with torch.no_grad():
-        out = model(raw_bytes=x_raw, lang_ids=torch.tensor([4], device=dev), stage="A")
+        out = model(raw_bytes=x_raw, lang_ids=torch.tensor([5], device=dev), stage="A")
     # Compare stack at `t = eot_pos + 1` against a fresh 1-step reset from xi=0
     eot0 = dlg.eot_positions[0]
     xi_after_eot = out.pmd.stack_xi[0, eot0 + 1]  # [16, 4]
@@ -253,9 +253,11 @@ def test_3_m3_repl_stateful_multiturn_eot_and_sleep_consolidation(tmp_path: Path
     loaded = load_dcpa_model_from_weights(exp["weights"], device=dev)
     session = DCPAChatSession(loaded, device=dev, temp=0.3, top_p=0.9, max_new_bytes=32)
 
-    # Verify slash commands `/probe on` and `/lang zh`
+    # Verify slash commands `/probe on`, `/lang js`, and `/lang zh`
     ex, msg = session.handle_command("/probe on")
     assert ex is False and session.probe_mode == "on"
+    ex, msg = session.handle_command("/lang js")
+    assert ex is False and session.lang_mode == "js"
     ex, msg = session.handle_command("/lang zh")
     assert ex is False and session.lang_mode == "zh"
 

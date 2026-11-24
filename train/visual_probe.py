@@ -38,16 +38,15 @@ LN2 = math.log(2.0)
 DOMAIN_ID_TO_NAME: dict[int, str] = {
     0: "en",
     1: "zh",
-    2: "ja",
     3: "py",
-    4: "rs",
+    5: "js",
 }
 
 FIXED_DOMAIN_PROBES: tuple[tuple[str, int, str], ...] = (
     ("EN", 0, "The quick silver falcon glides silently over the alpine valley before dusk."),
-    ("ZH", 1, "深度学习系统通过字节流感知与受限概念图实现高效的跨语言泛化。"),
-    ("JA", 2, "静かな森の奥で青い鳥が澄んだ声で鳴き、朝の光が木々を照らしました。"),
-    ("Rust", 4, "fn sum_nested(xs: &[i32]) -> i32 { let mut acc = 0; for &v in xs { if v > 0 { acc += v; } } acc }"),
+    ("ZH", 1, "深度学习系统通过字节流感知与受限概念图实现高效的双语逻辑推演。"),
+    ("Python", 3, "def sum_positive(xs: list[int]) -> int:\n    return sum(v for v in xs if v > 0)"),
+    ("JS", 5, "function sumPositive(xs) { let acc = 0; for (const v of xs) { if (v > 0) { acc += v; } } return acc; }"),
 )
 
 FIXED_WUG_PROBES: tuple[dict[str, Any], ...] = (
@@ -151,28 +150,6 @@ def _check_brackets_balanced(text: str) -> tuple[bool, int]:
                 return False, max_depth
             stack.pop()
     return len(stack) == 0, max_depth
-
-
-_RUST_PARSER_CACHE: Any = None
-
-
-def _check_rust_treesitter(code_bytes: bytes) -> tuple[bool, str]:
-    """Check Rust AST syntax validity via `tree-sitter-rust` (cached parser)."""
-    global _RUST_PARSER_CACHE
-    try:
-        if _RUST_PARSER_CACHE is None:
-            import tree_sitter_rust as tsrust
-            from tree_sitter import Language, Parser
-
-            lang = Language(tsrust.language())
-            parser = Parser(lang)
-            _RUST_PARSER_CACHE = parser
-        tree = _RUST_PARSER_CACHE.parse(code_bytes)
-        root = tree.root_node
-        has_err = bool(root.has_error)
-        return (not has_err), ("AST_OK" if not has_err else "AST_ERR")
-    except Exception as exc:
-        return False, f"AST_UNAVAILABLE({exc.__class__.__name__})"
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -309,10 +286,9 @@ def _run_domain_probes(
         eps_mon = max(0.0, 1.0 - cos_sim)
 
         rust_note = ""
-        if label == "Rust":
-            ast_ok, ast_status = _check_rust_treesitter(pred_bytes)
+        if label in ("Python", "JS"):
             bal_ok, max_d = _check_brackets_balanced(decoded_str)
-            rust_note = f" | `{ast_status}` | Brackets=`{'BALANCED' if bal_ok else 'UNBALANCED'}` (depth={max_d})"
+            rust_note = f" | Brackets=`{'BALANCED' if bal_ok else 'UNBALANCED'}` (depth={max_d})"
 
         domain_rows.append(
             {
@@ -518,12 +494,12 @@ def run_visual_probe(
         "",
         "## 1. 核心生命体征仪表盘 (Vital Signs)",
         "",
-        "| Step / Stage | Train_BPC | Val_BPC (en / zh / ja / py / rs) | Raw_PC_NLL | ρ = T/M | Concept_Std (Mean / Min) | Merge_Entropy | Ponder_Skip_% | Avg_L_m | VRAM_GB | KB/s |",
-        "| :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Step / Stage | Train_BPC | Val_BPC (en / zh / py / js) | Raw_PC_NLL | ρ = T/M | Concept_Std (Mean / Min) | Merge_Entropy | Ponder_Skip_% | Avg_L_m | VRAM_GB | KB/s |",
+        "| :--- | ---: | :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: |",
         (
             f"| `{step:,} / S{stage_id}({model_stage})` | `{train_bpc:.3f}` | "
-            f"`{_fmt(val_by_dom['en'])} / {_fmt(val_by_dom['zh'])} / {_fmt(val_by_dom['ja'])} / "
-            f"{_fmt(val_by_dom['py'])} / {_fmt(val_by_dom['rs'])}` (avg `{_fmt(val_overall)}`) | "
+            f"`{_fmt(val_by_dom['en'])} / {_fmt(val_by_dom['zh'])} / "
+            f"{_fmt(val_by_dom['py'])} / {_fmt(val_by_dom['js'])}` (avg `{_fmt(val_overall)}`) | "
             f"`{raw_pc_nll:.3f}` | `{rho:.2f}x` | `{std_mean:.3f} / {std_min:.3f}` | `{merge_ent:.3f}` | "
             f"`{skip_pct:.1f}%` | `{avg_l:.2f}` | `{mem_gb:.2f}` | `{kb_per_sec:.1f}` |"
         ),

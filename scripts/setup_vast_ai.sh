@@ -76,19 +76,18 @@ else
   echo "[WARN] nvidia-smi not found in PATH."
 fi
 
-# 3. Reuse container PyTorch if >= 2.4 with CUDA; upgrade only if missing/outdated
+# 3. Reuse container PyTorch only if CUDA + F.grouped_mm (PyTorch >= 2.8) are both available
 if ! "${PYTHON_BIN}" -c "
-import sys, torch
-ver = tuple(int(x) for x in torch.__version__.split('+')[0].split('.')[:2])
-sys.exit(0 if (torch.cuda.is_available() and ver >= (2, 4)) else 1)
+import sys, torch, torch.nn.functional as F
+sys.exit(0 if (torch.cuda.is_available() and hasattr(F, 'grouped_mm')) else 1)
 " >/dev/null 2>&1; then
-  echo "[PyTorch] Installing/upgrading PyTorch >= 2.4 CUDA wheels (required for F.grouped_mm)..."
-  "${PYTHON_BIN}" -m pip install -q --upgrade torch --index-url https://download.pytorch.org/whl/cu124
+  echo "[PyTorch] Installing/upgrading PyTorch >= 2.8 CUDA wheels (required for F.grouped_mm MoE)..."
+  "${PYTHON_BIN}" -m pip install -q --upgrade torch --index-url https://download.pytorch.org/whl/cu126
 else
-  echo "[PyTorch] Reusing preinstalled CUDA PyTorch ($("${PYTHON_BIN}" -c 'import torch; print(torch.__version__)'))."
+  echo "[PyTorch] Reusing preinstalled CUDA PyTorch with F.grouped_mm ($("${PYTHON_BIN}" -c 'import torch; print(torch.__version__)'))."
 fi
 
-# 4. Install lightweight DCPA Python dependencies without touching CUDA torch
+# 4. Install lightweight DCPA Python dependencies (incl. tree-sitter Python & JavaScript)
 echo "[Deps] Installing DCPA corpus, AST & training packages..."
 "${PYTHON_BIN}" -m pip install -q \
   safetensors \
@@ -97,7 +96,7 @@ echo "[Deps] Installing DCPA corpus, AST & training packages..."
   hf_transfer \
   "tree-sitter>=0.23" \
   tree-sitter-python \
-  tree-sitter-rust \
+  tree-sitter-javascript \
   pyyaml \
   pytest
 

@@ -37,7 +37,7 @@ for _p in (str(_REPO_ROOT), str(_TRAIN_PY)):
         sys.path.insert(0, _p)
 
 from data.build_sft_stage5 import SFTByteDataset
-from dcpa.compile_utils import configure_model_compile, strip_orig_mod_prefix
+from dcpa.compile_utils import configure_model_compile, strip_orig_mod_prefix, unwrap_compiled_module
 from dcpa.config import DCPAConfig
 from dcpa.model import DCPAModel
 from train.colab_drive_sync import assert_not_drive_path, sync_file_to_drive
@@ -64,6 +64,7 @@ from utils.distributed import (
     dist_barrier,
     init_distributed_context,
     sync_bool_any,
+    sync_tensor_avg_,
 )
 
 
@@ -323,11 +324,9 @@ def run_stage5_sft(
     use_bf16 = bool(profile.use_bf16 and not deterministic)
 
     if dist_ctx.is_distributed:
-        per_rank_target = max(int(profile.micro_batch_bytes), math.ceil(int(target_tokens_bytes_per_step) / dist_ctx.world_size))
-        if micro_batch_bytes is not None:
-            per_rank_target = max(int(micro_batch_bytes), math.ceil(int(target_tokens_bytes_per_step) / dist_ctx.world_size))
+        per_rank_target = max(128, math.ceil(int(target_tokens_bytes_per_step) / dist_ctx.world_size))
     else:
-        per_rank_target = int(target_tokens_bytes_per_step)
+        per_rank_target = max(128, int(target_tokens_bytes_per_step))
 
     eff_micro_bytes = (
         int(micro_batch_bytes)
@@ -337,6 +336,11 @@ def run_stage5_sft(
     eff_micro_bytes = max(128, eff_micro_bytes)
     grad_accum = max(1, math.ceil(per_rank_target / eff_micro_bytes))
     global_step_bytes = eff_micro_bytes * grad_accum * dist_ctx.world_size
+    sft_lr_scale = (
+        min(2.0, math.sqrt(float(global_step_bytes) / 65536.0))
+        if (dist_ctx.is_distributed and global_step_bytes > 65536)
+        else 1.0
+    )
     eff_warmup = (
         int(warmup_steps)
         if warmup_steps is not None
@@ -356,6 +360,10 @@ def run_stage5_sft(
             default_wm = 40.0 if model.cfg.num_experts >= 32 else 44.0
         model.bcg_checkpoint_vram_watermark_gb = default_wm
     freeze_info = apply_stage5_surgical_freeze(model)
+    if sft_lr_scale != 1.0:
+        for pg in freeze_info["param_groups"]:
+            pg["base_lr"] = float(pg["base_lr"]) * sft_lr_scale
+            pg["lr"] = float(pg["lr"]) * sft_lr_scale
     optimizer = torch.optim.AdamW(freeze_info["param_groups"], betas=(0.9, 0.95), eps=1.0e-8)
 
     comp_rep = configure_model_compile(model, compile_mode=compile_mode, device=device)
@@ -380,14 +388,14 @@ def run_stage5_sft(
     ]
     if cap_data_dir is not None:
         cdir = Path(cap_data_dir)
-        for idx_c, pref in enumerate(("cap_reasoning", "cap_writing", "cap_toolcall"), start=1):
+        for idx_c, pref in enumerate(("cap_reasoning", "cap_instruct", "cap_toolcall", "cap_writing"), start=1):
             if (cdir / f"{pref}_train.bin").exists() and (cdir / f"{pref}_train.loss_mask.bin").exists():
                 train_datasets.append(
                     SFTByteDataset(
                         data_dir=cdir,
                         split="train",
                         target_batch_bytes=eff_micro_bytes,
-                        max_doc_bytes=max(max_doc_bytes, 4096 if pref == "cap_writing" else max_doc_bytes),
+                        max_doc_bytes=max(max_doc_bytes, 4096 if pref in ("cap_writing", "cap_instruct") else max_doc_bytes),
                         num_batches=max((total_steps * grad_accum + 100) * dist_ctx.world_size, 1000),
                         seed=seed + idx_c * 313,
                         prefix=pref,
@@ -430,11 +438,11 @@ def run_stage5_sft(
             accum_m: dict[str, float] = {}
             step_finite = True
             for _ in range(grad_accum):
-                # Synchronize shard selection across all ranks (`batch_cursor`) while sharding dialogue index!
+                # Synchronize shard & length-tier selection across all ranks (`batch_cursor`) while sharding dialogue index!
                 ds_sel = train_datasets[batch_cursor % len(train_datasets)]
                 logical_ds_idx = batch_cursor // len(train_datasets)
                 phys_ds_idx = logical_ds_idx * dist_ctx.world_size + dist_ctx.rank
-                batch = pin_batch_if_cuda(ds_sel[phys_ds_idx], device)
+                batch = pin_batch_if_cuda(ds_sel.get_batch(phys_ds_idx, sync_group=batch_cursor), device)
                 batch_cursor += 1
                 x_b = to_device_async(batch["x_bytes"], device)
                 msk = to_device_async(batch["sft_loss_mask"], device)
@@ -487,11 +495,19 @@ def run_stage5_sft(
             # Track EOT row W_out[0x04] gradient norm (verified non-zero in Stage 5 audit!)
             if model.sgsc.w_out.weight.grad is not None:
                 gn_eot = float(model.sgsc.w_out.weight.grad[0x04].detach().float().norm().item())
-                eot_grad_norm_max = max(eot_grad_norm_max, gn_eot)
+                if math.isfinite(gn_eot):
+                    eot_grad_norm_max = max(eot_grad_norm_max, gn_eot)
 
-            torch.nn.utils.clip_grad_norm_(active_p, max_norm=1.0)
+            gn_t = torch.nn.utils.clip_grad_norm_(active_p, max_norm=1.0)
+            bad_grad = not math.isfinite(float(gn_t.detach().item()))
+            if sync_bool_any(bad_grad, dist_ctx, device):
+                optimizer.zero_grad(set_to_none=True)
+                continue
             optimizer.step()
             last_metrics = accum_m
+
+            if dist_ctx.is_distributed and (completed % 50 == 0 or completed == total_steps):
+                sync_tensor_avg_(unwrap_compiled_module(model.bcg_pc).c0, dist_ctx)
 
             if step_hook is not None:
                 step_hook(completed, model, last_metrics)
@@ -509,6 +525,8 @@ def run_stage5_sft(
                     flush=True,
                 )
 
+        if dist_ctx.is_distributed:
+            sync_tensor_avg_(unwrap_compiled_module(model.bcg_pc).c0, dist_ctx)
         val_bpc = _eval_sft_val_bpc(model, val_ds, device=device, use_bf16=use_bf16, n_batches=2) if is_primary else None
         out_sf = Path(export_dir) / "dcpa_chat_sft.safetensors"
         if is_primary:

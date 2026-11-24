@@ -254,7 +254,7 @@ def get_peak_memory_gb(device: torch.device) -> float:
 def synchronize(device: torch.device) -> None:
     """Synchronize asynchronous device kernels safely across CUDA, MPS, and CPU."""
     if device.type == "cuda" and is_cuda_available():
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
     elif device.type == "mps" and is_mps_available():
         if hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
             torch.mps.synchronize()
@@ -422,7 +422,12 @@ def resolve_micro_batch_plan(
 
 
 def capture_rng_state() -> dict[str, Any]:
-    """Capture Python, NumPy, CPU Torch, and optional CUDA/MPS RNG states cleanly."""
+    """Capture Python, NumPy, CPU Torch, and optional CUDA/MPS RNG states cleanly.
+
+    Under multi-process `torchrun` (`WORLD_SIZE > 1`), strictly captures ONLY the active
+    `LOCAL_RANK` CUDA device so Rank 0 never initializes extraneous CUDA driver contexts
+    on peer GPUs (saving ~0.5-1.5 GB VRAM per peer GPU).
+    """
     state: dict[str, Any] = {
         "python_rng_state": random.getstate(),
         "numpy_rng_state": np.random.get_state(),
@@ -431,7 +436,12 @@ def capture_rng_state() -> dict[str, Any]:
         "mps_rng_state": None,
     }
     if is_cuda_available():
-        state["cuda_rng_state_all"] = [s.clone() for s in torch.cuda.get_rng_state_all()]
+        world_sz = int(os.environ.get("WORLD_SIZE", "1") or "1")
+        if world_sz > 1 and "LOCAL_RANK" in os.environ:
+            local_rk = int(os.environ["LOCAL_RANK"])
+            state["cuda_rng_state_all"] = [torch.cuda.get_rng_state(local_rk).clone()]
+        else:
+            state["cuda_rng_state_all"] = [s.clone() for s in torch.cuda.get_rng_state_all()]
     if is_mps_available() and hasattr(torch, "mps") and hasattr(torch.mps, "get_rng_state"):
         try:
             state["mps_rng_state"] = torch.mps.get_rng_state().clone()
@@ -441,7 +451,7 @@ def capture_rng_state() -> dict[str, Any]:
 
 
 def restore_rng_state(rng_state: Optional[dict[str, Any]]) -> None:
-    """Restore RNG states across heterogeneous hardware (Mac <-> Colab) without raising errors."""
+    """Restore RNG states across heterogeneous hardware (Mac <-> Colab <-> Multi-GPU) without errors."""
     if not rng_state:
         return
 
@@ -461,12 +471,19 @@ def restore_rng_state(rng_state: Optional[dict[str, Any]]) -> None:
     cuda_states = rng_state.get("cuda_rng_state_all")
     if cuda_states is not None and is_cuda_available():
         try:
-            dev_count = torch.cuda.device_count()
             normalized = [s.to(device="cpu", dtype=torch.uint8) for s in cuda_states]
-            if len(normalized) == dev_count:
-                torch.cuda.set_rng_state_all(normalized)
-            elif len(normalized) > 0:
-                torch.cuda.set_rng_state(normalized[0], device=0)
+            world_sz = int(os.environ.get("WORLD_SIZE", "1") or "1")
+            if world_sz > 1 and "LOCAL_RANK" in os.environ and len(normalized) > 0:
+                local_rk = int(os.environ["LOCAL_RANK"])
+                src_idx = local_rk if local_rk < len(normalized) else 0
+                torch.cuda.set_rng_state(normalized[src_idx], device=local_rk)
+            else:
+                dev_count = torch.cuda.device_count()
+                if len(normalized) == dev_count:
+                    torch.cuda.set_rng_state_all(normalized)
+                elif len(normalized) > 0:
+                    cur_dev = torch.cuda.current_device()
+                    torch.cuda.set_rng_state(normalized[0], device=cur_dev)
         except Exception:
             pass
 

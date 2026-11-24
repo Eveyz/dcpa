@@ -23,3 +23,4 @@ dcpa_colab_bundle.zip
 *.idx
 *.pt
 .DS_Store
+*.env

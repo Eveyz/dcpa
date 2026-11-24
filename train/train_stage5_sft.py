@@ -56,6 +56,15 @@ from utils.device import (
     synchronize,
     to_device_async,
 )
+from utils.distributed import (
+    all_reduce_gradients_coalesced,
+    all_reduce_metrics_dict,
+    broadcast_model_state,
+    cleanup_distributed_context,
+    dist_barrier,
+    init_distributed_context,
+    sync_bool_any,
+)
 
 
 STAGE5_FROZEN_NAMES: frozenset[str] = frozenset(
@@ -293,6 +302,13 @@ def run_stage5_sft(
     step_hook: Optional[Callable[[int, DCPAModel, dict[str, float]], None]] = None,
 ) -> Stage5SFTSummary:
     """Run Stage 5 surgical pragmatic + capability SFT (default 8,000 steps) and export `dcpa_chat_sft.safetensors`."""
+    dist_ctx, dist_owned = init_distributed_context(preferred_device=device_str)
+    is_primary = dist_ctx.is_primary
+
+    def _r0_print(*args: Any, **kwargs: Any) -> None:
+        if is_primary:
+            print(*args, **kwargs)
+
     assert_not_drive_path(data_dir, role="--data-dir")
     if cap_data_dir is not None:
         assert_not_drive_path(cap_data_dir, role="--cap-data-dir")
@@ -306,33 +322,47 @@ def run_stage5_sft(
     reset_peak_memory_stats(device)
     use_bf16 = bool(profile.use_bf16 and not deterministic)
 
+    if dist_ctx.is_distributed:
+        per_rank_target = max(int(profile.micro_batch_bytes), math.ceil(int(target_tokens_bytes_per_step) / dist_ctx.world_size))
+        if micro_batch_bytes is not None:
+            per_rank_target = max(int(micro_batch_bytes), math.ceil(int(target_tokens_bytes_per_step) / dist_ctx.world_size))
+    else:
+        per_rank_target = int(target_tokens_bytes_per_step)
+
     eff_micro_bytes = (
         int(micro_batch_bytes)
         if micro_batch_bytes is not None
-        else min(int(profile.micro_batch_bytes), int(target_tokens_bytes_per_step))
+        else min(int(profile.micro_batch_bytes), per_rank_target)
     )
     eff_micro_bytes = max(128, eff_micro_bytes)
-    grad_accum = max(1, math.ceil(int(target_tokens_bytes_per_step) / eff_micro_bytes))
+    grad_accum = max(1, math.ceil(per_rank_target / eff_micro_bytes))
+    global_step_bytes = eff_micro_bytes * grad_accum * dist_ctx.world_size
     eff_warmup = (
         int(warmup_steps)
         if warmup_steps is not None
         else (300 if total_steps == 8000 else (200 if total_steps == 4000 else max(1, int(round(total_steps * 0.05)))))
     )
 
-    print(describe_hardware_profile(profile), flush=True)
+    _r0_print(describe_hardware_profile(profile), flush=True)
     seed_everything(seed, device=device)
 
     model = load_dcpa_model_from_weights(weights_path, config_path=config_path, device=device)
-    if device.type == "cuda" and profile.vram_gb >= 88.0:
-        model.bcg_checkpoint_vram_watermark_gb = 48.0 if model.cfg.num_experts >= 16 else 52.0
+    broadcast_model_state(model, dist_ctx)
+    if dist_ctx.is_distributed:
+        seed_everything(seed + dist_ctx.rank * 104729, device=device)
+    if device.type == "cuda" and profile.vram_gb >= 75.0:
+        default_wm = 48.0 if model.cfg.num_experts >= 16 else 52.0
+        if profile.vram_gb < 88.0:
+            default_wm = 40.0 if model.cfg.num_experts >= 32 else 44.0
+        model.bcg_checkpoint_vram_watermark_gb = default_wm
     freeze_info = apply_stage5_surgical_freeze(model)
     optimizer = torch.optim.AdamW(freeze_info["param_groups"], betas=(0.9, 0.95), eps=1.0e-8)
 
     comp_rep = configure_model_compile(model, compile_mode=compile_mode, device=device)
-    print(
-        f"[Stage 5 SFT] steps={total_steps:,} (warmup={eff_warmup}) | micro={eff_micro_bytes:,}B x {grad_accum} | "
-        f"active={freeze_info['active_params']:,} | frozen={freeze_info['frozen_params']:,} | "
-        f"compile={comp_rep.effective_mode}",
+    _r0_print(
+        f"[Stage 5 SFT] steps={total_steps:,} (warmup={eff_warmup}) | micro={eff_micro_bytes:,}B x {grad_accum} x {dist_ctx.world_size}GPU "
+        f"(global={global_step_bytes:,}B/step) | active={freeze_info['active_params']:,} | "
+        f"frozen={freeze_info['frozen_params']:,} | compile={comp_rep.effective_mode}",
         flush=True,
     )
 
@@ -342,9 +372,10 @@ def run_stage5_sft(
             split="train",
             target_batch_bytes=eff_micro_bytes,
             max_doc_bytes=max_doc_bytes,
-            num_batches=max(total_steps * grad_accum + 100, 1000),
+            num_batches=max((total_steps * grad_accum + 100) * dist_ctx.world_size, 1000),
             seed=seed,
             prefix="sft",
+            bucket_sync_world_size=dist_ctx.world_size,
         )
     ]
     if cap_data_dir is not None:
@@ -357,19 +388,20 @@ def run_stage5_sft(
                         split="train",
                         target_batch_bytes=eff_micro_bytes,
                         max_doc_bytes=max(max_doc_bytes, 4096 if pref == "cap_writing" else max_doc_bytes),
-                        num_batches=max(total_steps * grad_accum + 100, 1000),
+                        num_batches=max((total_steps * grad_accum + 100) * dist_ctx.world_size, 1000),
                         seed=seed + idx_c * 313,
                         prefix=pref,
+                        bucket_sync_world_size=dist_ctx.world_size,
                     )
                 )
     if len(train_datasets) > 1:
-        print(
+        _r0_print(
             f"[Stage 5 Mix] Balanced multi-capability mixture active ({len(train_datasets)} shards: sft + cap_*)",
             flush=True,
         )
 
     val_ds: Optional[SFTByteDataset] = None
-    if (Path(data_dir) / "sft_val.bin").exists():
+    if is_primary and (Path(data_dir) / "sft_val.bin").exists():
         val_ds = SFTByteDataset(
             data_dir=data_dir,
             split="val",
@@ -396,9 +428,13 @@ def run_stage5_sft(
 
             optimizer.zero_grad(set_to_none=True)
             accum_m: dict[str, float] = {}
+            step_finite = True
             for _ in range(grad_accum):
+                # Synchronize shard selection across all ranks (`batch_cursor`) while sharding dialogue index!
                 ds_sel = train_datasets[batch_cursor % len(train_datasets)]
-                batch = pin_batch_if_cuda(ds_sel[batch_cursor // len(train_datasets)], device)
+                logical_ds_idx = batch_cursor // len(train_datasets)
+                phys_ds_idx = logical_ds_idx * dist_ctx.world_size + dist_ctx.rank
+                batch = pin_batch_if_cuda(ds_sel[phys_ds_idx], device)
                 batch_cursor += 1
                 x_b = to_device_async(batch["x_bytes"], device)
                 msk = to_device_async(batch["sft_loss_mask"], device)
@@ -431,17 +467,28 @@ def run_stage5_sft(
                         doc_cu_seqlens=cu,
                         record_traces=False,
                     )
+                if sync_bool_any(not bool(torch.isfinite(out.loss_total).item()), dist_ctx, device):
+                    step_finite = False
+                    break
                 scaled_loss = out.loss_total / float(grad_accum)
                 scaled_loss.backward()
                 for k, v in out.metrics.items():
                     accum_m[k] = accum_m.get(k, 0.0) + float(v) / float(grad_accum)
+
+            if not step_finite:
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            active_p = [p for p in model.parameters() if p.requires_grad]
+            if dist_ctx.is_distributed:
+                all_reduce_gradients_coalesced(active_p, dist_ctx, use_bf16_comm=use_bf16)
+                accum_m = all_reduce_metrics_dict(accum_m, dist_ctx, device)
 
             # Track EOT row W_out[0x04] gradient norm (verified non-zero in Stage 5 audit!)
             if model.sgsc.w_out.weight.grad is not None:
                 gn_eot = float(model.sgsc.w_out.weight.grad[0x04].detach().float().norm().item())
                 eot_grad_norm_max = max(eot_grad_norm_max, gn_eot)
 
-            active_p = [p for p in model.parameters() if p.requires_grad]
             torch.nn.utils.clip_grad_norm_(active_p, max_norm=1.0)
             optimizer.step()
             last_metrics = accum_m
@@ -449,11 +496,11 @@ def run_stage5_sft(
             if step_hook is not None:
                 step_hook(completed, model, last_metrics)
 
-            if completed == 1 or completed == total_steps or (log_every > 0 and completed % log_every == 0):
+            if is_primary and (completed == 1 or completed == total_steps or (log_every > 0 and completed % log_every == 0)):
                 elapsed = max(time.perf_counter() - t_start, 1e-6)
-                kb_s = (completed * eff_micro_bytes * grad_accum) / (elapsed * 1024.0)
+                kb_s = (completed * global_step_bytes) / (elapsed * 1024.0)
                 bpc = last_metrics.get("loss_lang", 0.0) / math.log(2.0)
-                print(
+                _r0_print(
                     f"[SFT {completed:04d}/{total_steps:04d}] loss={last_metrics.get('loss_total', 0.0):.4f} "
                     f"bpc={bpc:.3f} pc={last_metrics.get('loss_pc', 0.0):.4f} "
                     f"halt={last_metrics.get('loss_halt', 0.0):.4f} "
@@ -462,21 +509,24 @@ def run_stage5_sft(
                     flush=True,
                 )
 
-        val_bpc = _eval_sft_val_bpc(model, val_ds, device=device, use_bf16=use_bf16, n_batches=2)
-        synchronize(device)
-        exported = export_final_safetensors(model, export_dir, filename="dcpa_chat_sft.safetensors")
-        out_sf = exported["weights"]
-        print(
-            f"[Stage 5 Export] Atomically exported {out_sf} "
-            f"({out_sf.stat().st_size / (1024 * 1024):.2f} MB) | val_bpc={val_bpc}",
-            flush=True,
-        )
-        if drive_export_dir is not None:
-            out_sf = sync_file_to_drive(exported["weights"], drive_export_dir, dest_name="dcpa_chat_sft.safetensors")
-            sync_file_to_drive(exported["config"], drive_export_dir, dest_name="config.json")
-            print(f"[Stage 5 Export] Synced to Drive -> {out_sf}", flush=True)
-        if hasattr(os, "sync"):
-            os.sync()
+        val_bpc = _eval_sft_val_bpc(model, val_ds, device=device, use_bf16=use_bf16, n_batches=2) if is_primary else None
+        out_sf = Path(export_dir) / "dcpa_chat_sft.safetensors"
+        if is_primary:
+            synchronize(device)
+            exported = export_final_safetensors(model, export_dir, filename="dcpa_chat_sft.safetensors")
+            out_sf = exported["weights"]
+            _r0_print(
+                f"[Stage 5 Export] Atomically exported {out_sf} "
+                f"({out_sf.stat().st_size / (1024 * 1024):.2f} MB) | val_bpc={val_bpc}",
+                flush=True,
+            )
+            if drive_export_dir is not None:
+                out_sf = sync_file_to_drive(exported["weights"], drive_export_dir, dest_name="dcpa_chat_sft.safetensors")
+                sync_file_to_drive(exported["config"], drive_export_dir, dest_name="config.json")
+                _r0_print(f"[Stage 5 Export] Synced to Drive -> {out_sf}", flush=True)
+            if hasattr(os, "sync"):
+                os.sync()
+        dist_barrier(dist_ctx)
 
         return Stage5SFTSummary(
             completed_steps=total_steps,
@@ -494,6 +544,7 @@ def run_stage5_sft(
             ds.close()
         if val_ds is not None:
             val_ds.close()
+        cleanup_distributed_context(dist_owned)
 
 
 def main() -> None:

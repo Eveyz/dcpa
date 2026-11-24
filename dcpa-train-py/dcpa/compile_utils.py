@@ -17,7 +17,10 @@ Implements Performance Audit Task 2:
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 import torch
@@ -132,6 +135,18 @@ def configure_model_compile(
         torch._dynamo.config.cache_size_limit = max(int(cache_size_limit), 64)
         if hasattr(torch._dynamo.config, "accumulated_cache_size_limit"):
             torch._dynamo.config.accumulated_cache_size_limit = max(int(cache_size_limit) * 4, 256)
+
+    # Isolate TorchInductor disk cache per rank under multi-GPU torchrun to prevent lock/write races
+    world_sz = int(os.environ.get("WORLD_SIZE", "1") or "1")
+    local_rk = os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0"))
+    if world_sz > 1 and device.type == "cuda":
+        base_inductor_dir = os.environ.get(
+            "DCPA_INDUCTOR_CACHE_ROOT",
+            str(Path(tempfile.gettempdir()) / "dcpa_torchinductor"),
+        )
+        rank_cache = Path(base_inductor_dir) / f"rank_{local_rk}"
+        rank_cache.mkdir(parents=True, exist_ok=True)
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(rank_cache)
 
     use_cuda_inductor = device.type == "cuda"
     backend = "inductor" if use_cuda_inductor else cpu_backend

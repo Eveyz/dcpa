@@ -233,6 +233,8 @@ class RaggedByteDataset(Dataset):
         num_batches: int = 10000,
         seed: int = 42,
         allow_drive_fuse: bool = False,
+        length_bucketing: bool = True,
+        bucket_sync_world_size: int = 1,
     ) -> None:
         if target_batch_bytes < 64:
             raise ValueError(f"target_batch_bytes must be >= 64, got {target_batch_bytes}")
@@ -257,6 +259,8 @@ class RaggedByteDataset(Dataset):
         self.wug_ratio = float(wug_ratio)
         self.num_batches = int(num_batches)
         self.seed = int(seed)
+        self.length_bucketing = bool(length_bucketing)
+        self.bucket_sync_world_size = max(1, int(bucket_sync_world_size))
 
         # Read lightweight index metadata once; .bin mmap is opened lazily per worker process.
         idx_mm = np.memmap(self.idx_path, dtype=IDX_DTYPE, mode="r")
@@ -288,10 +292,100 @@ class RaggedByteDataset(Dataset):
         self._langs, self._cum_weights = _normalize_domain_weights(
             list(self._lang_offsets.keys()), domain_weights
         )
+        # Precompute Bayes-exact length-bucketed sub-pools so every micro-batch packs
+        # homogeneous-length documents (eliminating straggler tails) AND synchronizes `m_max`
+        # across all DDP ranks via `sync_group = batch_idx // bucket_sync_world_size`!
+        self._use_tiered_buckets: bool = False
+        self._tier_cum_probs: list[float] = []
+        self._tier_langs: list[list[int]] = []
+        self._tier_lang_cum: list[list[float]] = []
+        self._tier_pools: list[dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = []
+        if self.length_bucketing and self.wug_ratio == 0.0 and self.max_doc_bytes > 512 and len(self._langs) > 0:
+            self._build_length_tier_tables()
+
         # Lazy per-process mmap handle (never pickled across DataLoader workers)
         self._bin_mmap: Optional[np.memmap] = None
         self._mmap_pid: int = -1
         self._mmap_lock = threading.Lock()
+
+    def _build_length_tier_tables(self) -> None:
+        """Partition each domain into power-of-2 byte-length bands preserving exact marginal P(lid, doc)."""
+        # Derive marginal domain probability p_lang[lid] from self._cum_weights
+        p_lang: dict[int, float] = {}
+        prev_c = 0.0
+        for lid, cw in zip(self._langs, self._cum_weights):
+            p_lang[lid] = max(0.0, float(cw) - prev_c)
+            prev_c = float(cw)
+
+        # Length band edges up to max_doc_bytes: (0, 512], (512, 1024], (1024, 2048], (2048, inf)
+        raw_edges = [0, 512, 1024, 2048, 1 << 60]
+        bands: list[tuple[int, int]] = []
+        for lo, hi in zip(raw_edges[:-1], raw_edges[1:]):
+            if lo >= self.max_doc_bytes:
+                break
+            bands.append((lo, hi))
+        if len(bands) <= 1:
+            return
+
+        tier_masses: list[float] = []
+        tier_langs: list[list[int]] = []
+        tier_lang_cum: list[list[float]] = []
+        tier_pools: list[dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = []
+
+        for lo, hi in bands:
+            t_mass = 0.0
+            l_masses: list[tuple[int, float]] = []
+            pools_k: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+            for lid in self._langs:
+                lens_l = self._lang_lengths[lid]
+                n_tot = len(lens_l)
+                if n_tot == 0:
+                    continue
+                eff_lens = np.minimum(lens_l, self.max_doc_bytes)
+                if hi >= self.max_doc_bytes:
+                    m_band = eff_lens > lo
+                else:
+                    m_band = (eff_lens > lo) & (eff_lens <= hi)
+                cnt = int(np.count_nonzero(m_band))
+                if cnt == 0:
+                    continue
+                joint_p = p_lang[lid] * (float(cnt) / float(n_tot))
+                if joint_p <= 0.0:
+                    continue
+                t_mass += joint_p
+                l_masses.append((lid, joint_p))
+                pools_k[lid] = (
+                    self._lang_offsets[lid][m_band],
+                    lens_l[m_band],
+                    self._lang_sources[lid][m_band],
+                    self._lang_styles[lid][m_band],
+                )
+            if t_mass > 0.0 and l_masses:
+                tier_masses.append(t_mass)
+                t_lids = [x[0] for x in l_masses]
+                acc_l = 0.0
+                t_cum: list[float] = []
+                for _, jm in l_masses:
+                    acc_l += jm / t_mass
+                    t_cum.append(acc_l)
+                t_cum[-1] = 1.0
+                tier_langs.append(t_lids)
+                tier_lang_cum.append(t_cum)
+                tier_pools.append(pools_k)
+
+        if len(tier_masses) > 1:
+            tot_m = sum(tier_masses)
+            acc_t = 0.0
+            cum_t: list[float] = []
+            for tm in tier_masses:
+                acc_t += tm / tot_m
+                cum_t.append(acc_t)
+            cum_t[-1] = 1.0
+            self._tier_cum_probs = cum_t
+            self._tier_langs = tier_langs
+            self._tier_lang_cum = tier_lang_cum
+            self._tier_pools = tier_pools
+            self._use_tiered_buckets = True
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
@@ -373,11 +467,16 @@ class RaggedByteDataset(Dataset):
             "wug_target_mask": torch.zeros(total_t, dtype=torch.bool),
         }
 
-    def __getitem__(self, batch_idx: int) -> dict[str, torch.Tensor]:
-        """Pack one Constant-Byte-Budget zero-padding Ragged batch (`Total_T <= target_batch_bytes`)."""
+    def get_batch(self, batch_idx: int, sync_group: Optional[int] = None) -> dict[str, torch.Tensor]:
+        """Pack one Constant-Byte-Budget zero-padding Ragged batch (`Total_T <= target_batch_bytes`).
+
+        When `self._use_tiered_buckets` is active, `sync_group` (defaulting to
+        `batch_idx // bucket_sync_world_size`) deterministically selects the same byte-length tier
+        across all DDP ranks on the same step while `batch_idx` selects distinct documents per rank!
+        """
         winfo = get_worker_info()
         worker_id = winfo.id if winfo is not None else 0
-        rng = random.Random(self.seed + batch_idx * 1000003 + worker_id * 97)
+        rng = random.Random(self.seed + int(batch_idx) * 1000003 + worker_id * 97)
         mm = self._get_mmap()
 
         budget = self.target_batch_bytes
@@ -395,13 +494,27 @@ class RaggedByteDataset(Dataset):
         doc_pts_list: list[float] = []
 
         cursor = 0
+        tier_pool: Optional[dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = None
+        if self._use_tiered_buckets:
+            eff_sync = (int(batch_idx) // self.bucket_sync_world_size) if sync_group is None else int(sync_group)
+            u_tier = random.Random(self.seed + eff_sync * 7919 + 31).random()
+            t_idx = len(self._tier_cum_probs) - 1
+            for k_i, cp in enumerate(self._tier_cum_probs):
+                if u_tier <= cp:
+                    t_idx = k_i
+                    break
+            langs = self._tier_langs[t_idx]
+            cum_weights = self._tier_lang_cum[t_idx]
+            tier_pool = self._tier_pools[t_idx]
+        else:
+            langs = self._langs
+            cum_weights = self._cum_weights
+
         # Pre-bind hot attributes to locals for maximum Python loop speed
         lang_offsets = self._lang_offsets
         lang_lengths = self._lang_lengths
         lang_sources = self._lang_sources
         lang_styles = self._lang_styles
-        langs = self._langs
-        cum_weights = self._cum_weights
         n_langs = len(langs)
         rand_fn = rng.random
         randrange_fn = rng.randrange
@@ -441,10 +554,13 @@ class RaggedByteDataset(Dataset):
                     break
                 # Fall through to a regular doc slice if Wug episode exceeded tiny tail budget
 
-            offs = lang_offsets[lid]
-            lens = lang_lengths[lid]
-            srcs = lang_sources[lid]
-            stys = lang_styles[lid]
+            if tier_pool is not None:
+                offs, lens, srcs, stys = tier_pool[lid]
+            else:
+                offs = lang_offsets[lid]
+                lens = lang_lengths[lid]
+                srcs = lang_sources[lid]
+                stys = lang_styles[lid]
             d_i = randrange_fn(len(offs))
             off = int(offs[d_i])
             doc_len = int(lens[d_i])
@@ -506,6 +622,9 @@ class RaggedByteDataset(Dataset):
             "wug_target_mask": torch.from_numpy(wug_mask[:total_t].copy()),
         }
 
+    def __getitem__(self, batch_idx: int) -> dict[str, torch.Tensor]:
+        return self.get_batch(batch_idx, sync_group=None)
+
 
 def create_ragged_dataloader(
     bin_path: str | Path,
@@ -518,6 +637,8 @@ def create_ragged_dataloader(
     num_workers: int = 0,
     seed: int = 42,
     allow_drive_fuse: bool = False,
+    length_bucketing: bool = True,
+    bucket_sync_world_size: int = 1,
 ) -> DataLoader:
     """Create a multi-worker DataLoader yielding pre-packed Constant-Byte-Budget Ragged dicts."""
     ds = RaggedByteDataset(
@@ -530,6 +651,8 @@ def create_ragged_dataloader(
         num_batches=num_batches,
         seed=seed,
         allow_drive_fuse=allow_drive_fuse,
+        length_bucketing=length_bucketing,
+        bucket_sync_world_size=bucket_sync_world_size,
     )
     return DataLoader(
         ds,

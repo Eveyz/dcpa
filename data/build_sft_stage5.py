@@ -740,6 +740,8 @@ class SFTByteDataset(Dataset):
         num_batches: int = 100000,
         seed: int = 42,
         prefix: str = "sft",
+        length_bucketing: bool = True,
+        bucket_sync_world_size: int = 1,
     ) -> None:
         dd = Path(data_dir)
         assert_not_drive_mmap(dd)
@@ -754,6 +756,8 @@ class SFTByteDataset(Dataset):
         self.max_doc_bytes = int(max_doc_bytes)
         self.num_batches = int(num_batches)
         self.seed = int(seed)
+        self.length_bucketing = bool(length_bucketing)
+        self.bucket_sync_world_size = max(1, int(bucket_sync_world_size))
 
         idx_mm = np.memmap(self.idx_path, dtype=IDX_DTYPE, mode="r")
         self._offsets = np.array(idx_mm["offset"], dtype=np.int64, copy=True)
@@ -764,6 +768,30 @@ class SFTByteDataset(Dataset):
         del idx_mm
 
         self.num_docs = int(len(self._offsets))
+        self._tier_doc_indices: list[np.ndarray] = []
+        self._tier_cum_probs: list[float] = []
+        valid_mask = self._lengths <= self.max_doc_bytes
+        if self.length_bucketing and self.max_doc_bytes > 512 and int(np.count_nonzero(valid_mask)) > 0:
+            edges = [0, 512, 1024, 2048, 1 << 60]
+            counts_t: list[int] = []
+            for lo, hi in zip(edges[:-1], edges[1:]):
+                if lo >= self.max_doc_bytes:
+                    break
+                eff_hi = self.max_doc_bytes if hi >= self.max_doc_bytes else hi
+                idxs = np.nonzero((self._lengths > lo) & (self._lengths <= eff_hi))[0]
+                if len(idxs) > 0:
+                    self._tier_doc_indices.append(idxs)
+                    counts_t.append(len(idxs))
+            if len(self._tier_doc_indices) > 1:
+                tot_c = float(sum(counts_t))
+                acc = 0.0
+                for c in counts_t:
+                    acc += float(c) / tot_c
+                    self._tier_cum_probs.append(acc)
+                self._tier_cum_probs[-1] = 1.0
+            else:
+                self._tier_doc_indices.clear()
+
         self._bin_mm: Optional[np.memmap] = None
         self._msk_mm: Optional[np.memmap] = None
         self._pid: int = -1
@@ -799,10 +827,24 @@ class SFTByteDataset(Dataset):
         doc_pts: list[float] = []
         cursor = 0
 
+        tier_pool: Optional[np.ndarray] = None
+        if self._tier_doc_indices:
+            eff_sync = int(batch_idx) // self.bucket_sync_world_size
+            u_t = random.Random(self.seed + eff_sync * 7919 + 31).random()
+            t_idx = len(self._tier_cum_probs) - 1
+            for k_i, cp in enumerate(self._tier_cum_probs):
+                if u_t <= cp:
+                    t_idx = k_i
+                    break
+            tier_pool = self._tier_doc_indices[t_idx]
+
         attempts = 0
         while cursor < budget and attempts < 2048:
             attempts += 1
-            d_i = rng.randrange(self.num_docs)
+            if tier_pool is not None:
+                d_i = int(tier_pool[rng.randrange(len(tier_pool))])
+            else:
+                d_i = rng.randrange(self.num_docs)
             d_len = int(self._lengths[d_i])
             if d_len > self.max_doc_bytes:
                 continue

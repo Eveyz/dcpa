@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
+import contextlib
 import json
 import math
 import os
@@ -44,7 +45,7 @@ for _p in (str(_REPO_ROOT), str(_TRAIN_PY)):
 
 from data.ragged_dataloader import RaggedByteDataset
 from data.wug_generator import sample_wug_episode_fast
-from dcpa.compile_utils import configure_model_compile
+from dcpa.compile_utils import configure_model_compile, unwrap_compiled_module
 from dcpa.config import DCPAConfig
 from dcpa.data.synthetic import generate_dyck_sequence, generate_grid_physics_episode
 from dcpa.export import extract_flat_state_dict
@@ -88,6 +89,17 @@ from utils.device import (
     synchronize,
     to_device_async,
 )
+from utils.distributed import (
+    DistContext,
+    all_reduce_gradients_coalesced,
+    all_reduce_metrics_dict,
+    broadcast_model_state,
+    cleanup_distributed_context,
+    dist_barrier,
+    init_distributed_context,
+    sync_bool_any,
+    sync_tensor_avg_,
+)
 
 
 DEFAULT_CONFIG_PATH = _REPO_ROOT / "configs" / "dcpa_48m_train.yaml"
@@ -126,12 +138,27 @@ def load_yaml_config(config_path: Optional[str | Path]) -> dict[str, Any]:
 def build_dcpa_config(preset: str, yaml_cfg: Mapping[str, Any]) -> DCPAConfig:
     """Resolve `DCPAConfig` from preset name and optional YAML overrides."""
     preset_key = preset.strip().lower()
-    alias_map = {"48m": "proto_48m", "152m": "standard_152m", "210m": "moe_210m"}
+    alias_map = {
+        "48m": "proto_48m",
+        "152m": "standard_152m",
+        "210m": "moe_210m",
+        "650m": "moe_650m",
+        "1.8b": "moe_1_8b",
+        "1_8b": "moe_1_8b",
+        "2.6b": "moe_2_6b",
+        "2_6b": "moe_2_6b",
+        "3.5b": "moe_3_5b",
+        "3_5b": "moe_3_5b",
+    }
     canon_key = alias_map.get(preset_key, preset_key)
     factory_map: dict[str, Callable[[], DCPAConfig]] = {
         "proto_48m": DCPAConfig.proto_48m,
         "standard_152m": DCPAConfig.standard_152m,
         "moe_210m": DCPAConfig.moe_210m,
+        "moe_650m": DCPAConfig.moe_650m,
+        "moe_1_8b": DCPAConfig.moe_1_8b,
+        "moe_2_6b": DCPAConfig.moe_2_6b,
+        "moe_3_5b": DCPAConfig.moe_3_5b,
         "base": DCPAConfig.base,
         "tiny": DCPAConfig.tiny,
         "micro": DCPAConfig.micro,
@@ -303,7 +330,7 @@ def export_final_safetensors(
 
 
 class _DynamicRaggedCursorStream:
-    """Deterministic cursor-addressable Ragged byte stream with optional CUDA pinned-memory prefetch."""
+    """Deterministic cursor-addressable Ragged byte stream with multi-rank sharding & async prefetch."""
 
     def __init__(
         self,
@@ -314,10 +341,17 @@ class _DynamicRaggedCursorStream:
         stage3_cap_mix_ratio: float = 0.35,
         device: Optional[torch.device] = None,
         prefetch_depth: int = 0,
+        rank: int = 0,
+        world_size: int = 1,
+        length_bucketing: bool = True,
+        prefetch_workers: int = 2,
     ) -> None:
         self.bin_path = bin_path if (bin_path is not None and bin_path.exists()) else None
         self.idx_path = idx_path if (idx_path is not None and idx_path.exists()) else None
         self.has_shards = self.bin_path is not None and self.idx_path is not None
+        self.rank = max(0, int(rank))
+        self.world_size = max(1, int(world_size))
+        self.length_bucketing = bool(length_bucketing)
         self._ds: Optional[RaggedByteDataset] = None
         self._ds_key: Optional[tuple[Any, ...]] = None
         self._cap_shards: list[tuple[Path, Path]] = []
@@ -343,8 +377,9 @@ class _DynamicRaggedCursorStream:
         self._ds_lock = threading.Lock()
         self._prefetch_depth = int(prefetch_depth) if (self.has_shards and self._device.type == "cuda") else 0
         self._prefetch_futures: dict[tuple[Any, ...], Future[dict[str, torch.Tensor]]] = {}
+        n_workers = max(1, min(int(prefetch_workers), max(1, self._prefetch_depth)))
         self._executor: Optional[ThreadPoolExecutor] = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="dcpa_prefetch")
+            ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix=f"dcpa_prefetch_r{self.rank}")
             if self._prefetch_depth > 0
             else None
         )
@@ -357,7 +392,7 @@ class _DynamicRaggedCursorStream:
         max_doc_bytes: int,
         seed_val: int,
     ) -> RaggedByteDataset:
-        key = (int(target_batch_bytes), int(max_doc_bytes), int(seed_val))
+        key = (int(target_batch_bytes), int(max_doc_bytes), int(seed_val), self.length_bucketing, self.world_size)
         if self._cap_datasets[cap_idx] is not None and self._cap_keys[cap_idx] == key:
             return self._cap_datasets[cap_idx]  # type: ignore[return-value]
         if self._cap_datasets[cap_idx] is not None:
@@ -372,6 +407,8 @@ class _DynamicRaggedCursorStream:
             wug_ratio=0.0,
             num_batches=10_000_000,
             seed=int(seed_val) + (cap_idx + 1) * 4099,
+            length_bucketing=self.length_bucketing,
+            bucket_sync_world_size=self.world_size,
         )
         self._cap_datasets[cap_idx] = ds
         self._cap_keys[cap_idx] = key
@@ -389,7 +426,15 @@ class _DynamicRaggedCursorStream:
         if not self.has_shards or self.bin_path is None or self.idx_path is None:
             return None
         dw_key = tuple(sorted((int(k), round(float(v), 6)) for k, v in domain_weights.items()))
-        key = (int(target_batch_bytes), int(max_doc_bytes), dw_key, round(float(wug_ratio), 6), int(seed_val))
+        key = (
+            int(target_batch_bytes),
+            int(max_doc_bytes),
+            dw_key,
+            round(float(wug_ratio), 6),
+            int(seed_val),
+            self.length_bucketing,
+            self.world_size,
+        )
         if self._ds is not None and self._ds_key == key:
             return self._ds
         if self._ds is not None:
@@ -403,6 +448,8 @@ class _DynamicRaggedCursorStream:
             wug_ratio=float(wug_ratio),
             num_batches=10_000_000,
             seed=int(seed_val),
+            length_bucketing=self.length_bucketing,
+            bucket_sync_world_size=self.world_size,
         )
         self._ds_key = key
         return self._ds
@@ -438,23 +485,28 @@ class _DynamicRaggedCursorStream:
         wug_ratio: float,
         seed_val: int,
     ) -> dict[str, torch.Tensor]:
+        # Key shard choice AND length-bucket tier on logical `b_idx` so ALL ranks draw homogeneous
+        # document lengths on the same step, while `phys_b_idx` gives each rank disjoint documents!
+        logical_b = int(b_idx)
+        phys_b_idx = logical_b * self.world_size + self.rank
         use_cap = (
             stage_id == 3
             and len(self._cap_shards) > 0
             and self.stage3_cap_mix_ratio > 0.0
-            and ((b_idx * 37) % 100) < int(round(self.stage3_cap_mix_ratio * 100.0))
+            and ((logical_b * 37) % 100) < int(round(self.stage3_cap_mix_ratio * 100.0))
         )
-        with self._ds_lock:
-            if use_cap:
-                c_idx = b_idx % len(self._cap_shards)
+        if use_cap:
+            c_idx = logical_b % len(self._cap_shards)
+            with self._ds_lock:
                 cap_ds = self._ensure_cap_dataset(
                     c_idx,
                     target_batch_bytes=target_batch_bytes,
                     max_doc_bytes=max_doc_bytes,
                     seed_val=seed_val,
                 )
-                batch = cap_ds[b_idx]
-            else:
+            batch = cap_ds.get_batch(phys_b_idx, sync_group=logical_b)
+        else:
+            with self._ds_lock:
                 ds = self._ensure_dataset(
                     target_batch_bytes=target_batch_bytes,
                     max_doc_bytes=max_doc_bytes,
@@ -462,16 +514,16 @@ class _DynamicRaggedCursorStream:
                     wug_ratio=wug_ratio,
                     seed_val=seed_val,
                 )
-                if ds is not None:
-                    batch = ds[b_idx]
-                else:
-                    batch = _sample_synthetic_ragged_batch(
-                        batch_idx=b_idx,
-                        seed=seed_val,
-                        target_bytes=target_batch_bytes,
-                        max_doc_bytes=max_doc_bytes,
-                        wug_ratio=wug_ratio,
-                    )
+            if ds is not None:
+                batch = ds.get_batch(phys_b_idx, sync_group=logical_b)
+            else:
+                batch = _sample_synthetic_ragged_batch(
+                    batch_idx=phys_b_idx,
+                    seed=seed_val,
+                    target_bytes=target_batch_bytes,
+                    max_doc_bytes=max_doc_bytes,
+                    wug_ratio=wug_ratio,
+                )
         return pin_batch_if_cuda(batch, self._device)
 
     def _clear_prefetch(self) -> None:
@@ -547,7 +599,9 @@ class _DynamicRaggedCursorStream:
             )
 
         self.cursor["batch_idx"] = b_idx + 1
-        self.cursor["consumed_bytes"] = int(self.cursor["consumed_bytes"]) + int(batch["x_bytes"].numel())
+        self.cursor["consumed_bytes"] = (
+            int(self.cursor["consumed_bytes"]) + int(batch["x_bytes"].numel()) * self.world_size
+        )
         self.cursor["epoch"] = int(self.cursor["consumed_bytes"]) // max(self._corpus_bytes, 1)
         return batch
 
@@ -611,12 +665,23 @@ def run_training(
     watchdog_warmup_steps: Optional[int] = None,
     milestone_steps: Optional[tuple[int, ...]] = None,
     export_final: bool = True,
+    fixed_global_batch: bool = False,
+    auto_lr_scale: bool = True,
+    length_bucketing: bool = True,
+    bf16_grad_comm: bool = True,
     clock: Callable[[], float] = time.monotonic,
     pre_step_hook: Optional[Callable[[int, DCPAModel, torch.optim.Optimizer, dict[str, float]], None]] = None,
     step_hook: Optional[Callable[[int, DCPAModel, dict[str, float]], None]] = None,
     stage_change_hook: Optional[Callable[[int, int, DCPAModel], None]] = None,
 ) -> TrainRunSummary:
-    """Execute the full DCPA 4-stage self-healing developmental training lifecycle."""
+    """Execute the full DCPA 4-stage self-healing developmental training lifecycle (1..N GPUs)."""
+    dist_ctx, dist_owned = init_distributed_context(preferred_device=device_str)
+    is_primary = dist_ctx.is_primary
+
+    def _r0_print(*args: Any, **kwargs: Any) -> None:
+        if is_primary:
+            print(*args, **kwargs)
+
     yaml_cfg = load_yaml_config(config_path) if config_path is not None else {}
     hw_cfg = dict(yaml_cfg.get("hardware", {}))
     opt_cfg = dict(yaml_cfg.get("optimizer", {}))
@@ -633,8 +698,9 @@ def run_training(
         eff_total_steps = int(total_steps) if total_steps is not None else eff_boundaries[-1]
     elif total_steps is not None:
         eff_total_steps = int(total_steps)
-        if eff_total_steps == 100_000 and "stage_boundaries" in curr_cfg:
-            eff_boundaries = tuple(int(x) for x in curr_cfg["stage_boundaries"])
+        cfg_bounds = curr_cfg.get("stage_boundaries")
+        if cfg_bounds is not None and len(cfg_bounds) == 5 and eff_total_steps == int(cfg_bounds[-1]):
+            eff_boundaries = tuple(int(x) for x in cfg_bounds)
         elif eff_total_steps == 100_000:
             eff_boundaries = CurriculumController.NOMINAL_BOUNDARIES
         else:
@@ -662,36 +728,47 @@ def run_training(
     eff_ckpt_dir = Path(ckpt_dir) if ckpt_dir is not None else Path(ck_cfg.get("ckpt_dir", local_cache / "checkpoints"))
     eff_logs_dir = Path(logs_dir) if logs_dir is not None else Path(vp_cfg.get("logs_dir", local_cache / "logs"))
     eff_export_dir = Path(export_dir) if export_dir is not None else Path(ck_cfg.get("export_dir", local_cache / "export"))
-    eff_ckpt_dir.mkdir(parents=True, exist_ok=True)
-    eff_logs_dir.mkdir(parents=True, exist_ok=True)
-    eff_export_dir.mkdir(parents=True, exist_ok=True)
+    if is_primary:
+        eff_ckpt_dir.mkdir(parents=True, exist_ok=True)
+        eff_logs_dir.mkdir(parents=True, exist_ok=True)
+        eff_export_dir.mkdir(parents=True, exist_ok=True)
+        # Restore append-only Drive logs onto fresh NVMe before appending so Colab reconnects
+        # preserve full continuous training telemetry across sessions.
+        restore_drive_log_file(drive_logs_dir, eff_logs_dir, "metrics.jsonl")
+        restore_drive_log_file(drive_logs_dir, eff_logs_dir, "watchdog_events.jsonl")
+    dist_barrier(dist_ctx)
 
-    # Restore append-only Drive logs onto fresh NVMe before appending so Colab reconnects
-    # preserve full continuous training telemetry across sessions.
-    restore_drive_log_file(drive_logs_dir, eff_logs_dir, "metrics.jsonl")
-    restore_drive_log_file(drive_logs_dir, eff_logs_dir, "watchdog_events.jsonl")
-
-    run_log = RunLogTee(
-        local_logs_dir=eff_logs_dir,
-        drive_logs_dir=drive_logs_dir,
-        sync_interval_seconds=max(30.0, float(heartbeat_seconds)),
-        clock=clock,
+    run_log: Any = (
+        RunLogTee(
+            local_logs_dir=eff_logs_dir,
+            drive_logs_dir=drive_logs_dir,
+            sync_interval_seconds=max(30.0, float(heartbeat_seconds)),
+            clock=clock,
+        )
+        if is_primary
+        else contextlib.nullcontext()
     )
     run_log.__enter__()
     _exit_exc: tuple[Any, Any, Any] = (None, None, None)
     stream: Optional[_DynamicRaggedCursorStream] = None
     try:
-        print(
-            f"[Logs] Local console log: {run_log.local_log_path}"
-            + (
-                f" | Drive mirror: {Path(drive_logs_dir) / run_log.log_filename} & train_latest.log"
-                if drive_logs_dir is not None
-                else ""
-            ),
-            flush=True,
-        )
+        if is_primary and hasattr(run_log, "local_log_path"):
+            _r0_print(
+                f"[Logs] Local console log: {run_log.local_log_path}"
+                + (
+                    f" | Drive mirror: {Path(drive_logs_dir) / run_log.log_filename} & train_latest.log"
+                    if drive_logs_dir is not None
+                    else ""
+                ),
+                flush=True,
+            )
         # Hardware detection & auto grad-accum sharding (Iron Law #1 + Deliverable 1)
         yaml_target_bytes = hw_cfg.get("target_tokens_bytes_per_step")
+        cuda_target_active = (
+            device_str == "cuda"
+            or device_str.startswith("cuda:")
+            or (device_str == "auto" and torch.cuda.is_available())
+        )
         explicit_target_bytes = (
             int(target_tokens_bytes_per_step)
             if target_tokens_bytes_per_step is not None
@@ -700,7 +777,7 @@ def run_training(
                 if (
                     yaml_target_bytes is not None
                     and int(yaml_target_bytes) != DEFAULT_PROD_STEP_BYTES
-                    and device_str == "cuda"
+                    and cuda_target_active
                 )
                 else None
             )
@@ -724,28 +801,74 @@ def run_training(
             if target_tokens_bytes_per_step is not None
             else int(profile.target_tokens_bytes_per_step)
         )
+        eff_fixed_global = bool(fixed_global_batch or hw_cfg.get("fixed_global_batch", False))
+        if dist_ctx.is_distributed:
+            if eff_fixed_global or eff_target_bytes >= int(profile.micro_batch_bytes) * dist_ctx.world_size:
+                # Partition target global byte budget evenly across ranks (zero GPU starvation when >= W * micro!)
+                per_rank_target = max(64, math.ceil(eff_target_bytes / dist_ctx.world_size))
+            else:
+                # Never starve GPUs when running a single-GPU config under torchrun: saturate each GPU!
+                per_rank_target = max(int(profile.micro_batch_bytes), math.ceil(eff_target_bytes / dist_ctx.world_size))
+        else:
+            per_rank_target = eff_target_bytes
+
         eff_micro_bytes = (
             int(micro_batch_bytes)
             if micro_batch_bytes is not None
-            else min(int(profile.micro_batch_bytes), eff_target_bytes)
+            else min(int(profile.micro_batch_bytes), per_rank_target)
         )
         eff_micro_bytes = max(64, eff_micro_bytes)
-        grad_accum_steps = max(1, math.ceil(eff_target_bytes / eff_micro_bytes))
-        actual_step_bytes = eff_micro_bytes * grad_accum_steps
+        grad_accum_steps = max(1, math.ceil(per_rank_target / eff_micro_bytes))
+        per_rank_step_bytes = eff_micro_bytes * grad_accum_steps
+        actual_step_bytes = per_rank_step_bytes * dist_ctx.world_size
+
+        # Optional sqrt-batch LR scaling when multi-GPU auto-expands global batch beyond YAML target
+        eff_auto_lr = bool(auto_lr_scale and hw_cfg.get("auto_lr_scale_multi_gpu", True) and not eff_fixed_global)
+        lr_batch_scale = 1.0
+        if dist_ctx.is_distributed and eff_auto_lr and actual_step_bytes > eff_target_bytes:
+            lr_batch_scale = min(2.5, math.sqrt(float(actual_step_bytes) / float(max(eff_target_bytes, 1))))
+            scaled_groups: dict[str, dict[str, Any]] = {}
+            base_groups = dict(opt_cfg.get("groups", {}))
+            for g_name, g_vals in base_groups.items():
+                gd = dict(g_vals)
+                if "lr" in gd:
+                    gd["lr"] = float(gd["lr"]) * lr_batch_scale
+                scaled_groups[g_name] = gd
+            if scaled_groups:
+                opt_cfg = dict(opt_cfg)
+                opt_cfg["groups"] = scaled_groups
 
         seed_everything(seed, device=device)
         cfg = build_dcpa_config(eff_preset, yaml_cfg)
+        if lr_batch_scale != 1.0:
+            cfg.lr_micro *= lr_batch_scale
+            cfg.lr_concept *= lr_batch_scale
+            cfg.lr_scalar_gate *= lr_batch_scale
         model = DCPAModel(cfg).to(device)
-        if device.type == "cuda" and profile.vram_gb >= 88.0:
+        broadcast_model_state(model, dist_ctx)
+        if dist_ctx.is_distributed:
+            # Decorrelate per-rank Gumbel exploration noise while keeping model weights bit-identical!
+            reseed_all_rngs(seed + dist_ctx.rank * 104729, device=device)
+
+        if device.type == "cuda" and profile.vram_gb >= 75.0:
             default_wm = 48.0 if cfg.num_experts >= 16 else 52.0
+            if profile.vram_gb < 88.0:
+                default_wm = 40.0 if cfg.num_experts >= 32 else 44.0
             model.bcg_checkpoint_vram_watermark_gb = float(
                 hw_cfg.get("bcg_checkpoint_vram_watermark_gb", default_wm)
             )
         optimizer = create_dcpa_optimizer(model, optimizer_cfg=opt_cfg)
         grad_clip_norm = float(opt_cfg.get("grad_clip_norm", cfg.grad_clip_norm))
 
-        print(describe_hardware_profile(profile), flush=True)
-        print(
+        _r0_print(describe_hardware_profile(profile), flush=True)
+        if dist_ctx.is_distributed:
+            _r0_print(
+                f"[Dist] world_size={dist_ctx.world_size} | backend={dist_ctx.backend} | "
+                f"per_gpu_bytes={per_rank_step_bytes:,} | global_bytes_per_step={actual_step_bytes:,} | "
+                f"lr_batch_scale={lr_batch_scale:.3f}x | bf16_grad_comm={bool(use_bf16 and bf16_grad_comm)}",
+                flush=True,
+            )
+        _r0_print(
             f"[Plan] preset={eff_preset} | total_steps={eff_total_steps:,} | "
             f"boundaries={list(eff_boundaries)} | micro_batch_bytes={eff_micro_bytes:,} | "
             f"grad_accum_steps={grad_accum_steps} | effective_bytes_per_step={actual_step_bytes:,} | "
@@ -768,7 +891,7 @@ def run_training(
             cache_size_limit=int(hw_cfg.get("compile_cache_size_limit", 128)),
             allow_cpu_compile=allow_cpu_compile,
         )
-        print(
+        _r0_print(
             f"[Compile] requested={compile_report.requested_mode} -> effective={compile_report.effective_mode} "
             f"| backend={compile_report.backend} | hotspots={list(compile_report.compiled_hotspots)} "
             f"| doc_bucket={compile_report.doc_bucket_size} | cache_limit={compile_report.cache_size_limit}"
@@ -785,6 +908,7 @@ def run_training(
             watchdog_cfg=wd_cfg,
             base_seed=seed,
             events_log_path=eff_logs_dir / "watchdog_events.jsonl",
+            enable_event_logging=is_primary,
         )
 
         eff_healthy_every = (
@@ -820,7 +944,7 @@ def run_training(
 
         # Optional Colab A/B Ping-Pong Drive sync + 10-minute wall-clock trigger (Iron Law #3)
         sync_mgr: Optional[ABDriveSyncManager] = None
-        if drive_sync_dir is not None:
+        if drive_sync_dir is not None and is_primary:
             sync_mgr = ABDriveSyncManager(
                 local_cache_dir=local_cache,
                 drive_sync_dir=drive_sync_dir,
@@ -840,6 +964,8 @@ def run_training(
         s3_cap_ratio = float(curr_cfg.get("stage3", {}).get("cap_mix_ratio", 0.35))
         cap_dir_path = Path(cap_data_dir) if cap_data_dir is not None else None
         eff_prefetch_depth = int(hw_cfg.get("prefetch_depth", 2)) if device.type == "cuda" else 0
+        eff_prefetch_workers = int(hw_cfg.get("prefetch_workers", 2))
+        eff_len_bucketing = bool(length_bucketing and hw_cfg.get("length_bucketing", True))
         stream = _DynamicRaggedCursorStream(
             train_bin,
             train_idx,
@@ -848,17 +974,25 @@ def run_training(
             stage3_cap_mix_ratio=s3_cap_ratio,
             device=device,
             prefetch_depth=eff_prefetch_depth,
+            rank=dist_ctx.rank,
+            world_size=dist_ctx.world_size,
+            length_bucketing=eff_len_bucketing,
+            prefetch_workers=eff_prefetch_workers,
         )
         if stream.has_shards:
-            print(f"[Data] Opened NVMe Ragged UTF-8 stream: {train_bin}", flush=True)
+            _r0_print(
+                f"[Data] Opened NVMe Ragged UTF-8 stream: {train_bin} "
+                f"(length_bucketing={eff_len_bucketing}, prefetch_depth={eff_prefetch_depth})",
+                flush=True,
+            )
         elif eff_total_steps >= 1000:
             raise FileNotFoundError(
                 f"Production training (total_steps={eff_total_steps:,}) requires real corpus shards at "
-                f"{train_bin} and {train_idx}! Restore corpus onto local NVMe first (run Cell 3) — "
+                f"{train_bin} and {train_idx}! Restore corpus onto local NVMe first — "
                 "refusing to fall back to synthetic smoke data and overwrite checkpoints."
             )
         if stream._cap_shards:
-            print(
+            _r0_print(
                 f"[Data] Stage 3 capability mix active ({s3_cap_ratio*100:.0f}%): "
                 f"{[p[0].name for p in stream._cap_shards]}",
                 flush=True,
@@ -879,11 +1013,14 @@ def run_training(
                     if res is not None:
                         loaded_ckpt = res.checkpoint
                         fallback_resume_used = res.fallback_triggered
+                        if dist_ctx.is_distributed:
+                            ckpt_mgr.save_healthy(loaded_ckpt)
+                dist_barrier(dist_ctx)
                 if loaded_ckpt is None:
                     latest_local = ckpt_mgr.find_latest_checkpoint()
                     if latest_local is not None:
                         loaded_ckpt = ckpt_mgr.load_checkpoint(latest_local, map_location=device)
-                        print(f"[Resume] Loaded local checkpoint: {latest_local}", flush=True)
+                        _r0_print(f"[Resume] Loaded local checkpoint: {latest_local}", flush=True)
                 if loaded_ckpt is not None:
                     start_step, restored_cursor = CheckpointManager.restore_into(
                         loaded_ckpt,
@@ -892,9 +1029,12 @@ def run_training(
                         controller=controller,
                         watchdog=watchdog,
                         preserve_watchdog_repairs=False,
-                        restore_rng=True,
+                        restore_rng=not dist_ctx.is_distributed,
                     )
+                    broadcast_model_state(model, dist_ctx)
                     stream.restore_cursor(restored_cursor)
+                    if dist_ctx.is_distributed:
+                        reseed_all_rngs(int(stream.cursor["seed"]) + dist_ctx.rank * 104729, device=device)
                     resumed_from_step = start_step
                     resumed_stage_id = int(loaded_ckpt.get("stage_id", -1))
                     best_val_metric = float(loaded_ckpt.get("best_val_metric", loaded_ckpt.get("best_loss", float("inf"))))
@@ -910,15 +1050,18 @@ def run_training(
                     controller=controller,
                     watchdog=watchdog,
                     preserve_watchdog_repairs=False,
-                    restore_rng=True,
+                    restore_rng=not dist_ctx.is_distributed,
                 )
+                broadcast_model_state(model, dist_ctx)
                 stream.restore_cursor(restored_cursor)
+                if dist_ctx.is_distributed:
+                    reseed_all_rngs(int(stream.cursor["seed"]) + dist_ctx.rank * 104729, device=device)
                 resumed_from_step = start_step
                 resumed_stage_id = int(loaded_ckpt.get("stage_id", -1))
                 best_val_metric = float(loaded_ckpt.get("best_val_metric", loaded_ckpt.get("best_loss", float("inf"))))
                 ckpt_mgr.last_healthy_step = start_step
                 wall_trigger.mark_saved(start_step)
-                print(f"[Resume] Restored explicit checkpoint {explicit} at step={start_step}", flush=True)
+                _r0_print(f"[Resume] Restored explicit checkpoint {explicit} at step={start_step}", flush=True)
 
         def _eval_metric_regime(st_id: int) -> str:
             if st_id == 1:
@@ -953,7 +1096,12 @@ def run_training(
                 hardware_tier=profile.tier,
             )
 
-        run_log.sync_to_drive(force=True)
+        def _sync_log(force: bool = False) -> None:
+            if is_primary and hasattr(run_log, "sync_to_drive"):
+                run_log.sync_to_drive(force=force)
+
+        eff_bf16_comm = bool(use_bf16 and bf16_grad_comm and hw_cfg.get("bf16_grad_comm", True))
+        _sync_log(force=True)
         with PreemptionSignalGuard() as sig_guard:
             step_idx = start_step
             while step_idx < eff_total_steps:
@@ -972,7 +1120,7 @@ def run_training(
                     freeze_stats = apply_stage_freeze(model, sc.stage_id)
                     current_stage_id = sc.stage_id
                     resumed_stage_id = sc.stage_id
-                    print(
+                    _r0_print(
                         f"[Stage] Entering Stage {sc.stage_id} ({sc.model_stage}: {sc.stage_name}) "
                         f"at step={completed_step:,}/{eff_total_steps:,} | "
                         f"active_params={freeze_stats['active_params']:,} | "
@@ -1059,7 +1207,8 @@ def run_training(
                     for k, v in out.metrics.items():
                         accum_metrics[k] = accum_metrics.get(k, 0.0) + float(v) / float(grad_accum_steps)
 
-                    if not torch.isfinite(out.loss_total):
+                    local_bad_loss = not bool(torch.isfinite(out.loss_total).item())
+                    if sync_bool_any(local_bad_loss, dist_ctx, device):
                         step_loss_finite = False
                         break
 
@@ -1074,6 +1223,12 @@ def run_training(
                 grads_finite = step_loss_finite
                 grad_norm: Optional[float] = None
                 if grads_finite and active_params:
+                    if dist_ctx.is_distributed:
+                        all_reduce_gradients_coalesced(
+                            active_params,
+                            dist_ctx,
+                            use_bf16_comm=eff_bf16_comm,
+                        )
                     if any(p.grad is not None for p in active_params):
                         gn_t = torch.nn.utils.clip_grad_norm_(active_params, max_norm=grad_clip_norm)
                         gn_val = float(gn_t.detach().item())
@@ -1083,6 +1238,11 @@ def run_training(
                             grads_finite = False
                     else:
                         grad_norm = 0.0
+
+                if dist_ctx.is_distributed:
+                    if sync_bool_any(not grads_finite, dist_ctx, device):
+                        grads_finite = False
+                    accum_metrics = all_reduce_metrics_dict(accum_metrics, dist_ctx, device)
 
                 action = watchdog.check_step(
                     step=completed_step,
@@ -1095,14 +1255,15 @@ def run_training(
                 if action.triggered:
                     optimizer.zero_grad(set_to_none=True)
                     rollback_events.append(action.event_record)
-                    print(
+                    _r0_print(
                         f"[Watchdog Rule {action.rule}] {action.reason} | "
                         f"rollback_count={watchdog.rollback_count} | "
                         f"lr_mult={watchdog.directives.lr_multiplier:.4f} | "
                         f"skip_batches={action.skip_batches} | new_seed={action.new_seed}",
                         flush=True,
                     )
-                    run_log.sync_to_drive(force=True)
+                    _sync_log(force=True)
+                    dist_barrier(dist_ctx)
                     if ckpt_mgr.last_healthy_path.exists():
                         healthy_ckpt = ckpt_mgr.load_checkpoint(ckpt_mgr.last_healthy_path, map_location=device)
                         restored_step, restored_cursor = CheckpointManager.restore_into(
@@ -1114,6 +1275,7 @@ def run_training(
                             preserve_watchdog_repairs=True,
                             restore_rng=False,
                         )
+                        broadcast_model_state(model, dist_ctx)
                         stream.restore_cursor(restored_cursor)
                         stream.cursor["batch_idx"] = int(stream.cursor["batch_idx"]) + int(action.skip_batches)
                         step_idx = restored_step
@@ -1123,7 +1285,12 @@ def run_training(
 
                     if action.new_seed is not None:
                         stream.cursor["seed"] = int(action.new_seed)
-                        reseed_all_rngs(action.new_seed, device=device)
+                        eff_r_seed = (
+                            int(action.new_seed) + dist_ctx.rank * 104729
+                            if dist_ctx.is_distributed
+                            else int(action.new_seed)
+                        )
+                        reseed_all_rngs(eff_r_seed, device=device)
                     continue
 
                 # Healthy optimization step
@@ -1135,6 +1302,10 @@ def run_training(
                 last_metrics = accum_metrics
                 loss_history[completed_step] = float(accum_metrics["loss_total"])
 
+                is_final_step = completed_step == eff_total_steps
+                if dist_ctx.is_distributed and sc.stage_id in (2, 3) and (completed_step % 50 == 0 or is_final_step):
+                    sync_tensor_avg_(unwrap_compiled_module(model.bcg_pc).c0, dist_ctx)
+
                 if step_hook is not None:
                     step_hook(completed_step, model, last_metrics)
 
@@ -1144,19 +1315,17 @@ def run_training(
                 active_lrs = [v for v in applied_lrs.values() if v > 0.0]
                 disp_lr = max(active_lrs) if active_lrs else 0.0
 
-                is_final_step = completed_step == eff_total_steps
-
                 # Concise single-line console row every `console_every_steps` (default 50)
-                if (
+                if is_primary and (
                     completed_step == start_step + 1
                     or is_final_step
                     or (eff_console_every > 0 and completed_step % eff_console_every == 0)
                     or (heartbeat_seconds > 0 and (now_t - last_heartbeat_t) >= heartbeat_seconds)
                 ):
                     if not header_printed:
-                        print(format_console_header(), flush=True)
+                        _r0_print(format_console_header(), flush=True)
                         header_printed = True
-                    print(
+                    _r0_print(
                         format_console_row(
                             step=completed_step,
                             stage_id=sc.stage_id,
@@ -1168,11 +1337,11 @@ def run_training(
                         flush=True,
                     )
                     last_heartbeat_t = now_t
-                    run_log.sync_to_drive(force=False)
+                    _sync_log(force=False)
 
-                # 500-step zero-grad visual diagnostic probe (isolated RNG so training trajectory is 100% invariant)
+                # 500-step zero-grad visual diagnostic probe (Rank 0 only; isolated RNG)
                 is_best = False
-                if eff_probe_every > 0 and (completed_step % eff_probe_every == 0 or is_final_step):
+                if is_primary and eff_probe_every > 0 and (completed_step % eff_probe_every == 0 or is_final_step):
                     rng_snap = capture_rng_state()
                     probe_res = run_visual_probe(
                         model,
@@ -1212,93 +1381,110 @@ def run_training(
                     if drive_logs_dir is not None:
                         sync_file_to_drive(eff_logs_dir / "latest_probe.md", drive_logs_dir, dest_name="latest_probe.md")
                         sync_file_to_drive(eff_logs_dir / "metrics.jsonl", drive_logs_dir, dest_name="metrics.jsonl")
-                        run_log.sync_to_drive(force=True)
+                        _sync_log(force=True)
 
-                # Dual-track atomic checkpointing + optional Colab Drive A/B Ping-Pong sync
+                # Dual-track atomic checkpointing + optional Colab Drive A/B Ping-Pong sync (Rank 0 writes)
+                any_interrupted = sync_bool_any(sig_guard.interrupted, dist_ctx, device)
                 healthy_due = ckpt_mgr.is_healthy_save_due(completed_step)
                 milestone_due = ckpt_mgr.is_milestone_step(completed_step)
-                wall_due, wall_reason = wall_trigger.should_save(completed_step)
-                need_payload = (
+                wall_due_local, wall_reason = wall_trigger.should_save(completed_step) if is_primary else (False, None)
+                wall_due = sync_bool_any(wall_due_local, dist_ctx, device)
+                step_healthy_ok = watchdog.is_healthy_for_checkpoint(completed_step, sc.stage_id, last_metrics)
+                need_sync_ckpt = (
                     healthy_due
                     or milestone_due
-                    or is_best
                     or wall_due
                     or is_final_step
-                    or sig_guard.interrupted
+                    or any_interrupted
                 )
-                if need_payload:
-                    synchronize(device)
-                    payload = _build_ckpt_payload(completed_step, sc.stage_id)
+                if need_sync_ckpt or (is_primary and is_best):
+                    if dist_ctx.is_distributed and need_sync_ckpt:
+                        sync_tensor_avg_(unwrap_compiled_module(model.bcg_pc).c0, dist_ctx)
+                    if is_primary:
+                        synchronize(device)
+                        payload = _build_ckpt_payload(completed_step, sc.stage_id)
 
-                    if sig_guard.interrupted:
-                        ckpt_mgr.save_emergency(payload)
-                        saves_performed += 1
-                        interrupted_sig = sig_guard.signal_name
-                        print(
-                            f"[PreemptionGuard] Saved atomic emergency checkpoint at step={completed_step} "
-                            f"-> {ckpt_mgr.emergency_interrupt_path}",
-                            flush=True,
-                        )
+                        if any_interrupted:
+                            ckpt_mgr.save_emergency(payload)
+                            saves_performed += 1
+                            interrupted_sig = sig_guard.signal_name or "SIGTERM"
+                            _r0_print(
+                                f"[PreemptionGuard] Saved atomic emergency checkpoint at step={completed_step} "
+                                f"-> {ckpt_mgr.emergency_interrupt_path}",
+                                flush=True,
+                            )
+                        else:
+                            if (healthy_due or is_final_step) and step_healthy_ok:
+                                ckpt_mgr.save_healthy(payload)
+                                saves_performed += 1
+
+                            if milestone_due:
+                                ckpt_mgr.save_milestone(payload)
+                                saves_performed += 1
+
+                            if is_best:
+                                ckpt_mgr.save_best(payload)
+                                saves_performed += 1
+
+                            if sync_mgr is not None and (wall_due or milestone_due or is_final_step or is_best):
+                                reason_s = wall_reason or ("milestone" if milestone_due else ("final" if is_final_step else "best"))
+                                sync_mgr.save_ping_pong(
+                                    payload=payload,
+                                    step=completed_step,
+                                    stage_id=sc.model_stage,
+                                    reason=reason_s,
+                                    is_best=is_best,
+                                )
+                                wall_trigger.mark_saved(completed_step)
+                                saves_performed += 1
+                                _sync_log(force=True)
+                            elif wall_due and not healthy_due:
+                                if step_healthy_ok:
+                                    ckpt_mgr.save_healthy(payload)
+                                    saves_performed += 1
+                                wall_trigger.mark_saved(completed_step)
+                    else:
+                        if not any_interrupted and step_healthy_ok and (healthy_due or is_final_step or (wall_due and drive_sync_dir is None)):
+                            ckpt_mgr.last_healthy_step = completed_step
+
+                    if need_sync_ckpt:
+                        dist_barrier(dist_ctx)
+                    if any_interrupted:
+                        interrupted_sig = sig_guard.signal_name or "SIGTERM"
                         step_idx += 1
                         break
 
-                    if (healthy_due or is_final_step) and watchdog.is_healthy_for_checkpoint(
-                        completed_step, sc.stage_id, last_metrics
-                    ):
-                        ckpt_mgr.save_healthy(payload)
-                        saves_performed += 1
-
-                    if milestone_due:
-                        ckpt_mgr.save_milestone(payload)
-                        saves_performed += 1
-
-                    if is_best:
-                        ckpt_mgr.save_best(payload)
-                        saves_performed += 1
-
-                    if sync_mgr is not None and (wall_due or milestone_due or is_final_step or is_best):
-                        reason_s = wall_reason or ("milestone" if milestone_due else ("final" if is_final_step else "best"))
-                        sync_mgr.save_ping_pong(
-                            payload=payload,
-                            step=completed_step,
-                            stage_id=sc.model_stage,
-                            reason=reason_s,
-                            is_best=is_best,
-                        )
-                        wall_trigger.mark_saved(completed_step)
-                        saves_performed += 1
-                        run_log.sync_to_drive(force=True)
-                    elif wall_due and not healthy_due:
-                        # Non-Drive local wall-clock safety save
-                        if watchdog.is_healthy_for_checkpoint(completed_step, sc.stage_id, last_metrics):
-                            ckpt_mgr.save_healthy(payload)
-                            saves_performed += 1
-                        wall_trigger.mark_saved(completed_step)
-
                 step_idx += 1
 
-        # Final `.safetensors` export on clean completion
+        # Final `.safetensors` export on clean completion (Rank 0 exclusive)
         final_export_path: Optional[Path] = None
         if export_final and interrupted_sig is None:
-            synchronize(device)
-            sf_name = str(ck_cfg.get("final_safetensors_name", "dcpa_final.safetensors"))
-            exported = export_final_safetensors(model, eff_export_dir, filename=sf_name)
-            final_export_path = exported["weights"]
-            print(
-                f"[Export] Atomically exported {final_export_path} "
-                f"({final_export_path.stat().st_size / (1024 * 1024):.2f} MB)",
-                flush=True,
-            )
-            if drive_export_dir is not None:
-                final_export_path = sync_file_to_drive(
-                    exported["weights"], drive_export_dir, dest_name=sf_name
+            if dist_ctx.is_distributed:
+                sync_tensor_avg_(unwrap_compiled_module(model.bcg_pc).c0, dist_ctx)
+            if is_primary:
+                synchronize(device)
+                sf_name = str(ck_cfg.get("final_safetensors_name", "dcpa_final.safetensors"))
+                exported = export_final_safetensors(model, eff_export_dir, filename=sf_name)
+                final_export_path = exported["weights"]
+                _r0_print(
+                    f"[Export] Atomically exported {final_export_path} "
+                    f"({final_export_path.stat().st_size / (1024 * 1024):.2f} MB)",
+                    flush=True,
                 )
-                sync_file_to_drive(exported["config"], drive_export_dir, dest_name="config.json")
-                print(f"[Export] Mirrored to Drive -> {final_export_path}", flush=True)
-            if hasattr(os, "sync"):
-                os.sync()
+                if drive_export_dir is not None:
+                    final_export_path = sync_file_to_drive(
+                        exported["weights"], drive_export_dir, dest_name=sf_name
+                    )
+                    sync_file_to_drive(exported["config"], drive_export_dir, dest_name="config.json")
+                    _r0_print(f"[Export] Mirrored to Drive -> {final_export_path}", flush=True)
+                if hasattr(os, "sync"):
+                    os.sync()
+            dist_barrier(dist_ctx)
+            if not is_primary:
+                sf_name = str(ck_cfg.get("final_safetensors_name", "dcpa_final.safetensors"))
+                final_export_path = eff_export_dir / sf_name
 
-        print(
+        _r0_print(
             f"[Train] Summary step={step_idx:,}/{eff_total_steps:,} | "
             f"saves={saves_performed} | rollbacks={watchdog.rollback_count} | "
             f"best_metric={best_val_metric:.4f}",
@@ -1329,8 +1515,9 @@ def run_training(
         if stream is not None:
             stream.close()
         run_log.__exit__(*_exit_exc)
-        if hasattr(os, "sync"):
+        if hasattr(os, "sync") and is_primary:
             os.sync()
+        cleanup_distributed_context(dist_owned)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1338,7 +1525,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--config", type=str, default=str(DEFAULT_CONFIG_PATH) if DEFAULT_CONFIG_PATH.exists() else None)
     ap.add_argument(
         "--preset",
-        choices=["micro", "tiny", "proto_48m", "48m", "base", "standard_152m", "152m", "moe_210m", "210m"],
+        choices=[
+            "micro",
+            "tiny",
+            "proto_48m",
+            "48m",
+            "base",
+            "standard_152m",
+            "152m",
+            "moe_210m",
+            "210m",
+            "moe_650m",
+            "650m",
+            "moe_1_8b",
+            "1.8b",
+            "moe_2_6b",
+            "2.6b",
+            "moe_3_5b",
+            "3.5b",
+        ],
         default=None,
     )
     ap.add_argument("--total-steps", type=int, default=None)
@@ -1346,6 +1551,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--seq-len", type=int, default=2048)
     ap.add_argument("--target-tokens-bytes-per-step", type=int, default=None)
     ap.add_argument("--micro-batch-bytes", type=int, default=None)
+    ap.add_argument("--fixed-global-batch", action="store_true", help="Keep exact global step bytes across ranks instead of saturating per-GPU micro-batch.")
+    ap.add_argument("--no-auto-lr-scale", action="store_true", help="Disable automatic sqrt(batch) LR scaling when multi-GPU expands global batch.")
+    ap.add_argument("--no-length-bucketing", action="store_true", help="Disable length-homogeneous Ragged batch packing.")
     ap.add_argument("--data-dir", type=str, default="artifacts/data")
     ap.add_argument("--cap-data-dir", type=str, default=None, help="Optional Stage 3 capability shards dir (cap_reasoning/writing)")
     ap.add_argument("--ckpt-dir", type=str, default=None)
@@ -1413,15 +1621,20 @@ def main() -> None:
             max_consecutive_meltdowns=args.max_consecutive_meltdowns,
             milestone_steps=m_steps,
             export_final=not args.no_export,
+            fixed_global_batch=args.fixed_global_batch,
+            auto_lr_scale=not args.no_auto_lr_scale,
+            length_bucketing=not args.no_length_bucketing,
         )
-        print(
-            f"[DONE] Completed {summary.completed_steps:,}/{summary.total_steps:,} steps "
-            f"(saves={summary.saves_performed}, rollbacks={summary.rollbacks_performed}, "
-            f"best_metric={summary.best_loss:.4f}, export={summary.final_export_path})",
-            flush=True,
-        )
+        if int(os.environ.get("RANK", "0") or "0") == 0:
+            print(
+                f"[DONE] Completed {summary.completed_steps:,}/{summary.total_steps:,} steps "
+                f"(saves={summary.saves_performed}, rollbacks={summary.rollbacks_performed}, "
+                f"best_metric={summary.best_loss:.4f}, export={summary.final_export_path})",
+                flush=True,
+            )
     except MeltdownAbortError as exc:
-        print(f"[FATAL MELTDOWN] {exc}", file=sys.stderr, flush=True)
+        if int(os.environ.get("RANK", "0") or "0") == 0:
+            print(f"[FATAL MELTDOWN] {exc}", file=sys.stderr, flush=True)
         sys.exit(42)
 
 

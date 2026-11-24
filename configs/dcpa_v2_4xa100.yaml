@@ -1,0 +1,285 @@
+# DCPA v2 Multi-GPU Production Config — Tuned for 4x NVIDIA A100 SXM4 80GB (Vast.ai / NVLink)
+#
+# Flagship default preset: `moe_2_6b` (~2.68B slow parameters, 64 Experts Top-2 -> ~126M active/concept)
+# Switchable via CLI `--preset {moe_1_8b, moe_2_6b, moe_3_5b, moe_650m, moe_210m}`:
+#   - `moe_1_8b`: ~1.79B slow | ~93M active  | ~220k-260k steps/week on 4x A100 (~120 GB UTF-8 bytes)
+#   - `moe_2_6b`: ~2.68B slow | ~126M active | ~180k-210k steps/week on 4x A100 (~100 GB UTF-8 bytes) [RECOMMENDED]
+#   - `moe_3_5b`: ~3.54B slow | ~161M active | ~130k-155k steps/week on 4x A100 (~75 GB UTF-8 bytes)
+#
+# Throughput & Multi-GPU Optimizations Enabled:
+#   1. Jagged Top-2 `torch.nn.functional.grouped_mm` BF16 Tensor Core MoE dispatch (32x less FLOPs on 64 experts)
+#   2. Cross-rank synchronized length-tier bucketing (`length_bucketing: true`, zero straggler barrier bubbles)
+#   3. Coalesced 64MB BF16/FP32 NVLink AllReduce + per-rank isolated TorchInductor caches
+#   4. 512 KB/step global byte budget (`131,072 B/GPU x 4 GPUs`, `grad_accum_steps = 1`)
+#   5. 100% compatible with Rust `dcpa-core-rs` (`vocab=256`, `k_slots=8`, `stack_depth=16`, `d_l=64`)
+
+schema_version: 2
+experiment_name: dcpa_v2_2_6b_moe64_4xa100_200k
+
+model:
+  preset: moe_2_6b
+  vocab_size: 256
+  d_s: 384
+  d_concept: 2048
+  k_slots: 8
+  d_r: 64
+  d_merge: 512
+  d_h: 8192
+  s_active: 48
+  d_l: 64
+  num_lang_domains: 6
+  num_style_domains: 5
+  num_experts: 64
+  top_k_experts: 2
+  expert_hidden: 3264
+  l_max: 12
+  tau_skip: 0.32
+  tau_halt: 0.22
+  ponder_eta: 0.5
+  lambda_moe_bal: 0.01
+  max_seg_len: 16
+  target_spike_rate: 0.10526315789473684  # 1 / 9.5
+  lambda_rate: 2.0
+  lambda_var: 1.0
+  lambda_act: 0.01
+  lambda_halt: 1.0
+  gamma_hip: 0.999
+  lambda_eta: 0.95
+  kappa_quench: 0.95
+  householder_max_writes: 32
+  householder_write_threshold: 0.05
+
+presets:
+  moe_3_5b:
+    d_s: 384
+    d_concept: 2048
+    k_slots: 8
+    d_r: 64
+    d_merge: 512
+    d_h: 8192
+    s_active: 64
+    d_l: 64
+    num_experts: 64
+    top_k_experts: 2
+    expert_hidden: 4352
+    l_max: 12
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
+    lambda_moe_bal: 0.01
+  moe_2_6b:
+    d_s: 384
+    d_concept: 2048
+    k_slots: 8
+    d_r: 64
+    d_merge: 512
+    d_h: 8192
+    s_active: 48
+    d_l: 64
+    num_experts: 64
+    top_k_experts: 2
+    expert_hidden: 3264
+    l_max: 12
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
+    lambda_moe_bal: 0.01
+  moe_1_8b:
+    d_s: 384
+    d_concept: 1536
+    k_slots: 8
+    d_r: 64
+    d_merge: 512
+    d_h: 8192
+    s_active: 48
+    d_l: 64
+    num_experts: 64
+    top_k_experts: 2
+    expert_hidden: 2944
+    l_max: 10
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
+    lambda_moe_bal: 0.01
+  moe_650m:
+    d_s: 256
+    d_concept: 1024
+    k_slots: 8
+    d_r: 32
+    d_merge: 384
+    d_h: 4096
+    s_active: 32
+    d_l: 64
+    num_experts: 32
+    top_k_experts: 2
+    expert_hidden: 3200
+    l_max: 8
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
+    lambda_moe_bal: 0.01
+  moe_210m:
+    d_s: 192
+    d_concept: 768
+    k_slots: 8
+    d_r: 32
+    d_merge: 256
+    d_h: 4096
+    s_active: 32
+    d_l: 64
+    num_experts: 32
+    top_k_experts: 2
+    expert_hidden: 1344
+    l_max: 8
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
+    lambda_moe_bal: 0.01
+
+hardware:
+  target_tokens_bytes_per_step: 524288     # 512 KB/step global = 131,072 B/GPU x 4x A100 (grad_accum=1)
+  fixed_global_batch: false                # Auto-expands if launched on 8x A100 without starving GPUs
+  auto_lr_scale_multi_gpu: true
+  bf16_grad_comm: true
+  length_bucketing: true
+  allow_tf32: true
+  bf16_autocast: true
+  use_grad_scaler: false
+  compile_mode: auto
+  compile_doc_bucket_size: 16
+  compile_cache_size_limit: 128
+  bcg_checkpoint_vram_watermark_gb: 42.0   # Activates selective BCG checkpointing only when VRAM > 42 GB
+  prefetch_depth: 4
+  prefetch_workers: 2
+
+optimizer:
+  type: AdamW
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  grad_clip_norm: 1.0
+  groups:
+    group_matrix_decay:
+      lr: 5.5e-4                           # Sqrt-batch scaled for 512 KB global step & d_concept=1536
+      weight_decay: 0.05
+    group_norm_embed_nodecay:
+      lr: 5.5e-4
+      weight_decay: 0.0
+    group_gates_thresholds:
+      lr: 1.2e-3
+      weight_decay: 0.0
+
+curriculum:
+  total_steps: 200000
+  stage_boundaries: [0, 24000, 124000, 188000, 200000]
+  stage1:
+    name: sensorimotor_spelling_autoencoder
+    model_stage: A
+    global_warmup_steps: 2500
+    max_doc_bytes: 512
+    domain_weights: [0.35, 0.35, 0.10, 0.10, 0.10]
+    wug_ratio: 0.0
+    tau_s_start: 1.0
+    tau_s_end: 0.35
+    target_rho: 9.5
+    lambda_rate: 2.0
+    lambda_var: 1.0
+    lambda_halt: 1.0
+    lambda_pc: 0.0
+    lambda_act: 0.0
+  stage2:
+    name: bottlenecked_concept_merge_and_pondering
+    model_stage: B
+    bcg_local_warmup_steps: 1500
+    local_warmup_start_factor: 0.01
+    domain_weights: [0.32, 0.36, 0.10, 0.11, 0.11]
+    wug_ratio: 0.0
+    tau_m_start: 1.5
+    tau_m_end: 0.25
+    tau_s: 0.30
+    target_rho: 9.5
+    lambda_rate: 2.0
+    lambda_var: 1.0
+    lambda_halt: 1.0
+    lambda_pc_ramp_steps: 3000
+    lambda_pc_target: 0.5
+    lambda_act_delay_steps: 1000
+    lambda_act_ramp_steps: 9000
+    lambda_act_target: 0.01
+  stage3:
+    name: cross_lingual_reasoning_writing_and_code_stack
+    model_stage: C
+    lr_cosine_end_ratio: 0.20
+    max_doc_bytes: 4096
+    domain_weights: [0.20, 0.22, 0.20, 0.19, 0.19]
+    wug_ratio: 0.0
+    tau_m: 0.25
+    tau_s: 0.25
+    target_rho: 9.5
+    lambda_rate: 2.0
+    lambda_var: 1.0
+    lambda_halt: 1.0
+    lambda_pc: 0.5
+    lambda_act: 0.01
+    code_delimiter_focal_weight: 1.5
+    code_delimiter_chars: "{}()[]:;\n"
+    broca_cq_prob: 0.20
+    cap_mix_ratio: 0.38
+  stage4:
+    name: hippocampal_oneshot_meta_plasticity
+    model_stage: D
+    hip_local_warmup_steps: 600
+    local_warmup_start_factor: 0.01
+    lr_scale: 0.25
+    max_doc_bytes: 1024
+    domain_weights: [0.20, 0.20, 0.20, 0.20, 0.20]
+    wug_ratio: 0.50
+    wug_target_weight: 3.0
+    lambda_ach_reg: 0.5
+    tau_m: 0.25
+    tau_s: 0.25
+    lambda_rate: 0.0
+    lambda_var: 0.0
+    lambda_halt: 0.0
+    lambda_pc: 0.0
+    lambda_act: 0.0
+
+watchdog:
+  window_size: 20
+  rule_bcd_warmup_steps: 500
+  compression_ratio_min: 2.5
+  compression_ratio_max: 25.0
+  concept_std_min_floor: 0.35
+  merge_entropy_min: 0.08
+  skip_batches_on_rollback: 10
+  seed_stride_on_rollback: 9973
+  rule_a_lr_multiplier: 0.7
+  rule_b_lambda_rate_multiplier: 3.0
+  rule_b_lambda_rate_cap: 50.0
+  rule_b_tau_s_floor: 0.5
+  rule_c_lambda_var_multiplier: 2.5
+  rule_c_lambda_var_cap: 25.0
+  rule_d_tau_m_delta: 0.4
+  rule_d_tau_m_cap: 1.2
+  rule_d_explore_steps: 1000
+  rule_d_uniform_mix: 0.10
+  rule_d_merge_kl_weight: 0.10
+  max_consecutive_rollbacks: 3
+  min_progress_steps_to_reset_breaker: 200
+  events_log_path: artifacts/logs/watchdog_events.jsonl
+
+checkpointing:
+  ckpt_dir: artifacts/checkpoints
+  healthy_save_every_steps: 1000
+  milestone_every_steps: 5000
+  save_every_minutes: 15.0
+  export_dir: artifacts/export
+  final_safetensors_name: dcpa_final.safetensors
+
+visual_probe:
+  console_every_steps: 50
+  probe_every_steps: 1000
+  logs_dir: artifacts/logs
+  metrics_jsonl: metrics.jsonl
+  latest_probe_md: latest_probe.md
+  probe_history_md: probe_history.md
+  val_batches_per_domain: 2

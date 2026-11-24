@@ -93,6 +93,11 @@ SOURCE_IDS: dict[str, int] = {
     "nampdn-ai/tiny-codes": 9,
     "TinyPixel/tiny-codes": 10,
     "git:serde-tokio-rayon": 11,
+    "HuggingFaceFW/fineweb-edu:sample-10BT(>=4)": 12,
+    "open-web-math/open-web-math": 13,
+    "git:rust-ecosystem-extended": 14,
+    "git:python-ecosystem": 15,
+    "wikimedia/wikipedia:20231101.ja": 16,
 }
 
 # Regexes for text hygiene & code fence extraction
@@ -711,17 +716,157 @@ def _stream_tiny_codes(lang: str) -> Iterator[tuple[str, int]]:
             gc.collect()
 
 
-def _stream_rust_git_repos() -> Iterator[tuple[str, int]]:
-    """Fallback shallow git-clone extractor for official `serde`, `tokio`, `rayon` `.rs` files."""
-    sid = SOURCE_IDS["git:serde-tokio-rayon"]
+def _stream_en_fineweb_edu_stem() -> Iterator[tuple[bytes, int]]:
+    """Stream high-score `HuggingFaceFW/fineweb-edu` (`sample-10BT`, score >= 3.8 / int_score >= 4)."""
+    from datasets import load_dataset
+
+    sid = SOURCE_IDS["HuggingFaceFW/fineweb-edu:sample-10BT(>=4)"]
+    ds = None
+    it = None
+    try:
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+        it = iter(ds)
+        for row in it:
+            int_sc = row.get("int_score")
+            sc = row.get("score")
+            if isinstance(int_sc, (int, float)):
+                if int_sc < 4:
+                    continue
+            elif isinstance(sc, (int, float)):
+                if sc < 3.8:
+                    continue
+            raw = row.get("text")
+            if not isinstance(raw, str):
+                continue
+            cleaned = normalize_and_validate_text(raw)
+            if cleaned is None:
+                continue
+            for chunk in _split_utf8_paragraphs(cleaned, min_bytes=120, max_bytes=4096):
+                yield chunk, sid
+    except Exception as exc:
+        print(f"  [WARN] fineweb-edu stream interrupted ({type(exc).__name__}: {exc}); falling back.", flush=True)
+    finally:
+        del it, ds
+        gc.collect()
+
+
+def _stream_en_open_web_math() -> Iterator[tuple[bytes, int]]:
+    """Stream STEM mathematical proofs & expositions from `open-web-math/open-web-math`."""
+    from datasets import load_dataset
+
+    sid = SOURCE_IDS["open-web-math/open-web-math"]
+    ds = None
+    it = None
+    try:
+        ds = load_dataset("open-web-math/open-web-math", split="train", streaming=True)
+        it = iter(ds)
+        for row in it:
+            raw = row.get("text")
+            if not isinstance(raw, str):
+                continue
+            cleaned = normalize_and_validate_text(raw)
+            if cleaned is None:
+                continue
+            for chunk in _split_utf8_paragraphs(cleaned, min_bytes=120, max_bytes=4096):
+                yield chunk, sid
+    except Exception as exc:
+        print(f"  [WARN] open-web-math stream interrupted ({type(exc).__name__}: {exc}); falling back.", flush=True)
+    finally:
+        del it, ds
+        gc.collect()
+
+
+def _stream_ja_wikipedia() -> Iterator[tuple[bytes, int]]:
+    """Extended Japanese prose stream (`wikimedia/wikipedia` 20231101.ja) for multi-GB quotas."""
+    from datasets import load_dataset
+
+    sid = SOURCE_IDS["wikimedia/wikipedia:20231101.ja"]
+    ds = None
+    it = None
+    try:
+        ds = load_dataset("wikimedia/wikipedia", name="20231101.ja", split="train", streaming=True)
+        it = iter(ds)
+        for row in it:
+            raw = row.get("text")
+            if not isinstance(raw, str):
+                continue
+            cleaned = normalize_and_validate_text(raw)
+            if cleaned is None or not _RE_KANA.search(cleaned):
+                continue
+            for chunk in _split_utf8_paragraphs(cleaned, min_bytes=120, max_bytes=4096):
+                txt = chunk.decode("utf-8", errors="strict").strip()
+                if _RE_KANA.search(txt) and txt.endswith(_JA_VALID_ENDINGS):
+                    yield chunk, sid
+    except Exception as exc:
+        print(f"  [WARN] ja-wikipedia stream interrupted ({type(exc).__name__}: {exc}); advancing.", flush=True)
+    finally:
+        del it, ds
+        gc.collect()
+
+
+def _stream_python_git_repos() -> Iterator[tuple[str, int]]:
+    """Extended shallow git-clone extractor for idiomatic pure-Python ecosystems."""
+    sid = SOURCE_IDS["git:python-ecosystem"]
     repos = (
-        "https://github.com/serde-rs/serde.git",
-        "https://github.com/tokio-rs/tokio.git",
-        "https://github.com/rayon-rs/rayon.git",
+        "https://github.com/pallets/click.git",
+        "https://github.com/pallets/flask.git",
+        "https://github.com/psf/requests.git",
+        "https://github.com/encode/httpx.git",
+        "https://github.com/Textualize/rich.git",
+        "https://github.com/pytest-dev/pytest.git",
+        "https://github.com/pydantic/pydantic.git",
+        "https://github.com/fastapi/fastapi.git",
     )
-    tmp_root = Path(tempfile.mkdtemp(prefix="dcpa_rust_repos_"))
+    tmp_root = Path(tempfile.mkdtemp(prefix="dcpa_py_repos_"))
     try:
         for url in repos:
+            name = url.rsplit("/", 1)[-1].removesuffix(".git")
+            dest = tmp_root / name
+            print(f"  -> [python] shallow cloning {url}...", flush=True)
+            res = subprocess.run(
+                ["git", "clone", "--depth", "1", "--quiet", url, str(dest)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if res.returncode != 0:
+                print(f"  [WARN] git clone {url} failed: {res.stderr.strip()}", flush=True)
+                continue
+            for py_file in sorted(dest.rglob("*.py")):
+                try:
+                    raw = py_file.read_text(encoding="utf-8", errors="strict")
+                except Exception:
+                    continue
+                stripped = raw.strip()
+                if len(stripped) < 64:
+                    continue
+                yield stripped, sid
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def _stream_rust_git_repos(extended: bool = False) -> Iterator[tuple[str, int]]:
+    """Shallow git-clone extractor for official `serde`, `tokio`, `rayon` (plus extended crates)."""
+    core_repos = (
+        ("https://github.com/serde-rs/serde.git", SOURCE_IDS["git:serde-tokio-rayon"]),
+        ("https://github.com/tokio-rs/tokio.git", SOURCE_IDS["git:serde-tokio-rayon"]),
+        ("https://github.com/rayon-rs/rayon.git", SOURCE_IDS["git:serde-tokio-rayon"]),
+    )
+    ext_sid = SOURCE_IDS["git:rust-ecosystem-extended"]
+    ext_repos = (
+        ("https://github.com/BurntSushi/ripgrep.git", ext_sid),
+        ("https://github.com/dtolnay/syn.git", ext_sid),
+        ("https://github.com/dtolnay/anyhow.git", ext_sid),
+        ("https://github.com/clap-rs/clap.git", ext_sid),
+        ("https://github.com/crossbeam-rs/crossbeam.git", ext_sid),
+        ("https://github.com/hyperium/http.git", ext_sid),
+        ("https://github.com/tokio-rs/axum.git", ext_sid),
+        ("https://github.com/rust-lang/regex.git", ext_sid),
+    )
+    repos = core_repos + ext_repos if extended else core_repos
+    tmp_root = Path(tempfile.mkdtemp(prefix="dcpa_rust_repos_"))
+    try:
+        for url, sid in repos:
             name = url.rsplit("/", 1)[-1].removesuffix(".git")
             dest = tmp_root / name
             print(f"  -> [rust] shallow cloning {url}...", flush=True)
@@ -749,10 +894,10 @@ def _stream_rust_git_repos() -> Iterator[tuple[str, int]]:
 
 def _assert_local_output_dir(out_dir: Path) -> None:
     resolved = str(out_dir.resolve())
-    if resolved.startswith("/content/drive"):
+    if resolved.startswith(("/content/drive", "/mnt/gdrive")):
         raise ValueError(
-            f"Refusing to build binary shards directly on Google Drive FUSE mount ({resolved}). "
-            "Build on local NVMe (e.g. /content/nvme_cache/data) and archive to Drive afterwards."
+            f"Refusing to build binary shards directly on network/FUSE mount ({resolved}). "
+            "Build on local NVMe (e.g. /workspace/nvme_cache/data) and archive afterwards."
         )
 
 
@@ -780,22 +925,264 @@ class _DomainAccum:
         return self.train_bytes >= self.train_target and self.val_bytes >= self.val_target
 
 
+def _populate_single_domain(
+    lang_id: int,
+    acc: _DomainAccum,
+    emit_fn: Any,
+    validator: CodeASTValidator,
+    *,
+    smoke_quota: bool,
+    scale_factor: float,
+    stem_upgrade: bool,
+) -> dict[str, Any]:
+    """Populate a single `lang_id` (`0..4`) via `emit_fn(acc, doc_bytes, source_id, max_depth)`."""
+    t0 = time.perf_counter()
+    use_stem = stem_upgrade or (not smoke_quota and scale_factor > 1.5)
+    total_target = acc.train_target + acc.val_target
+
+    if lang_id == 0:
+        if use_stem:
+            babylm_cap = int(0.15 * total_target)
+            fw_edu_cap = int(0.80 * total_target)
+            print("  -> [en | lang_id=0] streaming nilq/babylm-10M (15% syntax anchor)...", flush=True)
+            for doc_b, sid in _stream_en_babylm():
+                emit_fn(acc, doc_b, sid, 0)
+                if (acc.train_bytes + acc.val_bytes) >= babylm_cap or acc.done:
+                    break
+            if not acc.done:
+                print("  -> [en | lang_id=0] streaming HuggingFaceFW/fineweb-edu (score>=4 STEM 65%)...", flush=True)
+                for doc_b, sid in _stream_en_fineweb_edu_stem():
+                    emit_fn(acc, doc_b, sid, 0)
+                    if (acc.train_bytes + acc.val_bytes) >= fw_edu_cap or acc.done:
+                        break
+            if not acc.done:
+                print("  -> [en | lang_id=0] streaming open-web-math/open-web-math (20% proofs)...", flush=True)
+                for doc_b, sid in _stream_en_open_web_math():
+                    emit_fn(acc, doc_b, sid, 0)
+                    if acc.done:
+                        break
+        else:
+            babylm_cap = int(0.50 * total_target) if smoke_quota else total_target
+            print("  -> [en | lang_id=0] streaming nilq/babylm-10M...", flush=True)
+            for doc_b, sid in _stream_en_babylm():
+                emit_fn(acc, doc_b, sid, 0)
+                if (acc.train_bytes + acc.val_bytes) >= babylm_cap or acc.done:
+                    break
+        if not acc.done:
+            print("  -> [en | lang_id=0] topping up via roneneldan/TinyStories...", flush=True)
+            for doc_b, sid in _stream_en_tinystories():
+                emit_fn(acc, doc_b, sid, 0)
+                if acc.done:
+                    break
+        return _finalize_domain_stat(acc, time.perf_counter() - t0)
+
+    if lang_id == 1:
+        v21_cap = int(total_target * (130.0 / 180.0))
+        v21_shards = 3 if smoke_quota else min(400, max(40, int(40 * scale_factor)))
+        print("  -> [zh | lang_id=1] streaming opencsg/Fineweb-Edu-Chinese-V2.1 (4_5/*.parquet)...", flush=True)
+        for doc_b, sid in _stream_zh_fineweb_v21(max_shards=v21_shards):
+            emit_fn(acc, doc_b, sid, 0)
+            if (acc.train_bytes + acc.val_bytes) >= v21_cap or acc.done:
+                break
+        if not acc.done:
+            print("  -> [zh | lang_id=1] streaming opencsg/Fineweb-Edu-Chinese-V3 (HTTP tar.gz)...", flush=True)
+            for doc_b, sid in _stream_zh_fineweb_v3():
+                emit_fn(acc, doc_b, sid, 0)
+                if acc.done:
+                    break
+        if not acc.done:
+            for doc_b, sid in _stream_zh_fineweb_v21(max_shards=min(500, v21_shards + 40)):
+                emit_fn(acc, doc_b, sid, 0)
+                if acc.done:
+                    break
+        return _finalize_domain_stat(acc, time.perf_counter() - t0)
+
+    if lang_id == 2:
+        ja_mono_cap = int(total_target * 0.50)
+        ja_enja_cap = int(total_target * 0.85)
+        print("  -> [ja | lang_id=2] streaming Helsinki-NLP/opus-100 (en-ja monolingual 50%)...", flush=True)
+        for doc_b, sid in _stream_ja_opus("ja_mono"):
+            emit_fn(acc, doc_b, sid, 0)
+            if (acc.train_bytes + acc.val_bytes) >= ja_mono_cap or acc.done:
+                break
+        if not acc.done:
+            print("  -> [ja | lang_id=2] streaming Helsinki-NLP/opus-100 (en-ja bilingual pairs)...", flush=True)
+            for doc_b, sid in _stream_ja_opus("en_ja_pair"):
+                emit_fn(acc, doc_b, sid, 0)
+                if (acc.train_bytes + acc.val_bytes) >= ja_enja_cap or acc.done:
+                    break
+        if not acc.done:
+            print("  -> [ja | lang_id=2] streaming Helsinki-NLP/opus-100 (en-zh cross-order pairs)...", flush=True)
+            for doc_b, sid in _stream_ja_opus("en_zh_pair"):
+                emit_fn(acc, doc_b, sid, 0)
+                if acc.done:
+                    break
+        if not acc.done and scale_factor > 1.5:
+            print("  -> [ja | lang_id=2] topping up via wikimedia/wikipedia (20231101.ja)...", flush=True)
+            for doc_b, sid in _stream_ja_wikipedia():
+                emit_fn(acc, doc_b, sid, 0)
+                if acc.done:
+                    break
+        return _finalize_domain_stat(acc, time.perf_counter() - t0)
+
+    if lang_id == 3:
+        for raw_code, sid in _stream_tiny_codes("python"):
+            acc.code_candidates += 1
+            cleaned = normalize_and_validate_text(raw_code)
+            if cleaned is None:
+                acc.code_rejected += 1
+                continue
+            code_b = cleaned.encode("utf-8", errors="strict")
+            ok, depth = validator.validate("python", code_b)
+            if not ok:
+                acc.code_rejected += 1
+                continue
+            emit_fn(acc, code_b, sid, depth)
+            if acc.done:
+                break
+        if not acc.done and scale_factor > 1.5:
+            for raw_code, sid in _stream_python_git_repos():
+                acc.code_candidates += 1
+                cleaned = normalize_and_validate_text(raw_code)
+                if cleaned is None:
+                    acc.code_rejected += 1
+                    continue
+                code_b = cleaned.encode("utf-8", errors="strict")
+                ok, depth = validator.validate("python", code_b)
+                if not ok:
+                    acc.code_rejected += 1
+                    continue
+                emit_fn(acc, code_b, sid, depth)
+                if acc.done:
+                    break
+        return _finalize_domain_stat(acc, time.perf_counter() - t0)
+
+    if lang_id == 4:
+        for raw_code, sid in _stream_tiny_codes("rust"):
+            acc.code_candidates += 1
+            cleaned = normalize_and_validate_text(raw_code)
+            if cleaned is None:
+                acc.code_rejected += 1
+                continue
+            code_b = cleaned.encode("utf-8", errors="strict")
+            ok, depth = validator.validate("rust", code_b)
+            if not ok:
+                acc.code_rejected += 1
+                continue
+            emit_fn(acc, code_b, sid, depth)
+            if acc.done:
+                break
+        if not acc.done:
+            print("  -> [rust | lang_id=4] topping up from official Rust git crates...", flush=True)
+            for raw_code, sid in _stream_rust_git_repos(extended=(scale_factor > 1.2 or stem_upgrade)):
+                acc.code_candidates += 1
+                cleaned = normalize_and_validate_text(raw_code)
+                if cleaned is None:
+                    acc.code_rejected += 1
+                    continue
+                code_b = cleaned.encode("utf-8", errors="strict")
+                ok, depth = validator.validate("rust", code_b)
+                if not ok:
+                    acc.code_rejected += 1
+                    continue
+                emit_fn(acc, code_b, sid, depth)
+                if acc.done:
+                    break
+        return _finalize_domain_stat(acc, time.perf_counter() - t0)
+
+    raise ValueError(f"Unknown lang_id={lang_id}")
+
+
+def _worker_spool_domain(args_tuple: tuple[Any, ...]) -> dict[str, Any]:
+    """Subprocess worker that streams & AST-gates a single domain into a temporary spool file."""
+    lang_id, train_target, val_target, spool_dir_str, seed, smoke_quota, scale_factor, stem_upgrade = args_tuple
+    spool_dir = Path(spool_dir_str)
+    spool_dir.mkdir(parents=True, exist_ok=True)
+    spool_bin = spool_dir / f"dom_{lang_id}.bin"
+    spool_rec = spool_dir / f"dom_{lang_id}.rec"
+
+    validator = CodeASTValidator()
+    acc = _DomainAccum(lang_id, DOMAIN_NAMES[lang_id], train_target, val_target)
+    local_hashes: set[bytes] = set()
+    hash_person = f"dcpa{seed}".encode("ascii")[:16]
+    val_mod = 10 if smoke_quota else 20
+    source_id_to_name = {v: k for k, v in SOURCE_IDS.items()}
+    spool_offset = 0
+
+    with spool_bin.open("wb") as f_bin, spool_rec.open("wb") as f_rec:
+        def _spool_emit(a: _DomainAccum, doc_bytes: bytes, source_id: int, max_depth: int) -> bool:
+            nonlocal spool_offset
+            if a.done or not doc_bytes:
+                return False
+            digest = hashlib.blake2b(doc_bytes, digest_size=8, person=hash_person).digest()
+            if digest in local_hashes:
+                a.dup_rejected += 1
+                return False
+            local_hashes.add(digest)
+            rec_len = len(doc_bytes)
+            bucket_hit = (int.from_bytes(digest[:4], "little") % val_mod) == 0
+            if a.val_bytes < a.val_target and (bucket_hit or a.train_bytes >= a.train_target):
+                a.val_bytes += rec_len
+                a.val_docs += 1
+            elif a.train_bytes < a.train_target:
+                a.train_bytes += rec_len
+                a.train_docs += 1
+            else:
+                return False
+            f_bin.write(doc_bytes)
+            f_rec.write(struct.pack("<QIBB", spool_offset, rec_len, source_id, min(max_depth, 255)))
+            spool_offset += rec_len
+            sname = source_id_to_name.get(source_id, f"src_{source_id}")
+            if sname not in a.sources_used:
+                a.sources_used.append(sname)
+            return True
+
+        stat = _populate_single_domain(
+            lang_id,
+            acc,
+            _spool_emit,
+            validator,
+            smoke_quota=smoke_quota,
+            scale_factor=scale_factor,
+            stem_upgrade=stem_upgrade,
+        )
+    return {
+        "lang_id": lang_id,
+        "code_candidates": acc.code_candidates,
+        "code_rejected": acc.code_rejected,
+        "dup_rejected": acc.dup_rejected,
+        "elapsed_sec": stat["elapsed_sec"],
+        "spool_bin": str(spool_bin),
+        "spool_rec": str(spool_rec),
+    }
+
+
 def build_corpus(
     out_dir: str | Path = "artifacts/data",
     smoke_quota: bool = False,
     seed: int = 2026,
     allow_drive_output: bool = False,
+    scale_factor: float = 1.0,
+    stem_upgrade: bool = False,
+    workers: int = 1,
 ) -> dict[str, Any]:
     """Stream, filter, deduplicate, and write 5-domain DCPA `.bin/.idx/.meta.json` shards."""
     out_path = Path(out_dir)
     if not allow_drive_output:
         _assert_local_output_dir(out_path)
     out_path.mkdir(parents=True, exist_ok=True)
+    if scale_factor <= 0.0:
+        raise ValueError(f"scale_factor must be > 0, got {scale_factor}")
 
     validator = CodeASTValidator()
-    mode = "smoke" if smoke_quota else "full"
-    train_quotas = SMOKE_TRAIN_QUOTA_BYTES if smoke_quota else FULL_TRAIN_QUOTA_BYTES
-    val_quotas = SMOKE_VAL_QUOTA_BYTES if smoke_quota else FULL_VAL_QUOTA_BYTES
+    mode = "smoke" if smoke_quota else ("full_stem" if (stem_upgrade or scale_factor > 1.5) else "full")
+    if smoke_quota:
+        train_quotas = dict(SMOKE_TRAIN_QUOTA_BYTES)
+        val_quotas = dict(SMOKE_VAL_QUOTA_BYTES)
+    else:
+        val_scale = min(float(scale_factor), 8.0)
+        train_quotas = {lid: max(64 * 1024, int(round(q * scale_factor))) for lid, q in FULL_TRAIN_QUOTA_BYTES.items()}
+        val_quotas = {lid: max(16 * 1024, int(round(q * val_scale))) for lid, q in FULL_VAL_QUOTA_BYTES.items()}
 
     train_bin_path = out_path / "train.bin"
     train_idx_path = out_path / "train.idx"
@@ -811,7 +1198,8 @@ def build_corpus(
 
     t_global = time.perf_counter()
     print(
-        f"[build_corpus] mode={mode} | out_dir={out_path} | tree_sitter={validator.tree_sitter_active} | "
+        f"[build_corpus] mode={mode} | scale={scale_factor:.2f}x | workers={max(1, int(workers))} | "
+        f"out_dir={out_path} | tree_sitter={validator.tree_sitter_active} | "
         f"target_train={sum(train_quotas.values()) / (1024*1024):.1f} MB, "
         f"target_val={sum(val_quotas.values()) / (1024*1024):.1f} MB",
         flush=True,
@@ -872,136 +1260,87 @@ def build_corpus(
                 acc.sources_used.append(sname)
             return True
 
-        # ---------------------------------------------------------------------
-        # lang_id = 0: English (nilq/babylm-10M -> roneneldan/TinyStories)
-        # ---------------------------------------------------------------------
-        t0 = time.perf_counter()
-        acc_en = _DomainAccum(0, "en", train_quotas[0], val_quotas[0])
-        babylm_cap = int(0.50 * (acc_en.train_target + acc_en.val_target)) if smoke_quota else acc_en.train_target + acc_en.val_target
-        print(f"  -> [en | lang_id=0] streaming nilq/babylm-10M...", flush=True)
-        for doc_b, sid in _stream_en_babylm():
-            _emit_doc(acc_en, doc_b, sid, 0)
-            if (acc_en.train_bytes + acc_en.val_bytes) >= babylm_cap or acc_en.done:
-                break
-        if not acc_en.done:
-            print(f"  -> [en | lang_id=0] topping up via roneneldan/TinyStories...", flush=True)
-            for doc_b, sid in _stream_en_tinystories():
-                _emit_doc(acc_en, doc_b, sid, 0)
-                if acc_en.done:
-                    break
-        domain_stats["en"] = _finalize_domain_stat(acc_en, time.perf_counter() - t0)
+        if int(workers) > 1:
+            from concurrent.futures import ProcessPoolExecutor
 
-        # ---------------------------------------------------------------------
-        # lang_id = 1: Chinese (V2.1 4_5/*.parquet 130/180 + V3 50/180)
-        # ---------------------------------------------------------------------
-        t0 = time.perf_counter()
-        acc_zh = _DomainAccum(1, "zh", train_quotas[1], val_quotas[1])
-        zh_total_target = acc_zh.train_target + acc_zh.val_target
-        v21_cap = int(zh_total_target * (130.0 / 180.0))
-        v21_shards = 3 if smoke_quota else 40
-        print(f"  -> [zh | lang_id=1] streaming opencsg/Fineweb-Edu-Chinese-V2.1 (4_5/*.parquet)...", flush=True)
-        for doc_b, sid in _stream_zh_fineweb_v21(max_shards=v21_shards):
-            _emit_doc(acc_zh, doc_b, sid, 0)
-            if (acc_zh.train_bytes + acc_zh.val_bytes) >= v21_cap or acc_zh.done:
-                break
-        if not acc_zh.done:
-            print(f"  -> [zh | lang_id=1] streaming opencsg/Fineweb-Edu-Chinese-V3 (HTTP tar.gz)...", flush=True)
-            for doc_b, sid in _stream_zh_fineweb_v3():
-                _emit_doc(acc_zh, doc_b, sid, 0)
-                if acc_zh.done:
-                    break
-        # Fallback top-up from V2.1 if V3 HTTP stream closed early
-        if not acc_zh.done:
-            for doc_b, sid in _stream_zh_fineweb_v21(max_shards=v21_shards + 20):
-                _emit_doc(acc_zh, doc_b, sid, 0)
-                if acc_zh.done:
-                    break
-        domain_stats["zh"] = _finalize_domain_stat(acc_zh, time.perf_counter() - t0)
+            spool_dir = out_path / f".tmp_spool_{os.getpid()}"
+            spool_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                tasks = [
+                    (
+                        lid,
+                        train_quotas[lid],
+                        val_quotas[lid],
+                        str(spool_dir),
+                        seed,
+                        smoke_quota,
+                        float(scale_factor),
+                        bool(stem_upgrade),
+                    )
+                    for lid in range(5)
+                ]
+                with ProcessPoolExecutor(max_workers=min(5, int(workers))) as pool:
+                    worker_results = list(pool.map(_worker_spool_domain, tasks))
 
-        # ---------------------------------------------------------------------
-        # lang_id = 2: Japanese (50% pure JA mono + 50% bilingual aligned pairs)
-        # ---------------------------------------------------------------------
-        t0 = time.perf_counter()
-        acc_ja = _DomainAccum(2, "ja", train_quotas[2], val_quotas[2])
-        ja_total_target = acc_ja.train_target + acc_ja.val_target
-        ja_mono_cap = int(ja_total_target * 0.50)
-        ja_enja_cap = int(ja_total_target * 0.85)  # 50% mono + 35% EN->JA + 15% EN->ZH
-        print(f"  -> [ja | lang_id=2] streaming Helsinki-NLP/opus-100 (en-ja monolingual 50%)...", flush=True)
-        for doc_b, sid in _stream_ja_opus("ja_mono"):
-            _emit_doc(acc_ja, doc_b, sid, 0)
-            if (acc_ja.train_bytes + acc_ja.val_bytes) >= ja_mono_cap or acc_ja.done:
-                break
-        if not acc_ja.done:
-            print(f"  -> [ja | lang_id=2] streaming Helsinki-NLP/opus-100 (en-ja bilingual pairs)...", flush=True)
-            for doc_b, sid in _stream_ja_opus("en_ja_pair"):
-                _emit_doc(acc_ja, doc_b, sid, 0)
-                if (acc_ja.train_bytes + acc_ja.val_bytes) >= ja_enja_cap or acc_ja.done:
-                    break
-        if not acc_ja.done:
-            print(f"  -> [ja | lang_id=2] streaming Helsinki-NLP/opus-100 (en-zh cross-order pairs)...", flush=True)
-            for doc_b, sid in _stream_ja_opus("en_zh_pair"):
-                _emit_doc(acc_ja, doc_b, sid, 0)
-                if acc_ja.done:
-                    break
-        domain_stats["ja"] = _finalize_domain_stat(acc_ja, time.perf_counter() - t0)
-
-        # ---------------------------------------------------------------------
-        # lang_id = 3: Python (tiny-codes + strict 4-part tree-sitter hard gate)
-        # ---------------------------------------------------------------------
-        t0 = time.perf_counter()
-        acc_py = _DomainAccum(3, "python", train_quotas[3], val_quotas[3])
-        for raw_code, sid in _stream_tiny_codes("python"):
-            acc_py.code_candidates += 1
-            cleaned = normalize_and_validate_text(raw_code)
-            if cleaned is None:
-                acc_py.code_rejected += 1
-                continue
-            code_b = cleaned.encode("utf-8", errors="strict")
-            ok, depth = validator.validate("python", code_b)
-            if not ok:
-                acc_py.code_rejected += 1
-                continue
-            _emit_doc(acc_py, code_b, sid, depth)
-            if acc_py.done:
-                break
-        domain_stats["python"] = _finalize_domain_stat(acc_py, time.perf_counter() - t0)
-
-        # ---------------------------------------------------------------------
-        # lang_id = 4: Rust (tiny-codes + auto serde/tokio/rayon shallow git clone)
-        # ---------------------------------------------------------------------
-        t0 = time.perf_counter()
-        acc_rs = _DomainAccum(4, "rust", train_quotas[4], val_quotas[4])
-        for raw_code, sid in _stream_tiny_codes("rust"):
-            acc_rs.code_candidates += 1
-            cleaned = normalize_and_validate_text(raw_code)
-            if cleaned is None:
-                acc_rs.code_rejected += 1
-                continue
-            code_b = cleaned.encode("utf-8", errors="strict")
-            ok, depth = validator.validate("rust", code_b)
-            if not ok:
-                acc_rs.code_rejected += 1
-                continue
-            _emit_doc(acc_rs, code_b, sid, depth)
-            if acc_rs.done:
-                break
-        if not acc_rs.done:
-            print(f"  -> [rust | lang_id=4] topping up from serde/tokio/rayon shallow git clones...", flush=True)
-            for raw_code, sid in _stream_rust_git_repos():
-                acc_rs.code_candidates += 1
-                cleaned = normalize_and_validate_text(raw_code)
-                if cleaned is None:
-                    acc_rs.code_rejected += 1
-                    continue
-                code_b = cleaned.encode("utf-8", errors="strict")
-                ok, depth = validator.validate("rust", code_b)
-                if not ok:
-                    acc_rs.code_rejected += 1
-                    continue
-                _emit_doc(acc_rs, code_b, sid, depth)
-                if acc_rs.done:
-                    break
-        domain_stats["rust"] = _finalize_domain_stat(acc_rs, time.perf_counter() - t0)
+                # Deterministic merge in lang_id = 0..4 order with global leak-free seen_hashes check
+                rec_struct = struct.Struct("<QIBB")
+                for res in sorted(worker_results, key=lambda r: int(r["lang_id"])):
+                    lid = int(res["lang_id"])
+                    dname = DOMAIN_NAMES[lid]
+                    acc = _DomainAccum(
+                        lid,
+                        dname,
+                        train_quotas[lid],
+                        val_quotas[lid],
+                        code_candidates=int(res["code_candidates"]),
+                        code_rejected=int(res["code_rejected"]),
+                        dup_rejected=int(res["dup_rejected"]),
+                    )
+                    sp_bin = Path(res["spool_bin"])
+                    sp_rec = Path(res["spool_rec"])
+                    with sp_bin.open("rb") as fb, sp_rec.open("rb") as fr:
+                        while buf := fr.read(rec_struct.size):
+                            off, rlen, sid, depth = rec_struct.unpack(buf)
+                            fb.seek(off)
+                            doc_b = fb.read(rlen)
+                            _emit_doc(acc, doc_b, sid, depth)
+                    total_b = acc.train_bytes + acc.val_bytes
+                    total_d = acc.train_docs + acc.val_docs
+                    avg_len = (total_b / total_d) if total_d > 0 else 0.0
+                    rej_pct = (
+                        (100.0 * acc.code_rejected / acc.code_candidates) if acc.code_candidates > 0 else 0.0
+                    )
+                    domain_stats[dname] = {
+                        "lang_id": lid,
+                        "name": dname,
+                        "train_docs": acc.train_docs,
+                        "train_bytes": acc.train_bytes,
+                        "val_docs": acc.val_docs,
+                        "val_bytes": acc.val_bytes,
+                        "total_bytes": total_b,
+                        "avg_doc_bytes": round(avg_len, 2),
+                        "code_candidates": acc.code_candidates,
+                        "code_rejected": acc.code_rejected,
+                        "code_rejection_rate_pct": round(rej_pct, 2) if acc.code_candidates > 0 else None,
+                        "dup_rejected": acc.dup_rejected,
+                        "sources_used": acc.sources_used,
+                        "elapsed_sec": res["elapsed_sec"],
+                    }
+            finally:
+                shutil.rmtree(spool_dir, ignore_errors=True)
+        else:
+            for lid in range(5):
+                dname = DOMAIN_NAMES[lid]
+                acc = _DomainAccum(lid, dname, train_quotas[lid], val_quotas[lid])
+                domain_stats[dname] = _populate_single_domain(
+                    lid,
+                    acc,
+                    _emit_doc,
+                    validator,
+                    smoke_quota=smoke_quota,
+                    scale_factor=float(scale_factor),
+                    stem_upgrade=bool(stem_upgrade),
+                )
 
     def _file_blake2b(path: Path) -> str:
         h = hashlib.blake2b()
@@ -1014,6 +1353,8 @@ def build_corpus(
     train_meta = {
         "split": "train",
         "mode": mode,
+        "scale_factor": float(scale_factor),
+        "stem_upgrade": bool(stem_upgrade),
         "seed": seed,
         "idx_format": IDX_RECORD_FMT,
         "idx_record_bytes": IDX_RECORD_SIZE,
@@ -1034,6 +1375,8 @@ def build_corpus(
     val_meta = {
         "split": "val",
         "mode": mode,
+        "scale_factor": float(scale_factor),
+        "stem_upgrade": bool(stem_upgrade),
         "seed": seed,
         "idx_format": IDX_RECORD_FMT,
         "idx_record_bytes": IDX_RECORD_SIZE,
@@ -1053,6 +1396,8 @@ def build_corpus(
     }
     combined_meta = {
         "mode": mode,
+        "scale_factor": float(scale_factor),
+        "stem_upgrade": bool(stem_upgrade),
         "seed": seed,
         "tree_sitter_active": validator.tree_sitter_active,
         "idx_format": IDX_RECORD_FMT,
@@ -1130,6 +1475,23 @@ def main() -> None:
         action="store_true",
         help="Local M3 Pro smoke mode: stream 2 MB per lang_id (~10 MB total).",
     )
+    ap.add_argument(
+        "--scale-factor",
+        type=float,
+        default=1.0,
+        help="Quota multiplier over default 430 MB train build (e.g. 24.0 -> ~10.3 GB).",
+    )
+    ap.add_argument(
+        "--stem-upgrade",
+        action="store_true",
+        help="Upgrade English stream to FineWeb-Edu (score>=4) + OpenWebMath + extended Git code.",
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel per-domain workers (up to 5) for multi-core Vast.ai NVMe builds.",
+    )
     ap.add_argument("--seed", type=int, default=2026)
     args = ap.parse_args()
 
@@ -1137,6 +1499,9 @@ def main() -> None:
         out_dir=args.out_dir,
         smoke_quota=args.smoke_quota,
         seed=args.seed,
+        scale_factor=args.scale_factor,
+        stem_upgrade=args.stem_upgrade,
+        workers=args.workers,
     )
 
 

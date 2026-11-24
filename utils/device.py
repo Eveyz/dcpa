@@ -51,9 +51,12 @@ class HardwareProfile:
     grad_accum_steps: int
     target_tokens_bytes_per_step: int
     use_bf16: bool
+    device_index: Optional[int] = None
 
     @property
     def device(self) -> torch.device:
+        if self.device_type == "cuda" and self.device_index is not None:
+            return torch.device("cuda", int(self.device_index))
         return torch.device(self.device_type)
 
     def to_dict(self) -> dict[str, Any]:
@@ -74,35 +77,54 @@ def configure_mps_fallback(device: torch.device) -> None:
         os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 
+def _resolve_cuda_device(explicit_index: Optional[int] = None) -> torch.device:
+    if explicit_index is not None:
+        return torch.device("cuda", int(explicit_index))
+    world_sz = int(os.environ.get("WORLD_SIZE", "1") or "1")
+    if world_sz > 1 and "LOCAL_RANK" in os.environ:
+        return torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    return torch.device("cuda")
+
+
 def get_device(preferred: str = "auto", deterministic: bool = False) -> torch.device:
-    """Resolve compute device safely across CUDA, Apple MPS, and CPU.
+    """Resolve compute device safely across CUDA (incl. `cuda:N` / `LOCAL_RANK`), Apple MPS, and CPU.
 
     Args:
-      preferred: `"auto"`, `"cuda"`, `"mps"`, or `"cpu"`.
+      preferred: `"auto"`, `"cuda"`, `"cuda:<idx>"`, `"mps"`, or `"cpu"`.
       deterministic: When True, never select MPS; use `"cuda"` if available (and requested/auto),
         otherwise force pure `"cpu"` to guarantee exact float32 reproducibility.
     """
     pref = preferred.strip().lower()
-    if pref not in ("auto", "cuda", "mps", "cpu"):
+    cuda_idx: Optional[int] = None
+    if pref.startswith("cuda:"):
+        try:
+            cuda_idx = int(pref.split(":", 1)[1])
+        except ValueError as exc:
+            raise ValueError(f"Unsupported CUDA device string: {preferred!r}") from exc
+        pref_base = "cuda"
+    else:
+        pref_base = pref
+
+    if pref_base not in ("auto", "cuda", "mps", "cpu"):
         raise ValueError(f"Unsupported device preference: {preferred!r}")
 
     if deterministic:
-        if pref in ("auto", "cuda") and is_cuda_available():
-            return torch.device("cuda")
+        if pref_base in ("auto", "cuda") and is_cuda_available():
+            return _resolve_cuda_device(cuda_idx)
         return torch.device("cpu")
 
-    if pref == "auto":
+    if pref_base == "auto":
         if is_cuda_available():
-            dev = torch.device("cuda")
+            dev = _resolve_cuda_device(None)
         elif is_mps_available():
             dev = torch.device("mps")
         else:
             dev = torch.device("cpu")
-    elif pref == "cuda":
+    elif pref_base == "cuda":
         if not is_cuda_available():
             raise RuntimeError("CUDA device explicitly requested, but torch.cuda.is_available() is False.")
-        dev = torch.device("cuda")
-    elif pref == "mps":
+        dev = _resolve_cuda_device(cuda_idx)
+    elif pref_base == "mps":
         if not is_mps_available():
             raise RuntimeError("MPS device explicitly requested, but torch.backends.mps.is_available() is False.")
         dev = torch.device("mps")
@@ -341,13 +363,26 @@ def detect_hardware_profile(
             except Exception:
                 pass
         bf16_ok = bool(torch.cuda.is_bf16_supported())
-        return select_hardware_tier(
+        prof = select_hardware_tier(
             device_type="cuda",
             vram_gb=vram_gb,
             device_name=name,
             target_tokens_bytes_per_step=target_tokens_bytes_per_step,
             bf16_supported=bf16_ok,
         )
+        if device.index is not None:
+            return HardwareProfile(
+                device_type=prof.device_type,
+                device_name=prof.device_name,
+                vram_gb=prof.vram_gb,
+                tier=prof.tier,
+                micro_batch_bytes=prof.micro_batch_bytes,
+                grad_accum_steps=prof.grad_accum_steps,
+                target_tokens_bytes_per_step=prof.target_tokens_bytes_per_step,
+                use_bf16=prof.use_bf16,
+                device_index=int(device.index),
+            )
+        return prof
     return select_hardware_tier(
         device_type=device.type,
         vram_gb=0.0,

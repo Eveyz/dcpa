@@ -139,6 +139,29 @@ class TwoLayerSwiGLUExpert(nn.Module):
         return x + self.w_down2(h2)
 
 
+_CUDA_SM80_CACHE: dict[int, bool] = {}
+
+
+def _device_supports_grouped_mm(device: torch.device, allow_cpu_bf16: bool = False) -> bool:
+    """Return True if `F.grouped_mm` BF16 grouped GEMM is supported on `device` (SM >= 80 on CUDA)."""
+    if not hasattr(F, "grouped_mm"):
+        return False
+    if device.type == "cuda":
+        idx = 0 if device.index is None else int(device.index)
+        cached = _CUDA_SM80_CACHE.get(idx)
+        if cached is None:
+            try:
+                major, _ = torch.cuda.get_device_capability(idx)
+                cached = bool(major >= 8)
+            except Exception:
+                cached = False
+            _CUDA_SM80_CACHE[idx] = cached
+        return cached
+    if device.type == "cpu" and allow_cpu_bf16:
+        return True
+    return False
+
+
 class SparseMicroMoE(nn.Module):
     """Top-2 sparse micro-experts dispatched strictly on active high-surprisal samples."""
 
@@ -147,6 +170,7 @@ class SparseMicroMoE(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.eps = eps
+        self.allow_cpu_grouped_mm: bool = False
         self.router = nn.Linear(d_model, num_experts, bias=False)
         self.experts = nn.ModuleList(
             [TwoLayerSwiGLUExpert(d_model, hidden_dim, eps=eps) for _ in range(num_experts)]
@@ -155,25 +179,57 @@ class SparseMicroMoE(nn.Module):
     def pack_weights(
         self, dtype: Optional[torch.dtype] = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pack all E expert weights into 4 contiguous batched-GEMM tensors (preserves state_dict 100%).
+        """Pack all E expert weights into 4 column-major transposed 3D tensors (preserves state_dict 100%).
 
-        Returns `(w_gu1 [E, D, 2*H], w_d1 [E, H, D], w_gu2 [E, D, 2*H], w_d2 [E, H, D])`.
-        Calling once per `DCPAModel.forward` avoids E*6 sequential GEMMs AND redundant fp32->bf16 casts!
+        Returns `(w_gu1 [E, D, 2*H], w_d1 [E, H, D], w_gu2 [E, D, 2*H], w_d2 [E, H, D])`
+        where each tensor is `contiguous([E, out, in]).transpose(1, 2)` — directly compatible with BOTH
+        `torch.nn.functional.grouped_mm` (SM >= 80 BF16 Tensor Cores) AND `torch.bmm`!
         """
         w_gu1 = torch.stack(
             [torch.cat([e.w_gate1.weight, e.w_up1.weight], dim=0) for e in self.experts], dim=0
-        ).transpose(1, 2)
-        w_d1 = torch.stack([e.w_down1.weight for e in self.experts], dim=0).transpose(1, 2)
+        )
+        w_d1 = torch.stack([e.w_down1.weight for e in self.experts], dim=0)
         w_gu2 = torch.stack(
             [torch.cat([e.w_gate2.weight, e.w_up2.weight], dim=0) for e in self.experts], dim=0
-        ).transpose(1, 2)
-        w_d2 = torch.stack([e.w_down2.weight for e in self.experts], dim=0).transpose(1, 2)
+        )
+        w_d2 = torch.stack([e.w_down2.weight for e in self.experts], dim=0)
         if dtype is not None:
             w_gu1 = w_gu1.to(dtype=dtype)
             w_d1 = w_d1.to(dtype=dtype)
             w_gu2 = w_gu2.to(dtype=dtype)
             w_d2 = w_d2.to(dtype=dtype)
-        return w_gu1.contiguous(), w_d1.contiguous(), w_gu2.contiguous(), w_d2.contiguous()
+        return (
+            w_gu1.contiguous().transpose(1, 2),
+            w_d1.contiguous().transpose(1, 2),
+            w_gu2.contiguous().transpose(1, 2),
+            w_d2.contiguous().transpose(1, 2),
+        )
+
+    def _experts_4grouped_mm_impl(
+        self,
+        x_sorted: torch.Tensor,
+        offs: torch.Tensor,
+        w_gu1: torch.Tensor,
+        w_d1: torch.Tensor,
+        w_gu2: torch.Tensor,
+        w_d2: torch.Tensor,
+    ) -> torch.Tensor:
+        """Zero-sync, zero-drop jagged Top-K SwiGLU expert kernel via `F.grouped_mm` on `[N*top_k, D]`.
+
+        Executes ONLY `N * top_k` rows instead of `E * N` dense broadcast rows (16x less compute on
+        32-expert `moe_210m`, 32x less compute on 64-expert `moe_1_8b`/`moe_2_6b`!) with 0 CPU syncs.
+        """
+        gu1 = F.grouped_mm(x_sorted, w_gu1, offs=offs)
+        g1, u1 = gu1.chunk(2, dim=-1)
+        act1 = (F.silu(g1) * u1).contiguous()
+        x1 = x_sorted + F.grouped_mm(act1, w_d1, offs=offs)
+        x_n2 = (
+            x1.float() * torch.rsqrt(x1.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        ).to(x_sorted.dtype).contiguous()
+        gu2 = F.grouped_mm(x_n2, w_gu2, offs=offs)
+        g2, u2 = gu2.chunk(2, dim=-1)
+        act2 = (F.silu(g2) * u2).contiguous()
+        return x1 + F.grouped_mm(act2, w_d2, offs=offs)
 
     def _experts_4bmm_impl(
         self,
@@ -199,7 +255,12 @@ class SparseMicroMoE(nn.Module):
             return self.pack_weights(dtype=dtype)
         w_gu1, w_d1, w_gu2, w_d2 = packed_weights
         if w_gu1.dtype != dtype:
-            return w_gu1.to(dtype), w_d1.to(dtype), w_gu2.to(dtype), w_d2.to(dtype)
+            return (
+                w_gu1.transpose(1, 2).to(dtype).contiguous().transpose(1, 2),
+                w_d1.transpose(1, 2).to(dtype).contiguous().transpose(1, 2),
+                w_gu2.transpose(1, 2).to(dtype).contiguous().transpose(1, 2),
+                w_d2.transpose(1, 2).to(dtype).contiguous().transpose(1, 2),
+            )
         return w_gu1, w_d1, w_gu2, w_d2
 
     def forward_compacted_bmm(
@@ -209,12 +270,13 @@ class SparseMicroMoE(nn.Module):
         sample_mask: Optional[torch.Tensor] = None,
         packed_weights: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         compiled_experts_fn: Optional[Callable[..., torch.Tensor]] = None,
+        compiled_grouped_mm_fn: Optional[Callable[..., torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Lossless capacity-compacted Top-2 4-BMM MoE dispatch on bucketed active tokens `[N_pad, D]`.
+        """Lossless capacity-compacted Top-2 MoE dispatch on bucketed active tokens `[N_pad, D]`.
 
-        Mathematically equivalent (zero token dropping, zero atomic `index_add_` nondeterminism) to
-        dense `[E, N_pad, D]` dispatch while shrinking `[E, N_pad, D] -> [E, C_cap, D]` whenever
-        per-expert max load `C_cap < N_pad` (2.5x-3.2x smaller on 8-expert 48M, ~8x smaller on 32-expert 210M!).
+        - On SM >= 80 CUDA in BF16 (A100/H100/Blackwell): dispatches zero-sync jagged `F.grouped_mm`
+          on ONLY `n_valid * top_k` rows (zero padding waste, zero `.item()` GPU->CPU syncs!).
+        - Fallback (FP32 / MPS / older GPUs): shrinks `[E, N_pad, D] -> [E, C_cap, D]` via 4-BMM.
         """
         N, D = x.shape
         if N == 0 or n_valid <= 0:
@@ -241,24 +303,55 @@ class SparseMicroMoE(nn.Module):
         aux_bal = has_any * float(E) * (f_e.detach() * p_e).sum()
 
         w_gu1, w_d1, w_gu2, w_d2 = self._resolve_packed_weights(x.dtype, packed_weights)
+
+        if (
+            x.dtype == torch.bfloat16
+            and E >= 4
+            and E > top_k
+            and _device_supports_grouped_mm(x.device, allow_cpu_bf16=self.allow_cpu_grouped_mm)
+        ):
+            valid_top_idx = top_idx[:n_valid]
+            flat_e = valid_top_idx.reshape(-1)
+            perm = torch.argsort(flat_e, stable=True)
+            e_sorted = flat_e[perm]
+            tok_sorted = torch.div(perm, top_k, rounding_mode="floor")
+            x_sorted = x_norm[:n_valid][tok_sorted].contiguous()
+            counts = torch.bincount(e_sorted, minlength=E)
+            offs = torch.cumsum(counts, dim=0, dtype=torch.int32)
+            gmm_fn = compiled_grouped_mm_fn if compiled_grouped_mm_fn is not None else self._experts_4grouped_mm_impl
+            y_sorted = gmm_fn(x_sorted, offs, w_gu1, w_d1, w_gu2, w_d2)
+            gate_sorted = gates[:n_valid].reshape(-1)[perm].unsqueeze(-1)
+            y_weighted = (y_sorted * gate_sorted).contiguous()
+            inv_perm = torch.argsort(perm)
+            out_valid = y_weighted[inv_perm].view(n_valid, top_k, D).sum(dim=1)
+            if n_valid < N:
+                return torch.cat([out_valid, torch.zeros((N - n_valid, D), device=x.device, dtype=x.dtype)], dim=0), aux_bal
+            return out_valid, aux_bal
+
         experts_fn = compiled_experts_fn if compiled_experts_fn is not None else self._experts_4bmm_impl
 
         # Small active batches on <=8 experts fit in L2 cache directly without bincount/argsort overhead
         if N <= 48 and E <= 8:
-            x_e = x_norm.unsqueeze(0).expand(E, -1, -1)
-            gate_full = torch.zeros((N, E), device=x.device, dtype=x.dtype).scatter_add(1, top_idx, gates)
+            x_e = x_norm[:n_valid].unsqueeze(0).expand(E, -1, -1)
+            gate_full = torch.zeros((n_valid, E), device=x.device, dtype=x.dtype).scatter_add(1, top_idx[:n_valid], gates[:n_valid])
             y_all = experts_fn(x_e, w_gu1, w_d1, w_gu2, w_d2)
-            return torch.einsum("ne,end->nd", gate_full, y_all), aux_bal
+            out_valid = torch.einsum("ne,end->nd", gate_full, y_all)
+            if n_valid < N:
+                return torch.cat([out_valid, torch.zeros((N - n_valid, D), device=x.device, dtype=x.dtype)], dim=0), aux_bal
+            return out_valid, aux_bal
 
         valid_top_idx = top_idx[:n_valid]  # [n_valid, top_k]
         counts = torch.bincount(valid_top_idx.reshape(-1), minlength=E)  # [E]
         c_cap = _coarse_bucket_count(max(1, int(counts.max().item())), bucket=16)
 
-        if c_cap >= N:
-            x_e = x_norm.unsqueeze(0).expand(E, -1, -1)
-            gate_full = torch.zeros((N, E), device=x.device, dtype=x.dtype).scatter_add(1, top_idx, gates)
+        if c_cap >= n_valid:
+            x_e = x_norm[:n_valid].unsqueeze(0).expand(E, -1, -1)
+            gate_full = torch.zeros((n_valid, E), device=x.device, dtype=x.dtype).scatter_add(1, valid_top_idx, gates[:n_valid])
             y_all = experts_fn(x_e, w_gu1, w_d1, w_gu2, w_d2)
-            return torch.einsum("ne,end->nd", gate_full, y_all), aux_bal
+            out_valid = torch.einsum("ne,end->nd", gate_full, y_all)
+            if n_valid < N:
+                return torch.cat([out_valid, torch.zeros((N - n_valid, D), device=x.device, dtype=x.dtype)], dim=0), aux_bal
+            return out_valid, aux_bal
 
         M = n_valid * top_k
         flat_e = valid_top_idx.reshape(-1)
@@ -320,11 +413,35 @@ class SparseMicroMoE(nn.Module):
         f_e = (dispatch_oh * mask_f).sum(dim=0) / denom  # [E]
         aux_bal = has_any * float(self.num_experts) * (f_e.detach() * p_e).sum()
 
-        # Fused 4-BMM branchless dispatch (CUDA torch.compile + MPS): zero syncs, 12x fewer GEMMs!
+        # Fused zero-sync dispatch (CUDA torch.compile + MPS):
+        #   - On SM >= 80 CUDA in BF16 (A100/H100/Blackwell): uses lossless jagged `F.grouped_mm`
+        #     executing ONLY `N * top_k` rows (16x less compute on 32 experts, 32x less on 64 experts!).
+        #   - On FP32 / MPS / older CUDA: uses static 4-BMM kernel.
         if static_shape or x.device.type == "mps" or torch.compiler.is_compiling():
+            w_gu1, w_d1, w_gu2, w_d2 = self._resolve_packed_weights(x.dtype, packed_weights)
+            if (
+                x.dtype == torch.bfloat16
+                and self.num_experts >= 4
+                and self.num_experts > self.top_k
+                and _device_supports_grouped_mm(x.device, allow_cpu_bf16=self.allow_cpu_grouped_mm)
+            ):
+                N, D = x.shape
+                flat_e = top_idx.reshape(-1)
+                perm = torch.argsort(flat_e, stable=True)
+                e_sorted = flat_e[perm]
+                tok_sorted = torch.div(perm, self.top_k, rounding_mode="floor")
+                x_sorted = x[tok_sorted].contiguous()
+                counts = torch.bincount(e_sorted, minlength=self.num_experts)
+                offs = torch.cumsum(counts, dim=0, dtype=torch.int32)
+                y_sorted = self._experts_4grouped_mm_impl(x_sorted, offs, w_gu1, w_d1, w_gu2, w_d2)
+                gate_sorted = gates.reshape(-1)[perm].unsqueeze(-1)
+                y_weighted = (y_sorted * gate_sorted).contiguous()
+                inv_perm = torch.argsort(perm)
+                out = y_weighted[inv_perm].view(N, self.top_k, D).sum(dim=1)
+                return out, aux_bal
+
             gate_full = torch.zeros((x.shape[0], self.num_experts), device=x.device, dtype=x.dtype)
             gate_full = gate_full.scatter_add(1, top_idx, gates)
-            w_gu1, w_d1, w_gu2, w_d2 = self._resolve_packed_weights(x.dtype, packed_weights)
             x_e = x.unsqueeze(0).expand(self.num_experts, -1, -1)  # [E, N, D]
             y_all = self._experts_4bmm_impl(x_e, w_gu1, w_d1, w_gu2, w_d2)
             out = torch.einsum("ne,end->nd", gate_full, y_all)
@@ -441,6 +558,7 @@ class BCGPC(nn.Module):
         self._compiled_pre_ponder: Optional[Callable[..., Any]] = None
         self._compiled_ponder_router: Optional[Callable[..., Any]] = None
         self._compiled_experts_bmm: Optional[Callable[..., Any]] = None
+        self._compiled_experts_grouped_mm: Optional[Callable[..., Any]] = None
         self._compiled_ponder_update: Optional[Callable[..., Any]] = None
         self._compiled_post_merge: Optional[Callable[..., Any]] = None
 
@@ -455,6 +573,8 @@ class BCGPC(nn.Module):
         self._compiled_pre_ponder = torch.compile(self._pre_ponder_impl, **compile_kwargs)
         self._compiled_ponder_router = torch.compile(self._ponder_router_impl, **compile_kwargs)
         self._compiled_experts_bmm = torch.compile(self.moe._experts_4bmm_impl, **compile_kwargs)
+        if hasattr(F, "grouped_mm"):
+            self._compiled_experts_grouped_mm = torch.compile(self.moe._experts_4grouped_mm_impl, **compile_kwargs)
         self._compiled_ponder_update = torch.compile(self._ponder_update_impl, **compile_kwargs)
         self._compiled_post_merge = torch.compile(self._post_ponder_merge_impl, **compile_kwargs)
 
@@ -462,6 +582,7 @@ class BCGPC(nn.Module):
         self._compiled_pre_ponder = None
         self._compiled_ponder_router = None
         self._compiled_experts_bmm = None
+        self._compiled_experts_grouped_mm = None
         self._compiled_ponder_update = None
         self._compiled_post_merge = None
 
@@ -968,6 +1089,7 @@ class BCGPC(nn.Module):
                     sample_mask=None,
                     packed_weights=eff_packed_w,
                     compiled_experts_fn=self._compiled_experts_bmm,
+                    compiled_grouped_mm_fn=self._compiled_experts_grouped_mm,
                 )
                 moe_bal_sum = moe_bal_sum + bal_l
                 moe_bal_count = moe_bal_count + 1.0
@@ -995,6 +1117,7 @@ class BCGPC(nn.Module):
                     sample_mask=pad_mask,
                     packed_weights=eff_packed_w,
                     compiled_experts_fn=self._compiled_experts_bmm,
+                    compiled_grouped_mm_fn=self._compiled_experts_grouped_mm,
                 )
                 moe_bal_sum = moe_bal_sum + bal_l
                 moe_bal_count = moe_bal_count + 1.0

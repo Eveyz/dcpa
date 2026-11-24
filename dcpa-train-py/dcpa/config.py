@@ -189,6 +189,122 @@ class DCPAConfig:
         )
 
     @classmethod
+    def moe_650m(cls) -> DCPAConfig:
+        """DCPA-650M Sparse MoE Preset (32 experts Top-2 active, ~653M total / ~63M active)."""
+        return cls(
+            d_s=256,
+            d_concept=1024,
+            k_slots=8,
+            d_r=32,
+            d_merge=384,
+            d_h=4096,
+            s_active=32,
+            d_l=64,
+            num_experts=32,
+            top_k_experts=2,
+            expert_hidden=3200,
+            l_max=8,
+            tau_skip=0.32,
+            tau_halt=0.22,
+            lambda_moe_bal=0.01,
+            target_spike_rate=1.0 / 9.5,
+            lambda_rate=2.0,
+            lambda_var=1.0,
+            lambda_halt=1.0,
+            lambda_act=0.01,
+            lr_micro=4e-4,
+            lr_concept=3e-4,
+            lr_scalar_gate=8.0e-4,
+        )
+
+    @classmethod
+    def moe_1_8b(cls) -> DCPAConfig:
+        """DCPA v2-Pro 1.8B Sparse MoE Preset (64 experts Top-2 active, ~1.79B total / ~145M active)."""
+        return cls(
+            d_s=384,
+            d_concept=1536,
+            k_slots=8,
+            d_r=64,
+            d_merge=512,
+            d_h=8192,
+            s_active=48,
+            d_l=64,
+            num_experts=64,
+            top_k_experts=2,
+            expert_hidden=2944,
+            l_max=10,
+            tau_skip=0.32,
+            tau_halt=0.22,
+            lambda_moe_bal=0.01,
+            target_spike_rate=1.0 / 9.5,
+            lambda_rate=2.0,
+            lambda_var=1.0,
+            lambda_halt=1.0,
+            lambda_act=0.01,
+            lr_micro=3.5e-4,
+            lr_concept=2.5e-4,
+            lr_scalar_gate=8.0e-4,
+        )
+
+    @classmethod
+    def moe_2_6b(cls) -> DCPAConfig:
+        """DCPA v2-Max 2.6B Sparse MoE Preset (64 experts Top-2 active, ~2.66B total / ~195M active)."""
+        return cls(
+            d_s=384,
+            d_concept=2048,
+            k_slots=8,
+            d_r=64,
+            d_merge=512,
+            d_h=8192,
+            s_active=48,
+            d_l=64,
+            num_experts=64,
+            top_k_experts=2,
+            expert_hidden=3264,
+            l_max=12,
+            tau_skip=0.32,
+            tau_halt=0.22,
+            lambda_moe_bal=0.01,
+            target_spike_rate=1.0 / 9.5,
+            lambda_rate=2.0,
+            lambda_var=1.0,
+            lambda_halt=1.0,
+            lambda_act=0.01,
+            lr_micro=3.0e-4,
+            lr_concept=2.0e-4,
+            lr_scalar_gate=6.0e-4,
+        )
+
+    @classmethod
+    def moe_3_5b(cls) -> DCPAConfig:
+        """DCPA v2-Ultra 3.5B Sparse MoE Preset (64 experts Top-2 active, ~3.51B total / ~248M active)."""
+        return cls(
+            d_s=384,
+            d_concept=2048,
+            k_slots=8,
+            d_r=64,
+            d_merge=512,
+            d_h=8192,
+            s_active=64,
+            d_l=64,
+            num_experts=64,
+            top_k_experts=2,
+            expert_hidden=4352,
+            l_max=12,
+            tau_skip=0.32,
+            tau_halt=0.22,
+            lambda_moe_bal=0.01,
+            target_spike_rate=1.0 / 9.5,
+            lambda_rate=2.0,
+            lambda_var=1.0,
+            lambda_halt=1.0,
+            lambda_act=0.01,
+            lr_micro=2.8e-4,
+            lr_concept=1.8e-4,
+            lr_scalar_gate=6.0e-4,
+        )
+
+    @classmethod
     def proto_48m(cls) -> DCPAConfig:
         """DCPA-48M Prototype Preset (~47.6M slow weights: d_s=192, D=512, K=8, d_h=4096, s=32)."""
         return cls(

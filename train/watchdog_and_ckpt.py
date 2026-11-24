@@ -184,6 +184,7 @@ class SelfHealingWatchdog:
         watchdog_cfg: Optional[Mapping[str, Any]] = None,
         base_seed: int = 1337,
         events_log_path: Optional[str | Path] = None,
+        enable_event_logging: bool = True,
     ) -> None:
         cfg = dict(watchdog_cfg or {})
         self.window_size: int = int(cfg.get("window_size", 20))
@@ -214,6 +215,7 @@ class SelfHealingWatchdog:
         )
 
         self.base_seed: int = int(base_seed)
+        self.enable_event_logging: bool = bool(enable_event_logging)
         self.events_log_path: Path = Path(
             events_log_path
             if events_log_path is not None
@@ -467,7 +469,8 @@ class SelfHealingWatchdog:
             "directives_before": before_directives,
             "directives_after": self.directives.to_dict(),
         }
-        atomic_append_jsonl(self.events_log_path, event_record)
+        if self.enable_event_logging:
+            atomic_append_jsonl(self.events_log_path, event_record)
 
         if circuit_broken:
             raise MeltdownAbortError(

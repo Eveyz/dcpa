@@ -1,0 +1,294 @@
+# DCPA 48M Prototype (and 152M Standard Preset) — 100,000-Step Developmental Training Contract
+#
+# Enforces:
+#   - Global Override Iron Laws #1-#5 (Apple M3 Pro local dev + Google Colab H100/A100/L4 prod)
+#   - Training Red Lines #1-#4 (bf16 precision islands, NO GradScaler, hard requires_grad freeze,
+#     isolated Stage-4 episodic fast weights, atomic fsync+os.replace checkpointing)
+
+schema_version: 1
+experiment_name: dcpa_48m_developmental_100k
+
+# Default 48M prototype architecture (~47.62M slow weights, ~14M active per step)
+model:
+  preset: proto_48m
+  vocab_size: 256
+  d_s: 192
+  d_concept: 512
+  k_slots: 8
+  d_r: 32
+  d_merge: 256
+  d_h: 4096
+  s_active: 32
+  d_l: 64
+  num_lang_domains: 6
+  num_style_domains: 5
+  num_experts: 8
+  top_k_experts: 2
+  expert_hidden: 1728
+  l_max: 8
+  tau_skip: 0.32
+  tau_halt: 0.22
+  ponder_eta: 0.5
+  lambda_moe_bal: 0.01
+  max_seg_len: 16
+  target_spike_rate: 0.10526315789473684  # 1 / 9.5 (rho_target = 9.5)
+  lambda_rate: 2.0
+  lambda_var: 1.0
+  lambda_act: 0.01
+  lambda_halt: 1.0
+  gamma_hip: 0.999
+  lambda_eta: 0.95
+  kappa_quench: 0.95
+  householder_max_writes: 32
+  householder_write_threshold: 0.05
+
+# Named model presets selectable via `--preset`
+presets:
+  proto_48m:
+    d_s: 192
+    d_concept: 512
+    k_slots: 8
+    d_r: 32
+    d_merge: 256
+    d_h: 4096
+    s_active: 32
+    d_l: 64
+    num_experts: 8
+    top_k_experts: 2
+    expert_hidden: 1728
+    l_max: 8
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
+    lambda_moe_bal: 0.01
+  standard_152m:
+    d_s: 192
+    d_concept: 768
+    k_slots: 8
+    d_r: 32
+    d_merge: 256
+    d_h: 4096
+    s_active: 32
+    d_l: 64
+    num_experts: 16
+    top_k_experts: 2
+    expert_hidden: 1920
+    l_max: 8
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
+    lambda_moe_bal: 0.01
+  moe_210m:
+    d_s: 192
+    d_concept: 768
+    k_slots: 8
+    d_r: 32
+    d_merge: 256
+    d_h: 4096
+    s_active: 32
+    d_l: 64
+    num_experts: 32
+    top_k_experts: 2
+    expert_hidden: 1344
+    l_max: 8
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
+    lambda_moe_bal: 0.01
+  micro:
+    d_s: 64
+    d_concept: 128
+    k_slots: 8
+    d_r: 32
+    d_merge: 64
+    d_h: 512
+    s_active: 16
+    d_l: 64
+    num_experts: 4
+    top_k_experts: 2
+    expert_hidden: 192
+    l_max: 4
+
+# Constant-Byte-Budget & 4-tier hardware auto grad-accum sharding contract
+hardware:
+  target_tokens_bytes_per_step: 131072  # 128 KB/step -> ~13.1 GB raw UTF-8 stream over 100k steps
+  allow_tf32: true
+  bf16_autocast: true                   # CUDA only; safely falls back to pure float32 on MPS/CPU
+  use_grad_scaler: false                # RED LINE #1: NEVER enable GradScaler with bf16!
+  compile_mode: auto                    # none | auto | reduce-overhead (auto-falls back to none on cpu/mps)
+  compile_doc_bucket_size: 16           # Pad N_docs up to multiples of 16 to eliminate Dynamo recompiles
+  compile_cache_size_limit: 128         # torch._dynamo.config.cache_size_limit
+  bcg_checkpoint_vram_watermark_gb: 52.0  # >=88GB GPUs skip BCG recompute until 52GB allocated, then auto-checkpoint
+  prefetch_depth: 2                     # Background NVMe -> pinned-RAM lookahead depth on CUDA
+  fp32_precision_islands:
+    - sgsc_diag_scan_prior_log_softmax_and_lif_membrane
+    - holographic_rope_forward_and_inverse_phase_rotation
+    - gumbel_softmax_uniform_log_transform
+    - bcg_pc_free_energy_loss_and_variance_hinge
+    - hippocampus_sparse_s32_gated_delta_column_ops
+  auto_sharding_tiers:
+    blackwell_or_h200_96g:
+      min_vram_gb: 88.0
+      target_tokens_bytes_per_step: 262144
+      micro_batch_bytes: 262144
+      grad_accum_steps: 1
+    h100_or_a100_80g:
+      min_vram_gb: 75.0
+      micro_batch_bytes: 131072
+      grad_accum_steps: 1
+    a100_40g:
+      min_vram_gb: 38.0
+      micro_batch_bytes: 65536
+      grad_accum_steps: 2
+    l4_or_4090:
+      min_vram_gb: 20.0
+      micro_batch_bytes: 32768
+      grad_accum_steps: 4
+    local_mps_or_cpu:
+      min_vram_gb: 0.0
+      target_tokens_bytes_per_step: 8192
+      micro_batch_bytes: 8192
+      grad_accum_steps: 1
+
+# Fixed Step-0 three-way differentiated AdamW parameter groups (never rebuilt mid-run)
+optimizer:
+  type: AdamW
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  grad_clip_norm: 1.0
+  groups:
+    group_matrix_decay:
+      lr: 4.0e-4
+      weight_decay: 0.05
+    group_norm_embed_nodecay:
+      lr: 4.0e-4
+      weight_decay: 0.0
+    group_gates_thresholds:
+      lr: 8.0e-4
+      weight_decay: 0.0
+
+# 100,000-step 4-stage developmental curriculum state machine
+# Domain index mapping matches data/build_corpus.py & data/ragged_dataloader.py:
+#   0 = en, 1 = zh, 2 = ja, 3 = python, 4 = rust
+curriculum:
+  total_steps: 100000
+  stage_boundaries: [0, 15000, 65000, 94000, 100000]
+  stage1:
+    name: sensorimotor_spelling_autoencoder
+    model_stage: A
+    global_warmup_steps: 2000
+    max_doc_bytes: 512
+    domain_weights: [0.35, 0.35, 0.10, 0.10, 0.10]
+    wug_ratio: 0.0
+    tau_s_start: 1.0
+    tau_s_end: 0.35
+    target_rho: 9.5
+    lambda_rate: 2.0
+    lambda_var: 1.0
+    lambda_halt: 1.0
+    lambda_pc: 0.0
+    lambda_act: 0.0
+  stage2:
+    name: bottlenecked_concept_merge_and_pondering
+    model_stage: B
+    bcg_local_warmup_steps: 1000
+    local_warmup_start_factor: 0.01
+    window_schedule:
+      - [15000, 512]
+      - [35000, 1024]
+      - [50000, 2048]
+    domain_weights: [0.32, 0.36, 0.10, 0.11, 0.11]
+    wug_ratio: 0.0
+    tau_m_start: 1.5
+    tau_m_end: 0.25
+    tau_s: 0.30
+    target_rho: 9.5
+    lambda_rate: 2.0
+    lambda_var: 1.0
+    lambda_halt: 1.0
+    lambda_pc_ramp_steps: 3000
+    lambda_pc_target: 0.5
+    lambda_act_delay_steps: 1000    # 15k..16k kept at 0.0 during BCG local warmup
+    lambda_act_ramp_steps: 9000     # 16k..25k linear 0.0 -> 0.01 (prevents Avg_L_m=8.0 runaway while keeping MoE active)
+    lambda_act_target: 0.01
+  stage3:
+    name: cross_lingual_reordering_and_code_stack
+    model_stage: C
+    lr_cosine_end_ratio: 0.25
+    max_doc_bytes: 4096
+    domain_weights: [0.18, 0.22, 0.25, 0.17, 0.18]
+    wug_ratio: 0.0
+    tau_m: 0.25
+    tau_s: 0.25
+    target_rho: 9.5
+    lambda_rate: 2.0
+    lambda_var: 1.0
+    lambda_halt: 1.0
+    lambda_pc: 0.5
+    lambda_act: 0.01
+    code_delimiter_focal_weight: 1.5
+    code_delimiter_chars: "{}()[]:;\n"
+    broca_cq_prob: 0.20
+    cap_mix_ratio: 0.35
+  stage4:
+    name: hippocampal_oneshot_meta_plasticity
+    model_stage: D
+    hip_local_warmup_steps: 500
+    local_warmup_start_factor: 0.01
+    lr_scale: 0.25
+    max_doc_bytes: 1024
+    domain_weights: [0.20, 0.20, 0.20, 0.20, 0.20]
+    wug_ratio: 0.50
+    wug_target_weight: 3.0
+    lambda_ach_reg: 0.5
+    tau_m: 0.25
+    tau_s: 0.25
+    lambda_rate: 0.0
+    lambda_var: 0.0
+    lambda_halt: 0.0
+    lambda_pc: 0.0
+    lambda_act: 0.0
+
+# Self-Healing Watchdog (20-step sliding window + auto-rollback + targeted hyperparameter repair)
+watchdog:
+  window_size: 20
+  rule_bcd_warmup_steps: 500
+  compression_ratio_min: 2.5
+  compression_ratio_max: 25.0
+  concept_std_min_floor: 0.35
+  merge_entropy_min: 0.08
+  skip_batches_on_rollback: 10
+  seed_stride_on_rollback: 9973
+  rule_a_lr_multiplier: 0.7
+  rule_b_lambda_rate_multiplier: 3.0
+  rule_b_lambda_rate_cap: 50.0
+  rule_b_tau_s_floor: 0.5
+  rule_c_lambda_var_multiplier: 2.5
+  rule_c_lambda_var_cap: 25.0
+  rule_d_tau_m_delta: 0.4
+  rule_d_tau_m_cap: 1.2
+  rule_d_explore_steps: 1000
+  rule_d_uniform_mix: 0.10
+  rule_d_merge_kl_weight: 0.10
+  max_consecutive_rollbacks: 3
+  min_progress_steps_to_reset_breaker: 200
+  events_log_path: artifacts/logs/watchdog_events.jsonl
+
+# Dual-track atomic checkpointing & preemption protection
+checkpointing:
+  ckpt_dir: artifacts/checkpoints
+  healthy_save_every_steps: 1000
+  milestone_every_steps: 5000
+  save_every_minutes: 10.0
+  export_dir: artifacts/export
+  final_safetensors_name: dcpa_final.safetensors
+
+# Concise console table + 500-step zero-grad visual probe dashboard
+visual_probe:
+  console_every_steps: 50
+  probe_every_steps: 500
+  logs_dir: artifacts/logs
+  metrics_jsonl: metrics.jsonl
+  latest_probe_md: latest_probe.md
+  probe_history_md: probe_history.md
+  val_batches_per_domain: 2

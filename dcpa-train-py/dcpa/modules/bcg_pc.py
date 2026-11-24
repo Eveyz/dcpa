@@ -677,6 +677,7 @@ class BCGPC(nn.Module):
         trig_cur: torch.Tensor,
         use_gumbel: bool,
         gumbel_u: Optional[torch.Tensor] = None,
+        compute_s_bar_post: bool = True,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -830,7 +831,10 @@ class BCGPC(nn.Module):
         omega_new = torch.where(do_pin_w, torch.maximum(omega_new, torch.full_like(omega_new, 2.0)), omega_new)
         slot0_pinned_next = torch.where(do_pin, torch.ones_like(pinned_cur), pinned_cur)
 
-        s_bar_post, _ = self._message_pass_with_eproj(s_new, e_proj_post, omega_new)
+        if compute_s_bar_post:
+            s_bar_post, _ = self._message_pass_with_eproj(s_new, e_proj_post, omega_new)
+        else:
+            s_bar_post = s_new
         return (
             s_new,
             a_new,
@@ -864,6 +868,7 @@ class BCGPC(nn.Module):
         packed_moe_w_gu2: Optional[torch.Tensor] = None,
         packed_moe_w_d2: Optional[torch.Tensor] = None,
         gumbel_u: Optional[torch.Tensor] = None,
+        compute_s_bar_post: bool = True,
     ) -> tuple[torch.Tensor, ...]:
         """Fast event-driven BCG-PC dispatcher with early-exit Pondering & lossless compacted Top-2 MoE.
 
@@ -891,6 +896,7 @@ class BCGPC(nn.Module):
                 packed_moe_w_gu2=packed_moe_w_gu2,
                 packed_moe_w_d2=packed_moe_w_d2,
                 gumbel_u=gumbel_u,
+                compute_s_bar_post=compute_s_bar_post,
             )
 
         B, _ = c_fused.shape
@@ -1035,6 +1041,7 @@ class BCGPC(nn.Module):
             trig_cur,
             use_gumbel,
             gumbel_u,
+            compute_s_bar_post,
         )
 
         if self.training and update_c0_ema:
@@ -1080,6 +1087,7 @@ class BCGPC(nn.Module):
         packed_moe_w_gu2: Optional[torch.Tensor] = None,
         packed_moe_w_d2: Optional[torch.Tensor] = None,
         gumbel_u: Optional[torch.Tensor] = None,
+        compute_s_bar_post: bool = True,
     ) -> tuple[torch.Tensor, ...]:
         """Hotspot A (`bcg_step_kernel`): single-step concept graph transition kernel.
 
@@ -1192,6 +1200,7 @@ class BCGPC(nn.Module):
             trig_cur,
             use_gumbel,
             gumbel_u,
+            compute_s_bar_post,
         )
 
         # Update neutral concept center c_0 via EMA strictly over active docs

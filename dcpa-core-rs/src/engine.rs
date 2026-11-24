@@ -6,9 +6,10 @@
 use crate::simd::{
     apply_holographic_rope_f32, axpy_f32, cosine_sim_f32, dot_f32, expf, l2_norm_f32, linear_f32,
     logaddexp, logf, rmsnorm_f32, sigmoid, silu, softmax_inplace_f32, softplus, sqrtf, tanhf,
+    unit_rmsnorm_f32,
 };
 use crate::state::{
-    ConceptGraphState, EligibilityTags, FastWeightPrecision, HippocampusFastWeights,
+    BrainSnapshot, ConceptGraphState, EligibilityTags, FastWeightPrecision, HippocampusFastWeights,
     MotorCheckpoint, MotorState, ScratchPool, SgscState, MAX_SEG_CAP,
 };
 use crate::weights::DcpaWeights;
@@ -21,6 +22,7 @@ pub struct ByteIngestTrace {
     pub seg_len: usize,
     pub mean_info: f32,
     pub sem_norm: f32,
+    pub pin_triggered: bool,
 }
 
 /// Scalar telemetry emitted by a single concept graph + hippocampus step.
@@ -34,6 +36,7 @@ pub struct ConceptStepTrace {
     pub win_pair_idx: usize,
     pub win_i: usize,
     pub win_j: usize,
+    pub slot0_pinned: bool,
 }
 
 /// Complete self-contained DCPA streaming runtime (all working memory allocated ONCE on `new`).
@@ -48,7 +51,10 @@ pub struct DcpaEngine {
 }
 
 impl DcpaEngine {
-    pub fn new(weights: DcpaWeights, fast_precision: FastWeightPrecision) -> Self {
+    pub fn new(mut weights: DcpaWeights, fast_precision: FastWeightPrecision) -> Self {
+        if fast_precision == FastWeightPrecision::Bf16 {
+            weights.pack_experts_bf16();
+        }
         let cfg = weights.cfg.clone();
         let sgsc = SgscState::new(&weights);
         let graph = ConceptGraphState::new(&weights);
@@ -72,6 +78,18 @@ impl DcpaEngine {
         self.graph.reset(&self.weights);
         self.elig.reset();
         self.motor.reset(&self.weights);
+    }
+
+    /// Capture O(1) ~22 KB active working memory snapshot into pre-allocated `snap` (0 heap allocs!).
+    #[inline]
+    pub fn capture_snapshot(&self, snap: &mut BrainSnapshot) {
+        snap.capture_from(&self.sgsc, &self.graph, &self.elig, &self.motor);
+    }
+
+    /// Restore O(1) ~22 KB active working memory snapshot from `snap` (0 heap allocs!).
+    #[inline]
+    pub fn restore_snapshot(&mut self, snap: &BrainSnapshot) {
+        snap.restore_into(&mut self.sgsc, &mut self.graph, &mut self.elig, &mut self.motor);
     }
 
     /// Top-k partial selection into fixed slices `out_idx[..k]` and `out_val[..k]` (descending),
@@ -173,12 +191,40 @@ impl DcpaEngine {
             self.sgsc.h[i] = a * self.sgsc.h[i] + inj;
         }
 
-        // Record into fixed segment buffer
+        // Record into fixed segment buffer & track Spec 2 Slot-0 Thesis Pinning control sequences
         let slot_pos = self.sgsc.seg_len.min(MAX_SEG_CAP - 1);
         self.sgsc.seg_h[slot_pos * d_s..(slot_pos + 1) * d_s].copy_from_slice(&self.sgsc.h);
         self.sgsc.seg_bytes[slot_pos] = byte;
         self.sgsc.seg_len += 1;
         self.sgsc.seg_info_sum += info;
+
+        if self.sgsc.recent_len < 6 {
+            self.sgsc.recent_bytes[self.sgsc.recent_len] = byte;
+            self.sgsc.recent_len += 1;
+        } else {
+            self.sgsc.recent_bytes.copy_within(1..6, 0);
+            self.sgsc.recent_bytes[5] = byte;
+        }
+        let rlen = self.sgsc.recent_len;
+        if self.sgsc.pending_asst_pin {
+            // Defer `\x1fA\n` pin if immediately followed by `\x1d` (`\x1dS\n`); otherwise trigger!
+            if byte != 0x1D {
+                self.sgsc.seg_pin_hit = true;
+            }
+            self.sgsc.pending_asst_pin = false;
+            self.sgsc.pending_asst_ticks = 0;
+        }
+        if rlen >= 3 {
+            let b_m2 = self.sgsc.recent_bytes[rlen - 3];
+            let b_m1 = self.sgsc.recent_bytes[rlen - 2];
+            let b_0 = self.sgsc.recent_bytes[rlen - 1];
+            if b_m2 == 0x1D && b_m1 == b'E' && b_0 == 0x0A {
+                self.sgsc.seg_pin_hit = true;
+            } else if b_m2 == 0x1F && b_m1 == b'A' && b_0 == 0x0A {
+                self.sgsc.pending_asst_pin = true;
+                self.sgsc.pending_asst_ticks = 1;
+            }
+        }
 
         // 3. Strictly causal UTF-8 codepoint completion tracker
         if byte < 0x80 {
@@ -212,6 +258,7 @@ impl DcpaEngine {
                 seg_len: self.sgsc.seg_len,
                 mean_info: 0.0,
                 sem_norm: 0.0,
+                pin_triggered: false,
             };
         }
 
@@ -290,9 +337,11 @@ impl DcpaEngine {
         );
 
         // Reset LIF accumulator & segment counters
+        let pin_triggered = self.sgsc.seg_pin_hit;
         self.sgsc.v = 0.0;
         self.sgsc.seg_len = 0;
         self.sgsc.seg_info_sum = 0.0;
+        self.sgsc.seg_pin_hit = false;
 
         ByteIngestTrace {
             info,
@@ -300,6 +349,7 @@ impl DcpaEngine {
             seg_len,
             mean_info,
             sem_norm,
+            pin_triggered,
         }
     }
 
@@ -352,6 +402,19 @@ impl DcpaEngine {
     ///   - `scratch.vec_d_h` holds `g_ctx`
     /// Strictly ZERO heap allocations!
     pub fn step_concept_from_scratch(&mut self, mean_info: f32, sem_norm: f32) -> ConceptStepTrace {
+        self.step_concept_from_scratch_with_opts(mean_info, sem_norm, false, None)
+    }
+
+    /// Full Spec 2 + Spec 5 concept transition with optional `Slot-0 Thesis Pinning` trigger and `ach_override`
+    /// (e.g. `ach_override = Some(0.0)` when injecting `0x12` tool observations).
+    /// Strictly ZERO heap allocations!
+    pub fn step_concept_from_scratch_with_opts(
+        &mut self,
+        mean_info: f32,
+        sem_norm: f32,
+        pin_trigger: bool,
+        ach_override: Option<f32>,
+    ) -> ConceptStepTrace {
         let cfg = &self.weights.cfg;
         let d_s = cfg.d_s;
         let d = cfg.d_concept;
@@ -385,7 +448,10 @@ impl DcpaEngine {
             &self.scratch.psi_val,
             &mut self.scratch.hip_c_hip,
         );
-        let ach = (1.0 - gamma_slow) * (1.0 - gamma_hip);
+        let ach = match ach_override {
+            Some(ov) => ov.clamp(0.0, 1.0),
+            None => (1.0 - gamma_slow) * (1.0 - gamma_hip),
+        };
         let mu = gamma_hip / (gamma_slow + gamma_hip + cfg.eps);
 
         // pi_cort = Softplus(f_prec_cort(c_slow)) + 1e-4
@@ -480,9 +546,27 @@ impl DcpaEngine {
             &mut self.scratch.vec_d_g,
         );
 
-        // Event-driven pondering loop (L_max = 4; immediate shortcut when surprisal <= tau_skip!)
+        // Event-driven pondering loop (L_max = 8; immediate shortcut when surprisal <= tau_skip!)
         let mut surp_cur = surprisal_0;
         let mut ponder_steps = 0usize;
+        if surp_cur > cfg.tau_skip && cfg.l_max > 0 {
+            // Precompute SlotCrossAttention K & V ONCE across all K=8 slots (8x less KV GEMV work!)
+            for slot_i in 0..k {
+                let sb = &self.scratch.s_bar[slot_i * d..(slot_i + 1) * d];
+                linear_f32(
+                    sb,
+                    &self.weights.bcg_ca_wk,
+                    None,
+                    &mut self.scratch.ca_k[slot_i * d..(slot_i + 1) * d],
+                );
+                linear_f32(
+                    sb,
+                    &self.weights.bcg_ca_wv,
+                    None,
+                    &mut self.scratch.ca_v[slot_i * d..(slot_i + 1) * d],
+                );
+            }
+        }
         for l_idx in 0..cfg.l_max {
             let thresh = if l_idx == 0 { cfg.tau_skip } else { cfg.tau_halt };
             if surp_cur <= thresh {
@@ -490,20 +574,17 @@ impl DcpaEngine {
             }
             ponder_steps += 1;
 
-            // CrossAttn(Q = z_cur, K = S_bar, V = S_bar) -> scratch.vec_d_e
+            // CrossAttn(Q = z_cur, K = ca_k, V = ca_v) -> scratch.vec_d_e
             linear_f32(&self.scratch.vec_d_g, &self.weights.bcg_ca_wq, None, &mut self.scratch.vec_d_f);
             for slot_i in 0..k {
-                let sb = &self.scratch.s_bar[slot_i * d..(slot_i + 1) * d];
-                linear_f32(sb, &self.weights.bcg_ca_wk, None, &mut self.scratch.vec_d_e);
-                self.scratch.ca_scores[slot_i] =
-                    dot_f32(&self.scratch.vec_d_f, &self.scratch.vec_d_e) * inv_sqrt_d;
+                let ck = &self.scratch.ca_k[slot_i * d..(slot_i + 1) * d];
+                self.scratch.ca_scores[slot_i] = dot_f32(&self.scratch.vec_d_f, ck) * inv_sqrt_d;
             }
             softmax_inplace_f32(&mut self.scratch.ca_scores[..k]);
             self.scratch.vec_d_f.fill(0.0);
             for slot_i in 0..k {
-                let sb = &self.scratch.s_bar[slot_i * d..(slot_i + 1) * d];
-                linear_f32(sb, &self.weights.bcg_ca_wv, None, &mut self.scratch.vec_d_e);
-                axpy_f32(self.scratch.ca_scores[slot_i], &self.scratch.vec_d_e, &mut self.scratch.vec_d_f);
+                let cv = &self.scratch.ca_v[slot_i * d..(slot_i + 1) * d];
+                axpy_f32(self.scratch.ca_scores[slot_i], cv, &mut self.scratch.vec_d_f);
             }
             linear_f32(&self.scratch.vec_d_f, &self.weights.bcg_ca_wo, None, &mut self.scratch.vec_d_e);
 
@@ -551,14 +632,14 @@ impl DcpaEngine {
             self.scratch.expert_out.fill(0.0);
             for t_i in 0..2 {
                 let exp = &self.weights.bcg_experts[top_idx[t_i]];
-                // Layer 1 SwiGLU (input vec_d_f is unit-RMS normalized)
-                linear_f32(&self.scratch.vec_d_f, &exp.w_gate1, None, &mut self.scratch.expert_h1);
-                linear_f32(&self.scratch.vec_d_f, &exp.w_up1, None, &mut self.scratch.expert_h2);
+                // Layer 1 SwiGLU (input vec_d_f is unit-RMS normalized; uses F32 or 4-row Bf16 SIMD!)
+                exp.w_gate1.linear_no_bias(&self.scratch.vec_d_f, &mut self.scratch.expert_h1);
+                exp.w_up1.linear_no_bias(&self.scratch.vec_d_f, &mut self.scratch.expert_h2);
                 for h_i in 0..cfg.expert_hidden {
                     self.scratch.expert_h1[h_i] =
                         silu(self.scratch.expert_h1[h_i]) * self.scratch.expert_h2[h_i];
                 }
-                linear_f32(&self.scratch.expert_h1, &exp.w_down1, None, &mut self.scratch.vec_d_e);
+                exp.w_down1.linear_no_bias(&self.scratch.expert_h1, &mut self.scratch.vec_d_e);
                 let mut sum_sq2 = 0.0f32;
                 for i in 0..d {
                     let v = self.scratch.vec_d_e[i] + self.scratch.vec_d_f[i];
@@ -570,13 +651,13 @@ impl DcpaEngine {
                     self.scratch.vec_d_b[i] = self.scratch.vec_d_e[i] * inv_rms2;
                 }
                 // Layer 2 Pre-RMSNorm SwiGLU
-                linear_f32(&self.scratch.vec_d_b, &exp.w_gate2, None, &mut self.scratch.expert_h1);
-                linear_f32(&self.scratch.vec_d_b, &exp.w_up2, None, &mut self.scratch.expert_h2);
+                exp.w_gate2.linear_no_bias(&self.scratch.vec_d_b, &mut self.scratch.expert_h1);
+                exp.w_up2.linear_no_bias(&self.scratch.vec_d_b, &mut self.scratch.expert_h2);
                 for h_i in 0..cfg.expert_hidden {
                     self.scratch.expert_h1[h_i] =
                         silu(self.scratch.expert_h1[h_i]) * self.scratch.expert_h2[h_i];
                 }
-                linear_f32(&self.scratch.expert_h1, &exp.w_down2, None, &mut self.scratch.vec_d_b);
+                exp.w_down2.linear_no_bias(&self.scratch.expert_h1, &mut self.scratch.vec_d_b);
                 for i in 0..d {
                     let y = self.scratch.vec_d_e[i] + self.scratch.vec_d_b[i];
                     self.scratch.expert_out[i] += gates[t_i] * y;
@@ -646,6 +727,7 @@ impl DcpaEngine {
         let mut win_j = 1usize;
         let mut pair_idx = 0usize;
 
+        let already_pinned = self.graph.slot0_pinned;
         for i in 0..kp1 {
             let wl_i = &self.scratch.wl_all[i * d_m..(i + 1) * d_m];
             for j in 0..kp1 {
@@ -664,6 +746,9 @@ impl DcpaEngine {
                 for m in 0..d_m {
                     score += self.weights.bcg_w_merge[m]
                         * tanhf(wl_i[m] + wr_j[m] + self.scratch.merge_h[m]);
+                }
+                if already_pinned && (i == 0 || j == 0) {
+                    score -= 1.0e4;
                 }
                 if score > best_score {
                     best_score = score;
@@ -704,14 +789,16 @@ impl DcpaEngine {
             let g = sigmoid(self.scratch.vec_d_b[m]);
             self.scratch.vec_d_d[m] = g * self.scratch.vec_d_c[m] + (1.0 - g) * si[m];
         }
-        // Write merged parent in-place to slot u!
-        rmsnorm_f32(
-            &self.scratch.vec_d_d,
-            &self.weights.bcg_norm_merge,
-            cfg.eps,
-            &mut self.graph.slots[u * d..(u + 1) * d],
-        );
-        if v < k {
+        // Write merged parent in-place to slot u (preserving Slot 0 verbatim when already_pinned)!
+        if !(already_pinned && u == 0) {
+            rmsnorm_f32(
+                &self.scratch.vec_d_d,
+                &self.weights.bcg_norm_merge,
+                cfg.eps,
+                &mut self.graph.slots[u * d..(u + 1) * d],
+            );
+        }
+        if v < k && !(already_pinned && v == 0) {
             // Case B: place z_star into freed slot v!
             self.graph.slots[v * d..(v + 1) * d].copy_from_slice(&self.scratch.vec_d_g);
         }
@@ -775,8 +862,11 @@ impl DcpaEngine {
                 self.graph.salience[row] = self.scratch.omega_tilde[row];
             }
         }
+        if already_pinned {
+            self.graph.salience[0] = self.graph.salience[0].max(2.0);
+        }
 
-        // Post-merge message passing S_bar_post
+        // Post-merge message passing S_bar_post & g_post (in vec_d_c)
         Self::message_pass_graph(
             cfg,
             &self.weights.bcg_w_e,
@@ -786,8 +876,26 @@ impl DcpaEngine {
             &mut self.scratch.w_attn,
             &mut self.scratch.vec_d_b,
             &mut self.scratch.s_bar_post,
-            &mut self.scratch.vec_d_c, // discard post g_ctx
+            &mut self.scratch.vec_d_c, // g_post
         );
+
+        // Spec 2 Slot-0 Thesis Pinning latch (fires once on `\x1dE\n` or non-scratch `\x1fA\n`, matching bcg_pc.py)
+        if pin_trigger && !already_pinned {
+            unit_rmsnorm_f32(&self.scratch.vec_d_c, cfg.eps, &mut self.graph.slots[0..d]);
+            self.graph.salience[0] = self.graph.salience[0].max(2.0);
+            self.graph.slot0_pinned = true;
+            Self::message_pass_graph(
+                cfg,
+                &self.weights.bcg_w_e,
+                &self.graph.slots,
+                &self.graph.edges,
+                &self.graph.salience,
+                &mut self.scratch.w_attn,
+                &mut self.scratch.vec_d_b,
+                &mut self.scratch.s_bar_post,
+                &mut self.scratch.vec_d_c,
+            );
+        }
 
         // =====================================================================
         // 3. Module 3 Asymmetric Eligibility Inheritance (Commandment #8)
@@ -881,6 +989,7 @@ impl DcpaEngine {
             win_pair_idx,
             win_i,
             win_j,
+            slot0_pinned: self.graph.slot0_pinned,
         }
     }
 
@@ -1069,12 +1178,123 @@ impl DcpaEngine {
         (rho_out, done)
     }
 
+    /// Closed-Loop Mode-1 Concept Prediction & Hippocampal Expressive Retrieval!
+    ///
+    /// Matches Stage 5 SFT (`use_broca_cq=False`) and `cli/chat_m3.py` 1-to-1:
+    ///   1. Message-passes current `graph` -> `g_ctx`
+    ///   2. Predicts next concept `c_hat = f_pred_2(silu(f_pred_1(g_ctx)))` (`scratch.pmd_z_out`)
+    ///   3. Computes `delta_syn = silu(w_syn([w_ctx_role(g_ctx), l_reg]) + u_syn(c_hat))`
+    ///   4. Retrieves `f_out` from slow cortex + Hippocampus `M^{L<-C}` and initializes `motor.charge_e`
+    /// Strictly ZERO heap allocations! Returns `rho_out`.
+    pub fn mode1_step_and_retrieve_styled(&mut self, lang_id: usize, style_id: usize) -> f32 {
+        let cfg = &self.weights.cfg;
+        let d = cfg.d_concept;
+        let d_r = cfg.d_r;
+        let d_l = cfg.d_l;
+        let d_s = cfg.d_s;
+
+        let l_reg_arr = self.build_l_reg(lang_id, style_id);
+        let l_reg = &l_reg_arr[..d_l];
+
+        Self::message_pass_graph(
+            cfg,
+            &self.weights.bcg_w_e,
+            &self.graph.slots,
+            &self.graph.edges,
+            &self.graph.salience,
+            &mut self.scratch.w_attn,
+            &mut self.scratch.vec_d_b,
+            &mut self.scratch.s_bar,
+            &mut self.scratch.vec_d_h, // g_ctx
+        );
+
+        // c_hat = f_pred_2(silu(f_pred_1(g_ctx))) -> scratch.pmd_z_out
+        linear_f32(
+            &self.scratch.vec_d_h,
+            &self.weights.bcg_f_pred_1_w,
+            Some(&self.weights.bcg_f_pred_1_b),
+            &mut self.scratch.vec_d_c,
+        );
+        for v in self.scratch.vec_d_c.iter_mut() {
+            *v = silu(*v);
+        }
+        linear_f32(
+            &self.scratch.vec_d_c,
+            &self.weights.bcg_f_pred_2_w,
+            Some(&self.weights.bcg_f_pred_2_b),
+            &mut self.scratch.pmd_z_out, // c_hat
+        );
+
+        // Streaming delta_syn: r_role = w_ctx_role(g_ctx)
+        linear_f32(
+            &self.scratch.vec_d_h,
+            &self.weights.pmd_w_ctx_role,
+            None,
+            &mut self.scratch.vec_dr_a,
+        );
+        self.scratch.vec_dr_dl[..d_r].copy_from_slice(&self.scratch.vec_dr_a);
+        self.scratch.vec_dr_dl[d_r..d_r + d_l].copy_from_slice(l_reg);
+        linear_f32(
+            &self.scratch.vec_dr_dl,
+            &self.weights.pmd_w_syn_w,
+            Some(&self.weights.pmd_w_syn_b),
+            &mut self.scratch.vec_ds_a,
+        );
+        linear_f32(
+            &self.scratch.pmd_z_out,
+            &self.weights.pmd_u_syn,
+            None,
+            &mut self.scratch.vec_ds_b,
+        );
+        for i in 0..d_s {
+            self.scratch.pmd_delta_syn[i] = silu(self.scratch.vec_ds_a[i] + self.scratch.vec_ds_b[i]);
+        }
+
+        // Expressive retrieval from c_hat + l_reg
+        linear_f32(l_reg, &self.weights.hip_w_lang_lex, None, &mut self.scratch.vec_d_b);
+        for i in 0..d {
+            self.scratch.vec_d_b[i] += self.scratch.pmd_z_out[i];
+        }
+        linear_f32(
+            &self.scratch.vec_d_b,
+            &self.weights.hip_w_lex_slow,
+            None,
+            &mut self.scratch.vec_ds_c,
+        );
+        unit_rmsnorm_f32(&self.scratch.vec_ds_c, cfg.eps, &mut self.scratch.vec_ds_a);
+
+        linear_f32(&self.scratch.pmd_z_out, &self.weights.hip_r_sem, None, &mut self.scratch.dg_scores);
+        Self::topk_relu_unit_norm(
+            &self.scratch.dg_scores,
+            &mut self.scratch.phi_idx,
+            &mut self.scratch.phi_val,
+        );
+        let gamma_sem = self.fast_mem.read_l_from_c(
+            &self.scratch.phi_idx,
+            &self.scratch.phi_val,
+            &mut self.scratch.vec_ds_b,
+        );
+        let rho_out = sigmoid(self.weights.hip_alpha_out * (gamma_sem - self.weights.hip_theta_out));
+        for i in 0..d_s {
+            self.scratch.pmd_f_out[i] =
+                (1.0 - rho_out) * self.scratch.vec_ds_a[i] + rho_out * self.scratch.vec_ds_b[i];
+        }
+
+        self.scratch.vec_2ds_dl[..d_s].copy_from_slice(&self.scratch.pmd_f_out);
+        self.scratch.vec_2ds_dl[d_s..2 * d_s].copy_from_slice(&self.scratch.pmd_delta_syn);
+        self.scratch.vec_2ds_dl[2 * d_s..2 * d_s + d_l].copy_from_slice(l_reg);
+        let e0_raw =
+            dot_f32(&self.weights.pmd_w_e_init_w, &self.scratch.vec_2ds_dl) + self.weights.pmd_w_e_init_b;
+        self.motor.charge_e = softplus(e0_raw);
+        rho_out
+    }
+
     /// Module 4 (PMD): Execute ONE streaming byte generation step from `scratch.pmd_f_out` & `scratch.pmd_delta_syn`.
     ///
     /// Writes logits into `scratch.logits_256`. Returns `(greedy_byte, charge_e, p_seg_end)`.
     /// Strictly ZERO heap allocation!
     pub fn pmd_step_byte(&mut self, prev_byte: u8, lang_id: usize, tau_step: usize) -> (u8, f32, f32) {
-        self.pmd_step_byte_styled(prev_byte, lang_id, 0, tau_step)
+        self.pmd_step_byte_ex(prev_byte, lang_id, 0, tau_step, false)
     }
 
     pub fn pmd_step_byte_styled(
@@ -1083,6 +1303,17 @@ impl DcpaEngine {
         lang_id: usize,
         style_id: usize,
         tau_step: usize,
+    ) -> (u8, f32, f32) {
+        self.pmd_step_byte_ex(prev_byte, lang_id, style_id, tau_step, false)
+    }
+
+    pub fn pmd_step_byte_ex(
+        &mut self,
+        prev_byte: u8,
+        lang_id: usize,
+        style_id: usize,
+        tau_step: usize,
+        extra_stack_reset: bool,
     ) -> (u8, f32, f32) {
         let cfg = &self.weights.cfg;
         let d_s = cfg.d_s;
@@ -1135,6 +1366,10 @@ impl DcpaEngine {
             v_tag[t] = tanhf(v_tag[t]);
         }
 
+        // Spec 1 multi-frame stack reset: 0x04 (EOT), 0x13 (tool suspend), 0x1E (user turn), or `\x1dE\n`
+        if prev_byte == 0x04 || prev_byte == 0x13 || prev_byte == 0x1E || extra_stack_reset {
+            self.motor.stack_xi = [[0.0f32; 4]; 16];
+        }
         let prev_xi = self.motor.stack_xi;
         for row in 0..16 {
             for col in 0..4 {
@@ -1215,8 +1450,17 @@ impl DcpaEngine {
         self.scratch.mon_h.copy_from_slice(&self.weights.sgsc_h0);
         let mut info_sum = 0.0f32;
         for (j, &byte) in seg_bytes[..seg_len].iter().enumerate() {
-            // Prior surprisal
-            linear_f32(&self.scratch.mon_h, &self.weights.sgsc_w_out, None, &mut self.scratch.logits_256);
+            // Strictly causal scale-invariant cosine prior matching sgsc_ingest_byte (8.0 * norm(W_out) @ norm(h))
+            let h_norm = sqrtf(dot_f32(&self.scratch.mon_h, &self.scratch.mon_h) + 1e-2);
+            let inv_h = 8.0 / h_norm;
+            for i in 0..d_s {
+                self.scratch.vec_ds_a[i] = self.scratch.mon_h[i] * inv_h;
+            }
+            for b_i in 0..256 {
+                let row = &self.weights.sgsc_w_out[b_i * d_s..(b_i + 1) * d_s];
+                let w_norm = sqrtf(dot_f32(row, row) + 1e-6);
+                self.scratch.logits_256[b_i] = dot_f32(&self.scratch.vec_ds_a, row) / w_norm;
+            }
             let mut max_l = f32::NEG_INFINITY;
             for &v in self.scratch.logits_256.iter() {
                 if v > max_l {

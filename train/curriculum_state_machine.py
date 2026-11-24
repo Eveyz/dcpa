@@ -570,7 +570,13 @@ class CurriculumController:
             global_lr = _cosine_interp(1.0, end_ratio, progress)
             target_rho = float(self.s3_cfg.get("target_rho", 9.5))
             broca_prob = float(self.s3_cfg.get("broca_cq_prob", 0.5))
-            use_cq = (broca_prob >= 0.5 and (s % 2 == 1)) or broca_prob >= 1.0
+            if broca_prob <= 0.0:
+                use_cq = False
+            elif broca_prob >= 1.0:
+                use_cq = True
+            else:
+                cq_period = max(2, int(round(1.0 / broca_prob)))
+                use_cq = (s % cq_period) == (cq_period - 1)
             state = CurriculumStepState(
                 step=s,
                 stage_id=3,

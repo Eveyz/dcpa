@@ -647,34 +647,28 @@ class DCPAChatSession:
         l_reg = _get_l_reg(active_style_id)
         limit = self.max_new_bytes if max_new_bytes is None else int(max_new_bytes)
 
-        # Initialize Broca CQ queue from current 8-slot working memory graph
-        q_init = torch.sigmoid(self.carry.graph_state.salience.float())
-        q_cur = q_init
-        a_prev = torch.zeros(
-            (1, self.model.cfg.k_slots, self.model.cfg.d_r), device=self.device, dtype=torch.float32
-        )
-
+        # Closed-loop Mode-1 predictive motor drive aligned 1-to-1 with Stage 5 SFT (`use_broca_cq=False`):
+        # derives `c_hat` from live `BCG-PC` graph readout `g_ctx`, updating `self.carry` after each segment!
         def _next_motor_drive():
-            nonlocal q_cur, a_prev
-            cq = self.model.pmd.broca_cq_step(
-                graph=self.carry.graph_state,
-                q_prev=q_cur,
-                q_init=q_init,
-                a_prev=a_prev,
-                l_reg=l_reg,
+            _, g_ctx = self.model.bcg_pc.message_pass(
+                self.carry.graph_state.slots,
+                self.carry.graph_state.edges,
+                self.carry.graph_state.salience,
             )
-            q_cur = cq.q_next
-            a_prev = cq.a_prev_next
-            if bool(cq.done.all().item()):
-                q_cur = torch.sigmoid(self.carry.graph_state.salience.float())
+            c_hat = self.model.bcg_pc.f_pred_2(F.silu(self.model.bcg_pc.f_pred_1(g_ctx)))
             f_out, _ = self.model.hippocampus.read_expression(
-                z_out=cq.z_out,
+                z_out=c_hat,
                 l_reg=l_reg,
                 fast_state=self.carry.fast_state,
                 enabled=True,
             )
-            charge0 = self.model.pmd.init_segment_charge(f_out, cq.delta_syn, l_reg)
-            return f_out, cq.delta_syn, charge0
+            delta_syn = self.model.pmd.compute_streaming_delta_syn(
+                g_ctx=g_ctx,
+                z_star=c_hat,
+                l_reg=l_reg,
+            )
+            charge0 = self.model.pmd.init_segment_charge(f_out, delta_syn, l_reg)
+            return f_out, delta_syn, charge0
 
         f_out, delta_syn, charge_cur = _next_motor_drive()
         m_cur = self.carry.pmd_m
@@ -686,6 +680,7 @@ class DCPAChatSession:
         total_emitted_bytes = 0
         emitted_text_parts: list[str] = []
         recent_bytes = bytearray(prompt_bytes[-3:])
+        utf8_rem = 0
 
         tau_step = 1
         stopped_on_eot = False
@@ -759,6 +754,18 @@ class DCPAChatSession:
             recent_bytes.append(next_byte_val)
             if len(recent_bytes) > 6:
                 del recent_bytes[:-6]
+            if next_byte_val < 0x80:
+                utf8_rem = 0
+            elif (next_byte_val & 0xE0) == 0xC0:
+                utf8_rem = 1
+            elif (next_byte_val & 0xF0) == 0xE0:
+                utf8_rem = 2
+            elif (next_byte_val & 0xF8) == 0xF0:
+                utf8_rem = 3
+            elif (next_byte_val & 0xC0) == 0x80:
+                utf8_rem = max(utf8_rem - 1, 0)
+            else:
+                utf8_rem = 0
 
             # -----------------------------------------------------------------
             # Spec 5.3: `0x11` -> switch temp=0.0 & style_id=4 (strict_code_tool)
@@ -812,11 +819,10 @@ class DCPAChatSession:
                 # Reset stack cleanly on 0x13 suspend boundary and restore user's selected style_id
                 in_tool_call = False
                 tool_call_buf.clear()
+                utf8_rem = 0
                 active_style_id = int(self.style_id)
                 l_reg = _get_l_reg(active_style_id)
                 xi_cur = torch.zeros_like(xi_cur)
-                q_init = torch.sigmoid(self.carry.graph_state.salience.float())
-                q_cur = q_init
                 f_out, delta_syn, charge_cur = _next_motor_drive()
                 prev_b = torch.tensor([obs_bytes[-1]], dtype=torch.long, device=self.device)
                 recent_bytes = bytearray(obs_bytes[-3:])
@@ -859,9 +865,15 @@ class DCPAChatSession:
 
             prev_b = torch.tensor([next_byte_val], dtype=torch.long, device=self.device)
             tau_step += 1
-            if float(p_end[0].item()) >= 0.5 or tau_step > self.model.cfg.max_seg_len:
-                f_out, delta_syn, charge_cur = _next_motor_drive()
-                tau_step = 1
+            hit_scratch_close = len(recent_bytes) >= 3 and bytes(recent_bytes[-3:]) == SCRATCH_END
+            seg_done = float(p_end[0].item()) >= 0.5 or tau_step > self.model.cfg.max_seg_len
+            if hit_scratch_close or seg_done:
+                if (not in_tool_call) and emitted_raw and utf8_rem == 0:
+                    self.ingest_bytes(bytes(emitted_raw), lang_id=lang_id, style_id=active_style_id)
+                    emitted_raw.clear()
+                if utf8_rem == 0 or tau_step > self.model.cfg.max_seg_len + 3:
+                    f_out, delta_syn, charge_cur = _next_motor_drive()
+                    tau_step = 1
 
         tail = decoder.decode(b"", final=True)
         if tail:
@@ -871,7 +883,7 @@ class DCPAChatSession:
         self.carry.pmd_xi = xi_cur.detach().clone()
 
         # Efference-copy feedback: stream remaining assistant reply (+ EOT) into carry state in O(1)
-        if emitted_raw:
+        if emitted_raw or stopped_on_eot:
             self.ingest_bytes(
                 bytes(emitted_raw) + bytes([TURN_EOT_BYTE, 0x0A]),
                 lang_id=lang_id,

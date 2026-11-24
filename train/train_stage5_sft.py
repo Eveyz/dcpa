@@ -241,6 +241,7 @@ def _eval_sft_val_bpc(
             n_sup = float(msk.float().sum().item())
             if n_sup <= 0:
                 continue
+            sft_lam_act = min(0.02, 0.5 * float(model.cfg.lambda_act))
             with amp_autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
                 out = model(
                     raw_bytes=x_b.unsqueeze(0),
@@ -256,7 +257,7 @@ def _eval_sft_val_bpc(
                     lambda_var_override=0.0,
                     lambda_pc_override=0.5,
                     lambda_halt_override=0.5,
-                    lambda_act_override=0.02,
+                    lambda_act_override=sft_lam_act,
                     doc_cu_seqlens=cu,
                 )
             tot_nll += float(out.loss_lang.detach().item()) * n_sup
@@ -410,6 +411,7 @@ def run_stage5_sft(
                 loss_w = build_sft_byte_loss_weights(
                     x_b, msk, eot_weight=eot_weight, tool_ctrl_weight=tool_ctrl_weight
                 ).unsqueeze(0)
+                sft_lam_act = min(0.02, 0.5 * float(model.cfg.lambda_act))
                 with amp_autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
                     out = model(
                         raw_bytes=x_b.unsqueeze(0),
@@ -425,7 +427,7 @@ def run_stage5_sft(
                         lambda_var_override=0.0,
                         lambda_pc_override=0.5,
                         lambda_halt_override=0.5,
-                        lambda_act_override=0.02,
+                        lambda_act_override=sft_lam_act,
                         doc_cu_seqlens=cu,
                         record_traces=False,
                     )

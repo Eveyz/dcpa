@@ -27,15 +27,15 @@ model:
   top_k_experts: 2
   expert_hidden: 1344
   l_max: 8
-  tau_skip: 0.65
-  tau_halt: 0.35
+  tau_skip: 0.32
+  tau_halt: 0.22
   ponder_eta: 0.5
   lambda_moe_bal: 0.01
   max_seg_len: 16
   target_spike_rate: 0.10526315789473684  # 1 / 9.5
   lambda_rate: 2.0
   lambda_var: 1.0
-  lambda_act: 0.04
+  lambda_act: 0.01
   lambda_halt: 1.0
   gamma_hip: 0.999
   lambda_eta: 0.95
@@ -57,6 +57,9 @@ presets:
     top_k_experts: 2
     expert_hidden: 1344
     l_max: 8
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
     lambda_moe_bal: 0.01
   proto_48m:
     d_s: 192
@@ -71,6 +74,9 @@ presets:
     top_k_experts: 2
     expert_hidden: 1728
     l_max: 8
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
     lambda_moe_bal: 0.01
   micro:
     d_s: 64
@@ -139,7 +145,7 @@ optimizer:
 
 curriculum:
   total_steps: 100000
-  stage_boundaries: [0, 15000, 65000, 85000, 100000]
+  stage_boundaries: [0, 15000, 65000, 94000, 100000]
   stage1:
     name: sensorimotor_spelling_autoencoder
     model_stage: A
@@ -177,7 +183,7 @@ curriculum:
     lambda_pc_target: 0.5
     lambda_act_delay_steps: 1000
     lambda_act_ramp_steps: 9000
-    lambda_act_target: 0.04
+    lambda_act_target: 0.01
   stage3:
     name: cross_lingual_reasoning_writing_and_code_stack
     model_stage: C
@@ -192,10 +198,10 @@ curriculum:
     lambda_var: 1.0
     lambda_halt: 1.0
     lambda_pc: 0.5
-    lambda_act: 0.04
+    lambda_act: 0.01
     code_delimiter_focal_weight: 1.5
     code_delimiter_chars: "{}()[]:;\n"
-    broca_cq_prob: 0.5
+    broca_cq_prob: 0.20
     cap_mix_ratio: 0.35
   stage4:
     name: hippocampal_oneshot_meta_plasticity

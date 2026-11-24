@@ -126,33 +126,33 @@ def load_yaml_config(config_path: Optional[str | Path]) -> dict[str, Any]:
 def build_dcpa_config(preset: str, yaml_cfg: Mapping[str, Any]) -> DCPAConfig:
     """Resolve `DCPAConfig` from preset name and optional YAML overrides."""
     preset_key = preset.strip().lower()
+    alias_map = {"48m": "proto_48m", "152m": "standard_152m", "210m": "moe_210m"}
+    canon_key = alias_map.get(preset_key, preset_key)
     factory_map: dict[str, Callable[[], DCPAConfig]] = {
         "proto_48m": DCPAConfig.proto_48m,
-        "48m": DCPAConfig.proto_48m,
         "standard_152m": DCPAConfig.standard_152m,
-        "152m": DCPAConfig.standard_152m,
         "moe_210m": DCPAConfig.moe_210m,
-        "210m": DCPAConfig.moe_210m,
         "base": DCPAConfig.base,
         "tiny": DCPAConfig.tiny,
         "micro": DCPAConfig.micro,
     }
-    if preset_key not in factory_map:
-        raise ValueError(f"Unknown preset {preset!r}; expected one of {sorted(factory_map)}")
-    base_cfg = factory_map[preset_key]()
+    if canon_key not in factory_map:
+        raise ValueError(f"Unknown preset {preset!r}; expected one of {sorted(set(factory_map) | set(alias_map))}")
+    base_cfg = factory_map[canon_key]()
     merged = base_cfg.to_dict()
 
     presets_block = yaml_cfg.get("presets", {}) if isinstance(yaml_cfg, Mapping) else {}
     yaml_model = yaml_cfg.get("model", {}) if isinstance(yaml_cfg, Mapping) else {}
     # Apply YAML model defaults when using the YAML's own default preset
-    if yaml_model and str(yaml_model.get("preset", "")).lower() == preset_key:
+    if yaml_model and alias_map.get(str(yaml_model.get("preset", "")).lower(), str(yaml_model.get("preset", "")).lower()) == canon_key:
         for k, v in yaml_model.items():
             if k in merged:
                 merged[k] = v
-    if isinstance(presets_block, Mapping) and preset_key in presets_block:
-        for k, v in dict(presets_block[preset_key]).items():
-            if k in merged:
-                merged[k] = v
+    for key_cand in (canon_key, preset_key):
+        if isinstance(presets_block, Mapping) and key_cand in presets_block:
+            for k, v in dict(presets_block[key_cand]).items():
+                if k in merged:
+                    merged[k] = v
 
     return DCPAConfig(**merged)
 

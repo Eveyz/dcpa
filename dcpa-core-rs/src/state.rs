@@ -23,6 +23,7 @@ pub const MAX_SEG_CAP: usize = 20;
 pub const MAX_STACK_DS: usize = 256;
 
 /// Module 1 SGSC constant-space streaming state (~388 B active core + fixed segment ring).
+#[derive(Clone)]
 pub struct SgscState {
     pub h: Vec<f32>,         // [d_s]
     pub v: f32,              // LIF membrane potential
@@ -33,6 +34,11 @@ pub struct SgscState {
     pub seg_h: Vec<f32>,     // [MAX_SEG_CAP * d_s] flat pre-allocated segment hidden states
     pub seg_info_sum: f32,   // Running sum of I_t within current segment
     pub seg_bytes: [u8; MAX_SEG_CAP],
+    pub recent_bytes: [u8; 6],
+    pub recent_len: usize,
+    pub seg_pin_hit: bool,
+    pub pending_asst_pin: bool,
+    pub pending_asst_ticks: u8,
 }
 
 impl SgscState {
@@ -48,6 +54,11 @@ impl SgscState {
             seg_h: vec![0.0; MAX_SEG_CAP * d_s],
             seg_info_sum: 0.0,
             seg_bytes: [0u8; MAX_SEG_CAP],
+            recent_bytes: [0u8; 6],
+            recent_len: 0,
+            seg_pin_hit: false,
+            pending_asst_pin: false,
+            pending_asst_ticks: 0,
         }
     }
 
@@ -60,14 +71,39 @@ impl SgscState {
         self.seg_len = 0;
         self.utf8_rem = 0;
         self.seg_info_sum = 0.0;
+        self.recent_bytes = [0u8; 6];
+        self.recent_len = 0;
+        self.seg_pin_hit = false;
+        self.pending_asst_pin = false;
+        self.pending_asst_ticks = 0;
+    }
+
+    #[inline]
+    pub fn copy_from(&mut self, src: &Self) {
+        self.h.copy_from_slice(&src.h);
+        self.v = src.v;
+        self.prev_info = src.prev_info;
+        self.has_prev_byte = src.has_prev_byte;
+        self.seg_len = src.seg_len;
+        self.utf8_rem = src.utf8_rem;
+        self.seg_h.copy_from_slice(&src.seg_h);
+        self.seg_info_sum = src.seg_info_sum;
+        self.seg_bytes = src.seg_bytes;
+        self.recent_bytes = src.recent_bytes;
+        self.recent_len = src.recent_len;
+        self.seg_pin_hit = src.seg_pin_hit;
+        self.pending_asst_pin = src.pending_asst_pin;
+        self.pending_asst_ticks = src.pending_asst_ticks;
     }
 }
 
 /// Module 2 BCG-PC constant-capacity working memory graph (K=8 -> 17.5 KB in L1!).
+#[derive(Clone)]
 pub struct ConceptGraphState {
     pub slots: Vec<f32>,    // [K * D]
     pub edges: Vec<f32>,    // [K * K * d_r]
     pub salience: Vec<f32>, // [K]
+    pub slot0_pinned: bool, // Spec 2 Slot-0 Thesis Pinning latch
 }
 
 impl ConceptGraphState {
@@ -76,6 +112,7 @@ impl ConceptGraphState {
             slots: weights.bcg_s0.clone(),
             edges: weights.bcg_a0.clone(),
             salience: weights.bcg_omega0.clone(),
+            slot0_pinned: false,
         }
     }
 
@@ -83,10 +120,20 @@ impl ConceptGraphState {
         self.slots.copy_from_slice(&weights.bcg_s0);
         self.edges.copy_from_slice(&weights.bcg_a0);
         self.salience.copy_from_slice(&weights.bcg_omega0);
+        self.slot0_pinned = false;
+    }
+
+    #[inline]
+    pub fn copy_from(&mut self, src: &Self) {
+        self.slots.copy_from_slice(&src.slots);
+        self.edges.copy_from_slice(&src.edges);
+        self.salience.copy_from_slice(&src.salience);
+        self.slot0_pinned = src.slot0_pinned;
     }
 }
 
 /// Per-slot synaptic eligibility tags (K=8 -> 4.1 KB in L1!).
+#[derive(Clone)]
 pub struct EligibilityTags {
     pub k_slots: usize,
     pub s_active: usize,
@@ -115,6 +162,14 @@ impl EligibilityTags {
         self.e_val.fill(0.0);
         self.f_tilde.fill(0.0);
         self.eta.fill(0.0);
+    }
+
+    #[inline]
+    pub fn copy_from(&mut self, src: &Self) {
+        self.e_idx.copy_from_slice(&src.e_idx);
+        self.e_val.copy_from_slice(&src.e_val);
+        self.f_tilde.copy_from_slice(&src.f_tilde);
+        self.eta.copy_from_slice(&src.eta);
     }
 }
 
@@ -421,9 +476,94 @@ impl HippocampusFastWeights {
             }
         }
     }
+
+    /// Zero all hippocampal fast weights and familiarity counters (`/wipe`).
+    pub fn wipe_zero(&mut self) {
+        self.step_count = 0;
+        match &mut self.m_c_from_l {
+            ColumnStorage::Bf16(buf) => buf.as_mut_slice().fill(Bf16(0)),
+            ColumnStorage::F32(buf) => buf.as_mut_slice().fill(0.0),
+        }
+        match &mut self.m_l_from_c {
+            ColumnStorage::Bf16(buf) => buf.as_mut_slice().fill(Bf16(0)),
+            ColumnStorage::F32(buf) => buf.as_mut_slice().fill(0.0),
+        }
+        self.u_lex.as_mut_slice().fill(0.0);
+        self.u_sem.as_mut_slice().fill(0.0);
+        self.col_step_lex.fill(0);
+        self.col_step_sem.fill(0);
+        self.col_hits_lex.fill(0);
+    }
+
+    /// Deep-clone hippocampal fast weights (used once at startup for `M_tools_base` snapshot).
+    pub fn clone_snapshot(&self) -> Self {
+        let m_c_from_l = match &self.m_c_from_l {
+            ColumnStorage::Bf16(src) => {
+                let mut dst = AlignedVec::zeroed(src.len());
+                dst.as_mut_slice().copy_from_slice(src.as_slice());
+                ColumnStorage::Bf16(dst)
+            }
+            ColumnStorage::F32(src) => {
+                let mut dst = AlignedVec::zeroed(src.len());
+                dst.as_mut_slice().copy_from_slice(src.as_slice());
+                ColumnStorage::F32(dst)
+            }
+        };
+        let m_l_from_c = match &self.m_l_from_c {
+            ColumnStorage::Bf16(src) => {
+                let mut dst = AlignedVec::zeroed(src.len());
+                dst.as_mut_slice().copy_from_slice(src.as_slice());
+                ColumnStorage::Bf16(dst)
+            }
+            ColumnStorage::F32(src) => {
+                let mut dst = AlignedVec::zeroed(src.len());
+                dst.as_mut_slice().copy_from_slice(src.as_slice());
+                ColumnStorage::F32(dst)
+            }
+        };
+        let mut u_lex = AlignedVec::zeroed(self.u_lex.len());
+        u_lex.as_mut_slice().copy_from_slice(self.u_lex.as_slice());
+        let mut u_sem = AlignedVec::zeroed(self.u_sem.len());
+        u_sem.as_mut_slice().copy_from_slice(self.u_sem.as_slice());
+        Self {
+            d_h: self.d_h,
+            d_concept: self.d_concept,
+            d_s: self.d_s,
+            gamma_hip: self.gamma_hip,
+            step_count: self.step_count,
+            m_c_from_l,
+            m_l_from_c,
+            u_lex,
+            u_sem,
+            col_step_lex: self.col_step_lex.clone(),
+            col_step_sem: self.col_step_sem.clone(),
+            col_hits_lex: self.col_hits_lex.clone(),
+        }
+    }
+
+    /// Zero-allocation in-place restore from a saved `HippocampusFastWeights` snapshot (`/reset`).
+    pub fn restore_from(&mut self, snap: &Self) {
+        self.step_count = snap.step_count;
+        match (&mut self.m_c_from_l, &snap.m_c_from_l) {
+            (ColumnStorage::Bf16(d), ColumnStorage::Bf16(s)) => d.as_mut_slice().copy_from_slice(s.as_slice()),
+            (ColumnStorage::F32(d), ColumnStorage::F32(s)) => d.as_mut_slice().copy_from_slice(s.as_slice()),
+            _ => panic!("FastWeightPrecision mismatch in restore_from"),
+        }
+        match (&mut self.m_l_from_c, &snap.m_l_from_c) {
+            (ColumnStorage::Bf16(d), ColumnStorage::Bf16(s)) => d.as_mut_slice().copy_from_slice(s.as_slice()),
+            (ColumnStorage::F32(d), ColumnStorage::F32(s)) => d.as_mut_slice().copy_from_slice(s.as_slice()),
+            _ => panic!("FastWeightPrecision mismatch in restore_from"),
+        }
+        self.u_lex.as_mut_slice().copy_from_slice(snap.u_lex.as_slice());
+        self.u_sem.as_mut_slice().copy_from_slice(snap.u_sem.as_slice());
+        self.col_step_lex.copy_from_slice(&snap.col_step_lex);
+        self.col_step_sem.copy_from_slice(&snap.col_step_sem);
+        self.col_hits_lex.copy_from_slice(&snap.col_hits_lex);
+    }
 }
 
 /// Module 4 PMD constant-space streaming state (~528 B in L1!).
+#[derive(Clone)]
 pub struct MotorState {
     pub m: Vec<f32>,             // [d_s]
     pub stack_xi: [[f32; 4]; 16],// 16 x 4 differentiable pushdown stack
@@ -457,6 +597,88 @@ impl MotorState {
         self.a_prev.fill(0.0);
         self.last_byte = 0;
         self.charge_e = 0.0;
+    }
+
+    #[inline]
+    pub fn copy_from(&mut self, src: &Self) {
+        self.m.copy_from_slice(&src.m);
+        self.stack_xi = src.stack_xi;
+        self.queue_q.copy_from_slice(&src.queue_q);
+        self.queue_q_init.copy_from_slice(&src.queue_q_init);
+        self.a_prev.copy_from_slice(&src.a_prev);
+        self.last_byte = src.last_byte;
+        self.charge_e = src.charge_e;
+    }
+}
+
+/// O(1) ~22 KB Forkable Brain Working-Memory Snapshot (foundation for zero-KV-cache MCTS/Beam search!).
+/// Captures & restores SGSC + K=8 ConceptGraph + EligibilityTags + Motor/128B Stack in microseconds
+/// with STRICTLY 0 heap allocations during `capture_from` / `restore_into`!
+#[derive(Clone)]
+pub struct BrainSnapshot {
+    pub sgsc: SgscState,
+    pub graph: ConceptGraphState,
+    pub elig: EligibilityTags,
+    pub motor: MotorState,
+}
+
+impl BrainSnapshot {
+    pub fn new(weights: &DcpaWeights) -> Self {
+        Self {
+            sgsc: SgscState::new(weights),
+            graph: ConceptGraphState::new(weights),
+            elig: EligibilityTags::new(&weights.cfg),
+            motor: MotorState::new(weights),
+        }
+    }
+
+    #[inline]
+    pub fn capture_from(
+        &mut self,
+        sgsc: &SgscState,
+        graph: &ConceptGraphState,
+        elig: &EligibilityTags,
+        motor: &MotorState,
+    ) {
+        self.sgsc.copy_from(sgsc);
+        self.graph.copy_from(graph);
+        self.elig.copy_from(elig);
+        self.motor.copy_from(motor);
+    }
+
+    #[inline]
+    pub fn restore_into(
+        &self,
+        sgsc: &mut SgscState,
+        graph: &mut ConceptGraphState,
+        elig: &mut EligibilityTags,
+        motor: &mut MotorState,
+    ) {
+        sgsc.copy_from(&self.sgsc);
+        graph.copy_from(&self.graph);
+        elig.copy_from(&self.elig);
+        motor.copy_from(&self.motor);
+    }
+
+    /// Exact active working-memory footprint in bytes (~22–38 KB depending on d_s/D).
+    pub fn byte_footprint(&self) -> usize {
+        let f32_elems = self.sgsc.h.len()
+            + self.sgsc.seg_h.len()
+            + self.graph.slots.len()
+            + self.graph.edges.len()
+            + self.graph.salience.len()
+            + self.elig.e_val.len()
+            + self.elig.f_tilde.len()
+            + self.elig.eta.len()
+            + self.motor.m.len()
+            + 64
+            + self.motor.queue_q.len()
+            + self.motor.queue_q_init.len()
+            + self.motor.a_prev.len();
+        let usize_elems = self.elig.e_idx.len();
+        f32_elems * core::mem::size_of::<f32>()
+            + usize_elems * core::mem::size_of::<usize>()
+            + 64
     }
 }
 
@@ -528,6 +750,8 @@ pub struct ScratchPool {
     pub wr_all: Vec<f32>,       // [(K+1) * d_merge]
     pub merge_h: Vec<f32>,      // [d_merge]
     pub omega_tilde: Vec<f32>,  // [K+1]
+    pub ca_k: Vec<f32>,         // [K * D] precomputed SlotCrossAttention keys
+    pub ca_v: Vec<f32>,         // [K * D] precomputed SlotCrossAttention values
     pub ca_scores: Vec<f32>,    // [K]
     pub w_attn: Vec<f32>,       // [K]
 
@@ -608,6 +832,8 @@ impl ScratchPool {
             wr_all: vec![0.0; kp1 * cfg.d_merge],
             merge_h: vec![0.0; cfg.d_merge],
             omega_tilde: vec![0.0; kp1],
+            ca_k: vec![0.0; k * d],
+            ca_v: vec![0.0; k * d],
             ca_scores: vec![0.0; k],
             w_attn: vec![0.0; k],
 

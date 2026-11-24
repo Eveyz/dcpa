@@ -15,9 +15,9 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-#[cfg(feature = "std")]
-use crate::bf16::Bf16;
+use crate::bf16::{AlignedVec, Bf16};
 use crate::config::DcpaConfig;
+use crate::simd::{linear_bf16_f32, linear_f32};
 
 #[derive(Debug, Clone)]
 pub struct RawTensor {
@@ -156,13 +156,64 @@ pub fn serialize_safetensors_f32(tensors: &BTreeMap<String, (Vec<usize>, Vec<f32
     out
 }
 
+/// Dual-precision slow expert matrix storage:
+/// - `F32`: exact float32 parity mode (Gate 6a `< 1e-5` cross-stack verification).
+/// - `Bf16`: 64-byte cache-line aligned compact bfloat16 mode (halves memory bandwidth & footprint!).
+pub enum ExpertMatrix {
+    F32(Vec<f32>),
+    Bf16(AlignedVec<Bf16>),
+}
+
+impl ExpertMatrix {
+    pub fn from_f32_vec(v: Vec<f32>) -> Self {
+        Self::F32(v)
+    }
+
+    pub fn pack_bf16(&mut self) {
+        if let Self::F32(src) = self {
+            let mut dst = AlignedVec::<Bf16>::zeroed(src.len());
+            let dst_slice = dst.as_mut_slice();
+            for (i, &val) in src.iter().enumerate() {
+                dst_slice[i] = Bf16::from_f32(val);
+            }
+            *self = Self::Bf16(dst);
+        }
+    }
+
+    #[inline]
+    pub fn linear_no_bias(&self, x: &[f32], out: &mut [f32]) {
+        match self {
+            Self::F32(w) => linear_f32(x, w, None, out),
+            Self::Bf16(w) => linear_bf16_f32(x, w.as_slice(), None, out),
+        }
+    }
+
+    pub fn byte_footprint(&self) -> usize {
+        match self {
+            Self::F32(w) => w.len() * 4,
+            Self::Bf16(w) => w.len() * 2,
+        }
+    }
+}
+
 pub struct ExpertWeights {
-    pub w_gate1: Vec<f32>,
-    pub w_up1: Vec<f32>,
-    pub w_down1: Vec<f32>,
-    pub w_gate2: Vec<f32>,
-    pub w_up2: Vec<f32>,
-    pub w_down2: Vec<f32>,
+    pub w_gate1: ExpertMatrix,
+    pub w_up1: ExpertMatrix,
+    pub w_down1: ExpertMatrix,
+    pub w_gate2: ExpertMatrix,
+    pub w_up2: ExpertMatrix,
+    pub w_down2: ExpertMatrix,
+}
+
+impl ExpertWeights {
+    pub fn pack_bf16(&mut self) {
+        self.w_gate1.pack_bf16();
+        self.w_up1.pack_bf16();
+        self.w_down1.pack_bf16();
+        self.w_gate2.pack_bf16();
+        self.w_up2.pack_bf16();
+        self.w_down2.pack_bf16();
+    }
 }
 
 /// All read-only slow weights and frozen orthogonal buffers of DCPA.
@@ -295,12 +346,12 @@ impl DcpaWeights {
         let mut bcg_experts = Vec::with_capacity(cfg.num_experts);
         for e in 0..cfg.num_experts {
             bcg_experts.push(ExpertWeights {
-                w_gate1: take_vec(&mut map, &format!("bcg_pc.moe.experts.{}.w_gate1.weight", e))?,
-                w_up1: take_vec(&mut map, &format!("bcg_pc.moe.experts.{}.w_up1.weight", e))?,
-                w_down1: take_vec(&mut map, &format!("bcg_pc.moe.experts.{}.w_down1.weight", e))?,
-                w_gate2: take_vec(&mut map, &format!("bcg_pc.moe.experts.{}.w_gate2.weight", e))?,
-                w_up2: take_vec(&mut map, &format!("bcg_pc.moe.experts.{}.w_up2.weight", e))?,
-                w_down2: take_vec(&mut map, &format!("bcg_pc.moe.experts.{}.w_down2.weight", e))?,
+                w_gate1: ExpertMatrix::from_f32_vec(take_vec(&mut map, &format!("bcg_pc.moe.experts.{}.w_gate1.weight", e))?),
+                w_up1: ExpertMatrix::from_f32_vec(take_vec(&mut map, &format!("bcg_pc.moe.experts.{}.w_up1.weight", e))?),
+                w_down1: ExpertMatrix::from_f32_vec(take_vec(&mut map, &format!("bcg_pc.moe.experts.{}.w_down1.weight", e))?),
+                w_gate2: ExpertMatrix::from_f32_vec(take_vec(&mut map, &format!("bcg_pc.moe.experts.{}.w_gate2.weight", e))?),
+                w_up2: ExpertMatrix::from_f32_vec(take_vec(&mut map, &format!("bcg_pc.moe.experts.{}.w_up2.weight", e))?),
+                w_down2: ExpertMatrix::from_f32_vec(take_vec(&mut map, &format!("bcg_pc.moe.experts.{}.w_down2.weight", e))?),
             });
         }
 
@@ -400,5 +451,14 @@ impl DcpaWeights {
             pmd_w_drain_w: take_vec(&mut map, "pmd.w_drain.weight")?,
             pmd_w_drain_b: take_scalar(&mut map, "pmd.w_drain.bias")?,
         })
+    }
+}
+
+impl DcpaWeights {
+    /// Convert all MoE expert matrices into 64-byte aligned `Bf16` storage (~50% lower slow-weight memory!).
+    pub fn pack_experts_bf16(&mut self) {
+        for exp in &mut self.bcg_experts {
+            exp.pack_bf16();
+        }
     }
 }

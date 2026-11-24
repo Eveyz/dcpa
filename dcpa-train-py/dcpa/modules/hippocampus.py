@@ -215,12 +215,13 @@ class CompactHouseholderState:
         phi_val: torch.Tensor,
         f_tilde: torch.Tensor,
         write_threshold: float = 0.05,
+        _skip_thresh_check: bool = False,
     ) -> None:
         """Apply single-slot Householder Gated Delta update & familiarity update.
 
         Only appends a trace entry if max(beta) > write_threshold (keeping trace <= W_max).
         """
-        if float(beta.detach().max().item()) <= write_threshold:
+        if (not _skip_thresh_check) and float(beta.detach().max().item()) <= write_threshold:
             return
 
         # Precision Island #5 (Red Line #1): s=32 active sparse column Householder Gated Delta
@@ -375,6 +376,7 @@ class ColumnMajorFastWeights:
         phi_val: torch.Tensor,
         f_tilde: torch.Tensor,
         write_threshold: float = 0.0,
+        _skip_thresh_check: bool = False,
     ) -> None:
         b_val = float(beta[0].item())
         if b_val <= write_threshold:
@@ -685,23 +687,24 @@ class HippocampusDualMemory(nn.Module):
                 else (0.0 if write_threshold is None else write_threshold)
             )
 
-            # Compute semantic sparse addresses for slots that will write
-            for slot_i in range(K):
-                beta_i = beta[:, slot_i]
-                if float(beta_i.detach().max().item()) <= thresh:
-                    continue
-                s_bar_i = s_bar_post[:, slot_i, :]
-                phi_idx_i, phi_val_i = self.dg_sem(s_bar_i)
-                fast_state.write_slot(
-                    beta=beta_i,
-                    e_idx=elig.e_idx[:, slot_i, :],
-                    e_val=elig.e_val[:, slot_i, :],
-                    s_bar=s_bar_i,
-                    phi_idx=phi_idx_i,
-                    phi_val=phi_val_i,
-                    f_tilde=elig.f_tilde[:, slot_i, :],
-                    write_threshold=thresh,
-                )
+            # Single `[K]` max-beta transfer + single batched `[B, K, D]` DG semantic projection
+            # (cuts 16 CUDA-CPU `.item()` syncs -> 1 and 8 sequential `dg_sem` GEMMs -> 1 per step!).
+            slot_max_betas = beta.detach().amax(dim=0).to("cpu").tolist()
+            active_slots = [si for si, mb in enumerate(slot_max_betas) if float(mb) > thresh]
+            if active_slots:
+                phi_idx_all, phi_val_all = self.dg_sem(s_bar_post)  # [B, K, s]
+                for slot_i in active_slots:
+                    fast_state.write_slot(
+                        beta=beta[:, slot_i],
+                        e_idx=elig.e_idx[:, slot_i, :],
+                        e_val=elig.e_val[:, slot_i, :],
+                        s_bar=s_bar_post[:, slot_i, :],
+                        phi_idx=phi_idx_all[:, slot_i, :],
+                        phi_val=phi_val_all[:, slot_i, :],
+                        f_tilde=elig.f_tilde[:, slot_i, :],
+                        write_threshold=thresh,
+                        _skip_thresh_check=True,
+                    )
 
             # Quench consumed eligibility traces
             new_eta = (1.0 - self.cfg.kappa_quench * beta.detach()) * elig.eta.float()

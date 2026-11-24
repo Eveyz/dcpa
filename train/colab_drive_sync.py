@@ -43,7 +43,7 @@ SLOT_FILES: dict[str, str] = {
     "B": "slot_B.pt",
 }
 
-MILESTONE_STEPS: tuple[int, ...] = (15_000, 65_000, 85_000, 100_000)
+MILESTONE_STEPS: tuple[int, ...] = (15_000, 65_000, 94_000, 100_000)
 MAX_MILESTONE_FILES: int = 5  # 4 stage boundaries + best_model.pt
 COPY_CHUNK_BYTES: int = 4 * 1024 * 1024  # 4 MB FUSE-friendly sequential buffer
 

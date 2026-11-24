@@ -189,6 +189,7 @@ class DCPAModel(nn.Module):
         w_gu2: torch.Tensor,
         w_d2: torch.Tensor,
         gumbel_u: torch.Tensor,
+        compute_s_bar_post: bool = True,
     ) -> tuple[torch.Tensor, ...]:
         return self.bcg_pc(
             in_slots,
@@ -209,6 +210,7 @@ class DCPAModel(nn.Module):
             packed_moe_w_gu2=w_gu2,
             packed_moe_w_d2=w_d2,
             gumbel_u=gumbel_u,
+            compute_s_bar_post=compute_s_bar_post,
         )
 
     def count_parameters(self) -> dict[str, int]:
@@ -1062,6 +1064,7 @@ class DCPAModel(nn.Module):
                             w_gu2,
                             w_d2,
                             gumbel_u_step,
+                            hip_enabled,
                             use_reentrant=False,
                             preserve_rng_state=False,
                         )
@@ -1087,6 +1090,7 @@ class DCPAModel(nn.Module):
                             packed_moe_w_gu2=w_gu2,
                             packed_moe_w_d2=w_d2,
                             gumbel_u=gumbel_u_step,
+                            compute_s_bar_post=hip_enabled,
                         )
                     (
                         z_star_step,
@@ -1390,6 +1394,9 @@ class DCPAModel(nn.Module):
                 a_prev = torch.zeros((V, self.cfg.k_slots, self.cfg.d_r), device=device, dtype=g_state.edges.dtype)
                 cq_f_out = f_out_flat.clone()
                 cq_delta_syn = delta_syn_flat.clone()
+                seg_counts_i64 = seg_counts.to(torch.int64)
+                cq_win_len = seg_counts_i64.clamp_max(self.cfg.k_slots)
+                cq_tail_start = (seg_counts_i64 - cq_win_len).clamp_min(0)
                 for n_step in range(min(self.cfg.k_slots, m_max)):
                     cq_out = self.pmd.broca_cq_step(
                         graph=g_state,
@@ -1400,7 +1407,7 @@ class DCPAModel(nn.Module):
                     )
                     q_cur = cq_out.q_next
                     a_prev = cq_out.a_prev_next
-                    active_b = torch.nonzero(n_step < seg_counts, as_tuple=False).squeeze(-1)
+                    active_b = torch.nonzero(n_step < cq_win_len, as_tuple=False).squeeze(-1)
                     if active_b.numel() > 0:
                         f_cq_all, _ = self.hippocampus.read_expression(
                             z_out=cq_out.z_out,
@@ -1409,7 +1416,7 @@ class DCPAModel(nn.Module):
                             enabled=hip_enabled,
                         )
                         f_cq = f_cq_all[active_b]
-                        flat_idx = seg_offsets[active_b].to(torch.int64) + n_step
+                        flat_idx = seg_offsets[active_b].to(torch.int64) + cq_tail_start[active_b] + n_step
                         cq_f_out[flat_idx] = f_cq.to(cq_f_out.dtype)
                         cq_delta_syn[flat_idx] = cq_out.delta_syn[active_b].to(cq_delta_syn.dtype)
                 f_decode = cq_f_out

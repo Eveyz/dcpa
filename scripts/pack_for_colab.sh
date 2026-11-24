@@ -17,40 +17,44 @@ fi
 
 BUNDLE_PATH="${REPO_ROOT}/dcpa_colab_bundle.zip"
 NOTEBOOK_PATH="${REPO_ROOT}/notebooks/Colab_DCPA_Train.ipynb"
-MAX_BYTES=512000  # 500 KB strict ceiling
+SPARK_NOTEBOOK_PATH="${REPO_ROOT}/notebooks/DGX_Spark_DCPA_Train.ipynb"
+MAX_BYTES=768000  # 750 KB ceiling covering v2 cognitive modules
 
-echo "[1/3] Validating ${NOTEBOOK_PATH} (JSON schema + ast.parse across all code cells)..."
-"${PYTHON_BIN}" - "${NOTEBOOK_PATH}" <<'PYEOF'
+echo "[1/3] Validating Notebooks (JSON schema + ast.parse across all code cells)..."
+"${PYTHON_BIN}" - "${NOTEBOOK_PATH}" "${SPARK_NOTEBOOK_PATH}" <<'PYEOF'
 import ast
 import json
 import sys
 from pathlib import Path
 
-nb_path = Path(sys.argv[1])
-if not nb_path.exists():
-    raise SystemExit(f"ERROR: Notebook not found: {nb_path}")
+for idx_nb, nb_arg in enumerate(sys.argv[1:]):
+    nb_path = Path(nb_arg)
+    if not nb_path.exists():
+        raise SystemExit(f"ERROR: Notebook not found: {nb_path}")
 
-data = json.loads(nb_path.read_text(encoding="utf-8"))
-if data.get("nbformat") != 4:
-    raise SystemExit(f"ERROR: Expected Jupyter nbformat == 4, got {data.get('nbformat')!r}")
+    data = json.loads(nb_path.read_text(encoding="utf-8"))
+    if data.get("nbformat") != 4:
+        raise SystemExit(f"ERROR: Expected Jupyter nbformat == 4 in {nb_path.name}, got {data.get('nbformat')!r}")
 
-cells = data.get("cells")
-if not isinstance(cells, list) or len(cells) != 6:
-    raise SystemExit(f"ERROR: Expected exactly 6 cells, got {len(cells) if isinstance(cells, list) else type(cells)}")
+    cells = data.get("cells")
+    if not isinstance(cells, list) or len(cells) == 0:
+        raise SystemExit(f"ERROR: Invalid cells in {nb_path.name}")
+    if idx_nb == 0 and len(cells) != 6:
+        raise SystemExit(f"ERROR: Expected exactly 6 cells in {nb_path.name}, got {len(cells)}")
 
-code_cells = 0
-for idx, cell in enumerate(cells, start=1):
-    if cell.get("cell_type") == "code":
-        code_cells += 1
-        src = cell.get("source", "")
-        if isinstance(src, list):
-            src = "".join(src)
-        try:
-            ast.parse(src, filename=f"{nb_path.name}#cell_{idx}")
-        except SyntaxError as exc:
-            raise SystemExit(f"ERROR: ast.parse failed on Cell {idx}: {exc}") from exc
+    code_cells = 0
+    for idx, cell in enumerate(cells, start=1):
+        if cell.get("cell_type") == "code":
+            code_cells += 1
+            src = cell.get("source", "")
+            if isinstance(src, list):
+                src = "".join(src)
+            try:
+                ast.parse(src, filename=f"{nb_path.name}#cell_{idx}")
+            except SyntaxError as exc:
+                raise SystemExit(f"ERROR: ast.parse failed on {nb_path.name} Cell {idx}: {exc}") from exc
 
-print(f"  [OK] Valid Jupyter v4 JSON ({len(cells)} cells, {code_cells} code cells passed ast.parse).")
+    print(f"  [OK] {nb_path.name}: Valid Jupyter v4 JSON ({len(cells)} cells, {code_cells} code cells passed ast.parse).")
 PYEOF
 
 echo "[2/3] Packaging pure source & config bundle -> ${BUNDLE_PATH}..."
@@ -172,15 +176,21 @@ for name in names:
 required = [
     "configs/dcpa_48m_train.yaml",
     "configs/dcpa_210m_moe.yaml",
+    "configs/dcpa_210m_v2_cognitive.yaml",
     "utils/device.py",
     "utils/chat_protocol.py",
     "data/build_corpus.py",
+    "data/cognitive_v2_sources.py",
     "data/build_sft_stage5.py",
     "data/build_cap_reasoning.py",
     "data/build_cap_writing.py",
+    "data/build_cap_code_v2.py",
+    "data/build_cap_instruct.py",
     "data/build_cap_toolcall.py",
+    "data/prepare_vast_corpus.py",
     "data/ragged_dataloader.py",
     "data/wug_generator.py",
+    "docs/DCPA_ROADMAP.md",
     "train/colab_drive_sync.py",
     "train/curriculum_state_machine.py",
     "train/watchdog_and_ckpt.py",
@@ -196,7 +206,9 @@ required = [
     "tests/test_perf_and_compile.py",
     "tests/test_stage5_and_repl.py",
     "tests/test_capabilities_upgrade.py",
+    "tests/test_v2_cognitive_pipeline.py",
     "notebooks/Colab_DCPA_Train.ipynb",
+    "notebooks/DGX_Spark_DCPA_Train.ipynb",
     "dcpa-train-py/dcpa/compile_utils.py",
     "dcpa-train-py/dcpa/model.py",
 ]

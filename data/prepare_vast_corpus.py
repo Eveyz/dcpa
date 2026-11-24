@@ -53,6 +53,8 @@ class DataProfileSpec:
     sft_train_mb: float
     sft_val_mb: float
     min_free_gb: float
+    cognitive_v2: bool = False
+    cap_code_mb: float = 0.0
 
 
 PROFILES: dict[str, DataProfileSpec] = {
@@ -116,6 +118,40 @@ PROFILES: dict[str, DataProfileSpec] = {
         sft_val_mb=8.0,
         min_free_gb=95.0,
     ),
+    "v2_cognitive_smoke": DataProfileSpec(
+        name="v2_cognitive_smoke",
+        description="DCPA v2 (moe_210m) ~22 MB holistic 35:35:30 smoke shards (6-domain staged + Logic/Writing/Code alchemy, zero Rust).",
+        smoke_quota=True,
+        corpus_scale_factor=1.0,
+        stem_upgrade=False,
+        corpus_workers=2,
+        cap_reasoning_mb=2.0,
+        cap_instruct_mb=2.0,
+        cap_writing_mb=2.0,
+        cap_toolcall_mb=2.0,
+        sft_train_mb=1.0,
+        sft_val_mb=0.125,
+        min_free_gb=2.0,
+        cognitive_v2=True,
+        cap_code_mb=2.0,
+    ),
+    "v2_cognitive_5g": DataProfileSpec(
+        name="v2_cognitive_5g",
+        description="Recommended single-GPU DCPA v2 (moe_210m) ~5.9 GB holistic 35:35:30 corpus (6-domain staged + SYNTH/Writing/Code alchemy + Stage 5 multi-draft, zero Rust).",
+        smoke_quota=False,
+        corpus_scale_factor=12.0,
+        stem_upgrade=False,
+        corpus_workers=6,
+        cap_reasoning_mb=160.0,
+        cap_instruct_mb=40.0,
+        cap_writing_mb=160.0,
+        cap_toolcall_mb=40.0,
+        sft_train_mb=80.0,
+        sft_val_mb=4.0,
+        min_free_gb=14.0,
+        cognitive_v2=True,
+        cap_code_mb=120.0,
+    ),
 }
 
 
@@ -166,8 +202,8 @@ def verify_shard_triplet(
     return True, f"ok ({idx_size // IDX_RECORD_SIZE} docs, {bin_size / (1024 * 1024):.2f} MB)"
 
 
-def verify_all_shards(nvme_root: Path) -> dict[str, dict[str, Any]]:
-    """Verify all 6 shard groups (`data`, `cap_reasoning`, `cap_instruct`, `cap_writing`, `cap_toolcall`, `sft`)."""
+def verify_all_shards(nvme_root: Path, *, include_cap_code: bool = False) -> dict[str, dict[str, Any]]:
+    """Verify shard groups (`data`, `cap_reasoning`, `cap_instruct`, `cap_writing`, `cap_toolcall`, optional `cap_code`, `sft`)."""
     data_dir = nvme_root / "data"
     cap_dir = nvme_root / "cap_data"
     sft_dir = nvme_root / "sft_data"
@@ -225,19 +261,32 @@ def verify_all_shards(nvme_root: Path) -> dict[str, dict[str, Any]]:
                 cap_dir / "cap_toolcall_val.loss_mask.bin",
             ),
         ],
-        "stage5_sft": [
-            (
-                sft_dir / "sft_train.bin",
-                sft_dir / "sft_train.idx",
-                sft_dir / "sft_train.loss_mask.bin",
-            ),
-            (
-                sft_dir / "sft_val.bin",
-                sft_dir / "sft_val.idx",
-                sft_dir / "sft_val.loss_mask.bin",
-            ),
-        ],
     }
+    if include_cap_code:
+        checks["cap_code"] = [
+            (
+                cap_dir / "cap_code_train.bin",
+                cap_dir / "cap_code_train.idx",
+                cap_dir / "cap_code_train.loss_mask.bin",
+            ),
+            (
+                cap_dir / "cap_code_val.bin",
+                cap_dir / "cap_code_val.idx",
+                cap_dir / "cap_code_val.loss_mask.bin",
+            ),
+        ]
+    checks["stage5_sft"] = [
+        (
+            sft_dir / "sft_train.bin",
+            sft_dir / "sft_train.idx",
+            sft_dir / "sft_train.loss_mask.bin",
+        ),
+        (
+            sft_dir / "sft_val.bin",
+            sft_dir / "sft_val.idx",
+            sft_dir / "sft_val.loss_mask.bin",
+        ),
+    ]
 
     report: dict[str, dict[str, Any]] = {}
     for group_name, triplets in checks.items():
@@ -288,8 +337,12 @@ def build_job_plan(
         corpus_cmd.append("--smoke-quota")
     if spec.stem_upgrade:
         corpus_cmd.append("--stem-upgrade")
+    if spec.cognitive_v2:
+        corpus_cmd.append("--cognitive-v2")
+    if offline_synthetic:
+        corpus_cmd.append("--offline")
 
-    def _cap_cmd(script_name: str, target_mb: float, sub_seed: int) -> list[str]:
+    def _cap_cmd(script_name: str, target_mb: float, sub_seed: int, *, extra_flags: tuple[str, ...] = ()) -> list[str]:
         cmd = [
             python_bin,
             str(_REPO_ROOT / "data" / script_name),
@@ -304,6 +357,7 @@ def build_job_plan(
             cmd.append("--smoke-quota")
         if offline_synthetic:
             cmd.append("--offline")
+        cmd.extend(extra_flags)
         return cmd
 
     sft_cmd = [
@@ -320,17 +374,23 @@ def build_job_plan(
     ]
     if spec.smoke_quota:
         sft_cmd.append("--smoke-quota")
+    if spec.cognitive_v2:
+        sft_cmd.append("--cognitive-v2")
     if offline_synthetic:
         sft_cmd.append("--offline")
 
-    return {
+    reas_flags = ("--cognitive-v2",) if spec.cognitive_v2 else ()
+    jobs: dict[str, list[str]] = {
         "corpus_5domain": corpus_cmd,
-        "cap_reasoning": _cap_cmd("build_cap_reasoning.py", spec.cap_reasoning_mb, seed + 11),
+        "cap_reasoning": _cap_cmd("build_cap_reasoning.py", spec.cap_reasoning_mb, seed + 11, extra_flags=reas_flags),
         "cap_instruct": _cap_cmd("build_cap_instruct.py", spec.cap_instruct_mb, seed + 14),
         "cap_writing": _cap_cmd("build_cap_writing.py", spec.cap_writing_mb, seed + 12),
         "cap_toolcall": _cap_cmd("build_cap_toolcall.py", spec.cap_toolcall_mb, seed + 13),
-        "stage5_sft": sft_cmd,
     }
+    if spec.cap_code_mb > 0.0:
+        jobs["cap_code"] = _cap_cmd("build_cap_code_v2.py", spec.cap_code_mb, seed + 15)
+    jobs["stage5_sft"] = sft_cmd
+    return jobs
 
 
 def _restore_from_archive(archive_src: str, nvme_root: Path) -> None:
@@ -427,7 +487,8 @@ def prepare_vast_corpus(
         "TOKENIZERS_PARALLELISM": "false",
     }
 
-    existing_status = verify_all_shards(root) if root.exists() else {}
+    has_cap_code = spec.cap_code_mb > 0.0
+    existing_status = verify_all_shards(root, include_cap_code=has_cap_code) if root.exists() else {}
 
     if dry_run:
         free_gb = None
@@ -464,7 +525,7 @@ def prepare_vast_corpus(
     if from_archive:
         _restore_from_archive(from_archive, root)
 
-    status = verify_all_shards(root)
+    status = verify_all_shards(root, include_cap_code=has_cap_code)
     pending_jobs: list[tuple[str, list[str]]] = []
     for job_name, cmd in plan.items():
         if not force and status.get(job_name, {}).get("valid", False):
@@ -539,7 +600,7 @@ def prepare_vast_corpus(
                 msg_lines.append(f"  * {j_name} (exit={rc}, log={log_path}):\n    {tail}")
             raise RuntimeError("\n".join(msg_lines))
 
-    final_status = verify_all_shards(root)
+    final_status = verify_all_shards(root, include_cap_code=has_cap_code)
     invalid = [k for k, v in final_status.items() if not v["valid"]]
     if invalid:
         raise RuntimeError(f"Shard integrity verification failed for {invalid}: {json.dumps(final_status, indent=2)}")

@@ -44,6 +44,27 @@ for _p in (str(_REPO_ROOT), str(_TRAIN_PY)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from data.cognitive_v2_sources import (
+    COGNITIVE_V2_DOMAIN_IDS,
+    COGNITIVE_V2_DOMAIN_NAMES,
+    COGNITIVE_V2_SMOKE_TRAIN_QUOTAS,
+    COGNITIVE_V2_SMOKE_VAL_QUOTAS,
+    COGNITIVE_V2_SOURCE_IDS,
+    COGNITIVE_V2_TRAIN_QUOTAS,
+    COGNITIVE_V2_VAL_QUOTAS,
+    SID_JS_ES6_SHORT_S1,
+    SID_ZH_PROSE_SHORT_S1,
+    infer_corpus_style_id,
+    stream_en_cosmopedia_s2,
+    stream_en_finephrase_s1,
+    stream_en_us_pd_books_s1,
+    stream_formal_finemath_s2_s3,
+    stream_formal_folio_and_logic_s2,
+    stream_offline_cognitive_domain,
+    stream_python_edu_and_swallow,
+    stream_sql_create_context_s2,
+    stream_zh_cci3_hq_s2,
+)
 from data.ragged_dataloader import IDX_RECORD_FMT, IDX_RECORD_SIZE, utf8_safe_end
 
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
@@ -100,6 +121,7 @@ SOURCE_IDS: dict[str, int] = {
     "git:python-ecosystem": 15,
     "wikimedia/wikipedia:20231101.ja": 16,
     "git:javascript-ecosystem": 17,
+    **COGNITIVE_V2_SOURCE_IDS,
 }
 
 # Regexes for text hygiene & code fence extraction
@@ -1089,6 +1111,205 @@ class _DomainAccum:
         return self.train_bytes >= self.train_target and self.val_bytes >= self.val_target
 
 
+def _populate_cognitive_v2_domain(
+    lang_id: int,
+    acc: _DomainAccum,
+    emit_fn: Any,
+    validator: CodeASTValidator,
+    *,
+    smoke_quota: bool,
+    scale_factor: float,
+    offline: bool,
+    seed: int = 2026,
+) -> dict[str, Any]:
+    """Populate one v2 cognitive domain (`0=en, 1=zh, 2=formal, 3=python, 4=sql_struct, 5=javascript`, ZERO Rust)."""
+    t0 = time.perf_counter()
+    total_target = acc.train_target + acc.val_target
+
+    if not offline:
+        if lang_id == 0:
+            s1_fp_cap = int(0.18 * total_target)
+            s1_bk_cap = int(0.32 * total_target)
+            s2_co_cap = int(0.68 * total_target)
+            print("  -> [en | v2] Stage-1 HuggingFaceFW/finephrase...", flush=True)
+            for doc_b, sid in stream_en_finephrase_s1():
+                emit_fn(acc, doc_b, sid, 0)
+                if (acc.train_bytes + acc.val_bytes) >= s1_fp_cap or acc.done:
+                    break
+            if not acc.done:
+                print("  -> [en | v2] Stage-1 storytracer/US-PD-Books...", flush=True)
+                for doc_b, sid in stream_en_us_pd_books_s1():
+                    emit_fn(acc, doc_b, sid, 0)
+                    if (acc.train_bytes + acc.val_bytes) >= s1_bk_cap or acc.done:
+                        break
+            if not acc.done:
+                print("  -> [en | v2] Stage-2 HuggingFaceTB/cosmopedia-v2...", flush=True)
+                for doc_b, sid in stream_en_cosmopedia_s2():
+                    emit_fn(acc, doc_b, sid, 0)
+                    if (acc.train_bytes + acc.val_bytes) >= s2_co_cap or acc.done:
+                        break
+            if not acc.done:
+                print("  -> [en | v2] Stage-2/3 HuggingFaceFW/fineweb-edu (int_score>=4)...", flush=True)
+                for doc_b, sid in _stream_en_fineweb_edu_stem():
+                    emit_fn(acc, doc_b, sid, 0)
+                    if acc.done:
+                        break
+
+        elif lang_id == 1:
+            s1_cap = int(0.28 * total_target)
+            s2_cci_cap = int(0.62 * total_target)
+            v21_shards = 3 if smoke_quota else min(400, max(32, int(32 * scale_factor)))
+            print("  -> [zh | v2] Stage-1/2 opencsg/Fineweb-Edu-Chinese-V2.1 (4_5)...", flush=True)
+            for doc_b, sid in _stream_zh_fineweb_v21(max_shards=v21_shards):
+                eff_sid = SID_ZH_PROSE_SHORT_S1 if len(doc_b) <= 512 else sid
+                emit_fn(acc, doc_b, eff_sid, 0)
+                if (acc.train_bytes + acc.val_bytes) >= s1_cap or acc.done:
+                    break
+            if not acc.done:
+                print("  -> [zh | v2] Stage-2/3 BAAI/CCI3-HQ (auto-fallback if gated)...", flush=True)
+                for doc_b, sid in stream_zh_cci3_hq_s2():
+                    emit_fn(acc, doc_b, sid, 0)
+                    if (acc.train_bytes + acc.val_bytes) >= s2_cci_cap or acc.done:
+                        break
+            if not acc.done:
+                print("  -> [zh | v2] Stage-2/3 opencsg/Fineweb-Edu-Chinese-V3 + V2.1 essays...", flush=True)
+                for doc_b, sid in _stream_zh_fineweb_v3():
+                    emit_fn(acc, doc_b, sid, 0)
+                    if acc.done:
+                        break
+            if not acc.done:
+                for doc_b, sid in _stream_zh_fineweb_v21(max_shards=min(500, v21_shards + 50)):
+                    emit_fn(acc, doc_b, sid, 0)
+                    if acc.done:
+                        break
+
+        elif lang_id == 2:
+            s2_fol_cap = int(0.45 * total_target)
+            print("  -> [formal | v2] Stage-2 FOLIO (<=3 epochs) + ProofWriter + LogiQA...", flush=True)
+            for doc_b, sid in stream_formal_folio_and_logic_s2(max_folio_epochs=3):
+                emit_fn(acc, doc_b, sid, 0)
+                if (acc.train_bytes + acc.val_bytes) >= s2_fol_cap or acc.done:
+                    break
+            if not acc.done:
+                print("  -> [formal | v2] Stage-2/3 HuggingFaceTB/finemath-4plus...", flush=True)
+                for doc_b, sid in stream_formal_finemath_s2_s3():
+                    emit_fn(acc, doc_b, sid, 0)
+                    if acc.done:
+                        break
+            if not acc.done:
+                for doc_b, sid in _stream_en_open_web_math():
+                    emit_fn(acc, doc_b, sid, 0)
+                    if acc.done:
+                        break
+
+        elif lang_id == 3:
+            print("  -> [python | v2] Stage-1 python-edu + Stage-2 swallow-code-v2 (AST-gated)...", flush=True)
+            for raw_code, sid in stream_python_edu_and_swallow():
+                acc.code_candidates += 1
+                cleaned = normalize_and_validate_text(raw_code)
+                if cleaned is None:
+                    acc.code_rejected += 1
+                    continue
+                code_b = cleaned.encode("utf-8", errors="strict")
+                ok, depth = validator.validate("python", code_b)
+                if not ok or (sid == 24 and depth > 8):
+                    acc.code_rejected += 1
+                    continue
+                emit_fn(acc, code_b, sid, depth)
+                if acc.done:
+                    break
+            if not acc.done:
+                for raw_code, sid in _stream_tiny_codes("python"):
+                    acc.code_candidates += 1
+                    cleaned = normalize_and_validate_text(raw_code)
+                    if cleaned is None:
+                        acc.code_rejected += 1
+                        continue
+                    code_b = cleaned.encode("utf-8", errors="strict")
+                    ok, depth = validator.validate("python", code_b)
+                    if not ok:
+                        acc.code_rejected += 1
+                        continue
+                    eff_sid = 24 if (len(code_b) <= 512 and depth <= 8) else sid
+                    emit_fn(acc, code_b, eff_sid, depth)
+                    if acc.done:
+                        break
+            if not acc.done and scale_factor > 1.5:
+                for raw_code, sid in _stream_python_git_repos():
+                    acc.code_candidates += 1
+                    cleaned = normalize_and_validate_text(raw_code)
+                    if cleaned is None:
+                        acc.code_rejected += 1
+                        continue
+                    code_b = cleaned.encode("utf-8", errors="strict")
+                    ok, depth = validator.validate("python", code_b)
+                    if not ok:
+                        acc.code_rejected += 1
+                        continue
+                    emit_fn(acc, code_b, sid, depth)
+                    if acc.done:
+                        break
+
+        elif lang_id == 4:
+            s2_sql_cap = int(0.70 * total_target)
+            print("  -> [sql_struct | v2] Stage-1/2 b-mc2/sql-create-context...", flush=True)
+            for doc_b, sid in stream_sql_create_context_s2():
+                emit_fn(acc, doc_b, sid, 0)
+                if (acc.train_bytes + acc.val_bytes) >= s2_sql_cap or acc.done:
+                    break
+
+        elif lang_id == 5:
+            print("  -> [javascript | v2] Stage-1/2 ES6+ tiny-codes & modular JS (AST-gated)...", flush=True)
+            for raw_code, sid in _stream_tiny_codes("javascript"):
+                acc.code_candidates += 1
+                cleaned = normalize_and_validate_text(raw_code)
+                if cleaned is None:
+                    acc.code_rejected += 1
+                    continue
+                code_b = cleaned.encode("utf-8", errors="strict")
+                ok, depth = validator.validate("javascript", code_b)
+                if not ok:
+                    acc.code_rejected += 1
+                    continue
+                eff_sid = SID_JS_ES6_SHORT_S1 if (len(code_b) <= 512 and depth <= 8) else sid
+                emit_fn(acc, code_b, eff_sid, depth)
+                if acc.done:
+                    break
+            if not acc.done:
+                for raw_code, sid in _stream_js_git_repos(extended=(scale_factor > 1.2)):
+                    acc.code_candidates += 1
+                    cleaned = normalize_and_validate_text(raw_code)
+                    if cleaned is None:
+                        acc.code_rejected += 1
+                        continue
+                    code_b = cleaned.encode("utf-8", errors="strict")
+                    ok, depth = validator.validate("javascript", code_b)
+                    if not ok:
+                        acc.code_rejected += 1
+                        continue
+                    emit_fn(acc, code_b, sid, depth)
+                    if acc.done:
+                        break
+
+    # Deterministic multi-tier top-up / offline synthesis (guarantees exact quota even offline!)
+    if not acc.done:
+        for doc_b, sid in stream_offline_cognitive_domain(lang_id, seed=seed):
+            if lang_id in (3, 5):
+                acc.code_candidates += 1
+                lang_key = "python" if lang_id == 3 else "javascript"
+                ok, depth = validator.validate(lang_key, doc_b)
+                if not ok:
+                    acc.code_rejected += 1
+                    continue
+                emit_fn(acc, doc_b, sid, depth)
+            else:
+                emit_fn(acc, doc_b, sid, 0)
+            if acc.done:
+                break
+
+    return _finalize_domain_stat(acc, time.perf_counter() - t0)
+
+
 def _populate_single_domain(
     lang_id: int,
     acc: _DomainAccum,
@@ -1098,8 +1319,22 @@ def _populate_single_domain(
     smoke_quota: bool,
     scale_factor: float,
     stem_upgrade: bool,
+    cognitive_v2: bool = False,
+    offline: bool = False,
+    seed: int = 2026,
 ) -> dict[str, Any]:
-    """Populate a single `lang_id` (`0..4`) via `emit_fn(acc, doc_bytes, source_id, max_depth)`."""
+    """Populate a single `lang_id` (`0..5`) via `emit_fn(acc, doc_bytes, source_id, max_depth)`."""
+    if cognitive_v2:
+        return _populate_cognitive_v2_domain(
+            lang_id,
+            acc,
+            emit_fn,
+            validator,
+            smoke_quota=smoke_quota,
+            scale_factor=scale_factor,
+            offline=offline,
+            seed=seed,
+        )
     t0 = time.perf_counter()
     use_stem = stem_upgrade or (not smoke_quota and scale_factor > 1.5)
     total_target = acc.train_target + acc.val_target
@@ -1292,14 +1527,26 @@ def _populate_single_domain(
 
 def _worker_spool_domain(args_tuple: tuple[Any, ...]) -> dict[str, Any]:
     """Subprocess worker that streams & AST-gates a single domain into a temporary spool file."""
-    lang_id, train_target, val_target, spool_dir_str, seed, smoke_quota, scale_factor, stem_upgrade = args_tuple
+    (
+        lang_id,
+        train_target,
+        val_target,
+        spool_dir_str,
+        seed,
+        smoke_quota,
+        scale_factor,
+        stem_upgrade,
+        cognitive_v2,
+        offline,
+    ) = args_tuple
     spool_dir = Path(spool_dir_str)
     spool_dir.mkdir(parents=True, exist_ok=True)
     spool_bin = spool_dir / f"dom_{lang_id}.bin"
     spool_rec = spool_dir / f"dom_{lang_id}.rec"
 
     validator = CodeASTValidator()
-    acc = _DomainAccum(lang_id, DOMAIN_NAMES[lang_id], train_target, val_target)
+    dname_map = COGNITIVE_V2_DOMAIN_NAMES if cognitive_v2 else DOMAIN_NAMES
+    acc = _DomainAccum(lang_id, dname_map[lang_id], train_target, val_target)
     local_hashes: set[bytes] = set()
     hash_person = f"dcpa{seed}".encode("ascii")[:16]
     val_mod = 10 if smoke_quota else 20
@@ -1342,6 +1589,9 @@ def _worker_spool_domain(args_tuple: tuple[Any, ...]) -> dict[str, Any]:
             smoke_quota=smoke_quota,
             scale_factor=scale_factor,
             stem_upgrade=stem_upgrade,
+            cognitive_v2=cognitive_v2,
+            offline=offline,
+            seed=seed,
         )
     return {
         "lang_id": lang_id,
@@ -1362,8 +1612,10 @@ def build_corpus(
     scale_factor: float = 1.0,
     stem_upgrade: bool = False,
     workers: int = 1,
+    cognitive_v2: bool = False,
+    offline: bool = False,
 ) -> dict[str, Any]:
-    """Stream, filter, deduplicate, and write 5-domain DCPA `.bin/.idx/.meta.json` shards."""
+    """Stream, filter, deduplicate, and write DCPA `.bin/.idx/.meta.json` shards."""
     out_path = Path(out_dir)
     if not allow_drive_output:
         _assert_local_output_dir(out_path)
@@ -1372,14 +1624,24 @@ def build_corpus(
         raise ValueError(f"scale_factor must be > 0, got {scale_factor}")
 
     validator = CodeASTValidator()
-    mode = "smoke" if smoke_quota else ("full_stem" if (stem_upgrade or scale_factor > 1.5) else "full")
+    active_ids = COGNITIVE_V2_DOMAIN_IDS if cognitive_v2 else ACTIVE_DOMAIN_IDS
+    dname_map = COGNITIVE_V2_DOMAIN_NAMES if cognitive_v2 else DOMAIN_NAMES
+    if cognitive_v2:
+        mode = "cognitive_v2_smoke" if smoke_quota else "cognitive_v2"
+        base_train_q = COGNITIVE_V2_SMOKE_TRAIN_QUOTAS if smoke_quota else COGNITIVE_V2_TRAIN_QUOTAS
+        base_val_q = COGNITIVE_V2_SMOKE_VAL_QUOTAS if smoke_quota else COGNITIVE_V2_VAL_QUOTAS
+    else:
+        mode = "smoke" if smoke_quota else ("full_stem" if (stem_upgrade or scale_factor > 1.5) else "full")
+        base_train_q = SMOKE_TRAIN_QUOTA_BYTES if smoke_quota else FULL_TRAIN_QUOTA_BYTES
+        base_val_q = SMOKE_VAL_QUOTA_BYTES if smoke_quota else FULL_VAL_QUOTA_BYTES
+
     if smoke_quota:
-        train_quotas = dict(SMOKE_TRAIN_QUOTA_BYTES)
-        val_quotas = dict(SMOKE_VAL_QUOTA_BYTES)
+        train_quotas = dict(base_train_q)
+        val_quotas = dict(base_val_q)
     else:
         val_scale = min(float(scale_factor), 8.0)
-        train_quotas = {lid: max(64 * 1024, int(round(q * scale_factor))) for lid, q in FULL_TRAIN_QUOTA_BYTES.items()}
-        val_quotas = {lid: max(16 * 1024, int(round(q * val_scale))) for lid, q in FULL_VAL_QUOTA_BYTES.items()}
+        train_quotas = {lid: max(64 * 1024, int(round(q * scale_factor))) for lid, q in base_train_q.items()}
+        val_quotas = {lid: max(16 * 1024, int(round(q * val_scale))) for lid, q in base_val_q.items()}
 
     train_bin_path = out_path / "train.bin"
     train_idx_path = out_path / "train.idx"
@@ -1429,12 +1691,13 @@ def build_corpus(
 
             # Deterministic val bucket (~5% in full, ~10% in smoke); prioritize filling val
             # cleanly if train is full, and never let the same hash enter both splits.
+            style_id = infer_corpus_style_id(acc.lang_id, doc_bytes, source_id) if cognitive_v2 else 0
             val_mod = 10 if smoke_quota else 20
             bucket_hit = (int.from_bytes(digest[:4], "little") % val_mod) == 0
             if acc.val_bytes < acc.val_target and (bucket_hit or acc.train_bytes >= acc.train_target):
                 val_bin.write(doc_bytes)
                 val_idx.write(
-                    struct.pack(IDX_RECORD_FMT, val_offset, rec_len, acc.lang_id, source_id, min(max_depth, 255), 0)
+                    struct.pack(IDX_RECORD_FMT, val_offset, rec_len, acc.lang_id, source_id, min(max_depth, 255), style_id)
                 )
                 val_offset += rec_len
                 val_docs_total += 1
@@ -1443,7 +1706,7 @@ def build_corpus(
             elif acc.train_bytes < acc.train_target:
                 train_bin.write(doc_bytes)
                 train_idx.write(
-                    struct.pack(IDX_RECORD_FMT, train_offset, rec_len, acc.lang_id, source_id, min(max_depth, 255), 0)
+                    struct.pack(IDX_RECORD_FMT, train_offset, rec_len, acc.lang_id, source_id, min(max_depth, 255), style_id)
                 )
                 train_offset += rec_len
                 train_docs_total += 1
@@ -1473,17 +1736,19 @@ def build_corpus(
                         smoke_quota,
                         float(scale_factor),
                         bool(stem_upgrade),
+                        bool(cognitive_v2),
+                        bool(offline),
                     )
-                    for lid in ACTIVE_DOMAIN_IDS
+                    for lid in active_ids
                 ]
-                with ProcessPoolExecutor(max_workers=min(len(ACTIVE_DOMAIN_IDS), int(workers))) as pool:
+                with ProcessPoolExecutor(max_workers=min(len(active_ids), int(workers))) as pool:
                     worker_results = list(pool.map(_worker_spool_domain, tasks))
 
-                # Deterministic merge in lang_id = 0..4 order with global leak-free seen_hashes check
+                # Deterministic merge in lang_id = 0..5 order with global leak-free seen_hashes check
                 rec_struct = struct.Struct("<QIBB")
                 for res in sorted(worker_results, key=lambda r: int(r["lang_id"])):
                     lid = int(res["lang_id"])
-                    dname = DOMAIN_NAMES[lid]
+                    dname = dname_map[lid]
                     acc = _DomainAccum(
                         lid,
                         dname,
@@ -1526,8 +1791,8 @@ def build_corpus(
             finally:
                 shutil.rmtree(spool_dir, ignore_errors=True)
         else:
-            for lid in ACTIVE_DOMAIN_IDS:
-                dname = DOMAIN_NAMES[lid]
+            for lid in active_ids:
+                dname = dname_map[lid]
                 acc = _DomainAccum(lid, dname, train_quotas[lid], val_quotas[lid])
                 domain_stats[dname] = _populate_single_domain(
                     lid,
@@ -1537,6 +1802,9 @@ def build_corpus(
                     smoke_quota=smoke_quota,
                     scale_factor=float(scale_factor),
                     stem_upgrade=bool(stem_upgrade),
+                    cognitive_v2=bool(cognitive_v2),
+                    offline=bool(offline),
+                    seed=seed,
                 )
 
     def _file_blake2b(path: Path) -> str:
@@ -1595,6 +1863,8 @@ def build_corpus(
         "mode": mode,
         "scale_factor": float(scale_factor),
         "stem_upgrade": bool(stem_upgrade),
+        "cognitive_v2": bool(cognitive_v2),
+        "offline": bool(offline),
         "seed": seed,
         "tree_sitter_active": validator.tree_sitter_active,
         "idx_format": IDX_RECORD_FMT,
@@ -1687,7 +1957,17 @@ def main() -> None:
         "--workers",
         type=int,
         default=1,
-        help="Parallel per-domain workers (up to 5) for multi-core Vast.ai NVMe builds.",
+        help="Parallel per-domain workers (up to 6) for multi-core Vast.ai NVMe builds.",
+    )
+    ap.add_argument(
+        "--cognitive-v2",
+        action="store_true",
+        help="Build 6-domain v2 holistic cognitive shards (en, zh, formal, python, sql_struct, javascript; zero Rust).",
+    )
+    ap.add_argument(
+        "--offline",
+        action="store_true",
+        help="Skip external network downloads and synthesize deterministic multi-tier shards locally.",
     )
     ap.add_argument("--seed", type=int, default=2026)
     args = ap.parse_args()
@@ -1699,6 +1979,8 @@ def main() -> None:
         scale_factor=args.scale_factor,
         stem_upgrade=args.stem_upgrade,
         workers=args.workers,
+        cognitive_v2=args.cognitive_v2,
+        offline=args.offline,
     )
 
 

@@ -1,0 +1,316 @@
+# DCPA v2 Holistic 5-Stage Cognitive Curriculum Config — `moe_210m` (Single-GPU Primary / Multi-GPU Elastic)
+#
+# Implements `docs/DCPA_ROADMAP.md` Section 2:
+#   - Model        : `moe_210m` (~208.65M slow weights, 32 Experts Top-2 -> ~22.86M active/concept, 100% dcpa-core-rs compatible)
+#   - Ratio Lock   : Exact 35.0% Logic : 35.0% Deep Writing : 30.0% Engineering Code (Python/JS/SQL, ZERO Rust)
+#   - 6x5 Grid     : lang_id = [0:en, 1:zh, 2:formal, 3:python, 4:sql_struct, 5:javascript]
+#                    style_id = [0:rigorous, 1:concise_memo, 2:expository, 3:literary, 4:strict_eng]
+#   - Stage Guards : Stage 1 forces `max_stage_tier=1` + `anchor_doc_start=true` (zero mid-code/mid-sentence cuts);
+#                    Stage 2 keeps Slot-0 `\x1dS..\x1dE` at 0% for first 20k steps to train all 72 merge pairs, warming in 15% at 32k..42k;
+#                    Stage 4 expands window to 3072B + `householder_max_writes=64` for World-Bible, Temporary Axioms & Multi-API SDKs.
+#
+# Launch Commands:
+#   - Single-GPU (primary) : bash scripts/train.sh --config=configs/dcpa_210m_v2_cognitive.yaml --gpus=1 --preset=moe_210m --data-profile=v2_cognitive_5g
+#   - Multi-GPU (elastic)  : bash scripts/train.sh --config=configs/dcpa_210m_v2_cognitive.yaml --gpus=4 --preset=moe_210m --data-profile=v2_cognitive_5g
+
+schema_version: 2
+experiment_name: dcpa_v2_210m_cognitive_5stage_100k
+
+model:
+  preset: moe_210m
+  vocab_size: 256
+  d_s: 192
+  d_concept: 768
+  k_slots: 8
+  d_r: 32
+  d_merge: 256
+  d_h: 4096
+  s_active: 32
+  d_l: 64
+  num_lang_domains: 6
+  num_style_domains: 5
+  num_experts: 32
+  top_k_experts: 2
+  expert_hidden: 1344
+  l_max: 8
+  tau_skip: 0.32
+  tau_halt: 0.22
+  ponder_eta: 0.5
+  lambda_moe_bal: 0.01
+  max_seg_len: 16
+  target_spike_rate: 0.10526315789473684  # 1 / 9.5
+  lambda_rate: 2.0
+  lambda_var: 1.0
+  lambda_act: 0.01
+  lambda_halt: 1.0
+  gamma_hip: 0.999
+  lambda_eta: 0.95
+  kappa_quench: 0.95
+  householder_max_writes: 64               # Expanded 32 -> 64 so Stage 4/5 World-Bible & SDK headers never FIFO-evict
+  householder_write_threshold: 0.08        # Aligned with Stage 5 SFT write_threshold_override
+
+presets:
+  moe_210m:
+    d_s: 192
+    d_concept: 768
+    k_slots: 8
+    d_r: 32
+    d_merge: 256
+    d_h: 4096
+    s_active: 32
+    d_l: 64
+    num_experts: 32
+    top_k_experts: 2
+    expert_hidden: 1344
+    l_max: 8
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
+    lambda_moe_bal: 0.01
+    householder_max_writes: 64
+    householder_write_threshold: 0.08
+  moe_650m:
+    d_s: 256
+    d_concept: 1024
+    k_slots: 8
+    d_r: 32
+    d_merge: 384
+    d_h: 4096
+    s_active: 32
+    d_l: 64
+    num_experts: 32
+    top_k_experts: 2
+    expert_hidden: 3200
+    l_max: 8
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
+    lambda_moe_bal: 0.01
+    householder_max_writes: 64
+    householder_write_threshold: 0.08
+  micro:
+    d_s: 64
+    d_concept: 128
+    k_slots: 8
+    d_r: 32
+    d_merge: 64
+    d_h: 512
+    s_active: 16
+    d_l: 64
+    num_experts: 4
+    top_k_experts: 2
+    expert_hidden: 192
+    l_max: 4
+    householder_max_writes: 32
+    householder_write_threshold: 0.08
+
+hardware:
+  per_gpu_tokens_bytes_per_step: 131072    # 128 KB/step on 1 GPU -> 13.1 GB stream over 100k steps (~2.5 epochs on ~5.2 GB corpus)
+  target_tokens_bytes_per_step: 131072
+  fixed_global_batch: false
+  auto_lr_scale_multi_gpu: true
+  bf16_grad_comm: true
+  length_bucketing: true
+  allow_tf32: true
+  bf16_autocast: true
+  use_grad_scaler: false
+  compile_mode: auto
+  compile_doc_bucket_size: 16
+  compile_cache_size_limit: 128
+  bcg_checkpoint_vram_watermark_gb: 48.0   # Skips BCG recomputation on >=75GB GPUs while VRAM < 48GB
+  prefetch_depth: 3
+  prefetch_workers: 2
+  auto_sharding_tiers:
+    blackwell_or_h200_96g:
+      min_vram_gb: 88.0
+      target_tokens_bytes_per_step: 131072
+      micro_batch_bytes: 131072
+      grad_accum_steps: 1
+    h100_or_a100_80g:
+      min_vram_gb: 75.0
+      micro_batch_bytes: 131072
+      grad_accum_steps: 1
+    a100_40g:
+      min_vram_gb: 38.0
+      micro_batch_bytes: 65536
+      grad_accum_steps: 2
+    l4_or_4090:
+      min_vram_gb: 20.0
+      micro_batch_bytes: 32768
+      grad_accum_steps: 4
+    local_mps_or_cpu:
+      min_vram_gb: 0.0
+      target_tokens_bytes_per_step: 8192
+      micro_batch_bytes: 8192
+      grad_accum_steps: 1
+
+optimizer:
+  type: AdamW
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  grad_clip_norm: 1.0
+  lr_reference_bytes: 131072
+  groups:
+    group_matrix_decay:
+      lr: 4.0e-4
+      weight_decay: 0.05
+    group_norm_embed_nodecay:
+      lr: 4.0e-4
+      weight_decay: 0.0
+    group_gates_thresholds:
+      lr: 1.0e-3
+      weight_decay: 0.0
+
+# 6-slot domain_weights order: [0:en, 1:zh, 2:formal, 3:python, 4:sql_struct, 5:javascript] (ZERO Rust)
+# Step-weighted 0..100k & 0..115k integrals converge strictly to 35.0% Logic : 35.0% Writing : 30.0% Code.
+curriculum:
+  total_steps: 100000
+  stage_boundaries: [0, 12000, 42000, 78000, 100000]
+  cap_shard_weights:
+    cap_reasoning: 35
+    cap_writing: 35
+    cap_code: 20
+    cap_instruct: 5
+    cap_toolcall: 5
+  stage1:
+    name: sensorimotor_rhythm_and_syntax_instinct
+    model_stage: A
+    global_warmup_steps: 1800
+    max_doc_bytes: 512
+    max_stage_tier: 1
+    anchor_doc_start: true
+    # 30% Logic + 45% Writing (75% across en/zh/formal) + 25% Clean Syntax Code (py=13%, sql=3%, js=9%)
+    domain_weights: [0.33, 0.36, 0.06, 0.13, 0.03, 0.09]
+    wug_ratio: 0.0
+    tau_s_start: 1.0
+    tau_s_end: 0.35
+    target_rho: 9.5
+    lambda_rate: 2.0
+    lambda_var: 1.0
+    lambda_halt: 1.0
+    lambda_pc: 0.0
+    lambda_act: 0.0
+  stage2:
+    name: deductive_edges_discourse_and_modular_ast
+    model_stage: B
+    bcg_local_warmup_steps: 1000
+    local_warmup_start_factor: 0.01
+    window_schedule:
+      - [12000, 512]
+      - [22000, 1024]
+      - [32000, 2048]
+    max_stage_tier: 2
+    anchor_doc_start: false
+    # Keep Slot-0 unpinned for first 20k steps (12k..32k) so all 72 merge pairs train freely; warm in 15% at 32k..42k
+    cap_warmup_start_progress: 0.6667
+    cap_mix_ratio: 0.15
+    # 37% Logic + 31% Writing (68% across en/zh/formal) + 32% Modular Code (py=17%, sql=5%, js=10%)
+    domain_weights: [0.26, 0.29, 0.13, 0.17, 0.05, 0.10]
+    wug_ratio: 0.0
+    tau_m_start: 1.5
+    tau_m_end: 0.25
+    tau_s: 0.30
+    target_rho: 9.5
+    lambda_rate: 2.0
+    lambda_var: 1.0
+    lambda_halt: 1.0
+    lambda_pc_ramp_steps: 2500
+    lambda_pc_target: 0.5
+    lambda_act_delay_steps: 1000
+    lambda_act_ramp_steps: 7000
+    lambda_act_target: 0.01
+  stage3:
+    name: slow_thinking_reverse_outline_and_anti_pattern_refactoring
+    model_stage: C
+    lr_cosine_end_ratio: 0.22
+    max_doc_bytes: 4096
+    max_stage_tier: 3
+    anchor_doc_start: false
+    # 55% Base Corpus + 45% Data-Alchemy Shards -> Exact 35% Logic : 35% Writing : 30% Code
+    domain_weights: [0.29, 0.31, 0.10, 0.15, 0.05, 0.10]
+    wug_ratio: 0.0
+    tau_m: 0.25
+    tau_s: 0.25
+    target_rho: 9.5
+    lambda_rate: 2.0
+    lambda_var: 1.0
+    lambda_halt: 1.0
+    lambda_pc: 0.5
+    lambda_act: 0.01
+    code_delimiter_focal_weight: 1.5
+    code_delimiter_chars: "{}()[]:;\n"
+    broca_cq_prob: 0.20
+    cap_mix_ratio: 0.45
+  stage4:
+    name: hippocampal_world_bible_temporary_axioms_and_sdk_binding
+    model_stage: D
+    hip_local_warmup_steps: 500
+    local_warmup_start_factor: 0.01
+    lr_scale: 0.25
+    max_doc_bytes: 3072
+    max_stage_tier: 3
+    # 55% Long-Horizon Novel Binding Episodes + 45% Stage-3 Familiar Anti-False-Write Replay
+    # 35% Temporary Axioms/Contracts + 35% World-Bible/Research Briefs + 30% Multi-API Python/JS/SQL SDKs
+    domain_weights: [0.28, 0.30, 0.12, 0.15, 0.05, 0.10]
+    wug_ratio: 0.55
+    wug_mode: cognitive_v2
+    wug_target_weight: 3.0
+    lambda_ach_reg: 0.5
+    tau_m: 0.25
+    tau_s: 0.25
+    lambda_rate: 0.0
+    lambda_var: 0.0
+    lambda_halt: 0.0
+    lambda_pc: 0.0
+    lambda_act: 0.0
+
+# Stage 5 / 5.5 Post-Training Contract (`100k -> 115k`, 15,000 steps on Single GPU)
+stage5_sft:
+  total_steps: 15000
+  warmup_steps: 500
+  target_tokens_bytes_per_step: 65536
+  max_doc_bytes: 4096
+  write_threshold_override: 0.08
+  enable_r_lex_copy_ring: true
+  w_lex_ring: 128
+
+watchdog:
+  window_size: 20
+  rule_bcd_warmup_steps: 500
+  compression_ratio_min: 2.5
+  compression_ratio_max: 25.0
+  concept_std_min_floor: 0.35
+  merge_entropy_min: 0.08
+  skip_batches_on_rollback: 10
+  seed_stride_on_rollback: 9973
+  rule_a_lr_multiplier: 0.7
+  rule_b_lambda_rate_multiplier: 3.0
+  rule_b_lambda_rate_cap: 50.0
+  rule_b_tau_s_floor: 0.5
+  rule_c_lambda_var_multiplier: 2.5
+  rule_c_lambda_var_cap: 25.0
+  rule_d_tau_m_delta: 0.4
+  rule_d_tau_m_cap: 1.2
+  rule_d_explore_steps: 1000
+  rule_d_uniform_mix: 0.10
+  rule_d_merge_kl_weight: 0.10
+  max_consecutive_rollbacks: 3
+  min_progress_steps_to_reset_breaker: 200
+  events_log_path: artifacts/logs/watchdog_events.jsonl
+
+checkpointing:
+  ckpt_dir: artifacts/checkpoints
+  healthy_save_every_steps: 1000
+  milestone_every_steps: 5000
+  save_every_minutes: 10.0
+  export_dir: artifacts/export
+  final_safetensors_name: dcpa_final.safetensors
+
+visual_probe:
+  console_every_steps: 50
+  probe_every_steps: 500
+  logs_dir: artifacts/logs
+  metrics_jsonl: metrics.jsonl
+  latest_probe_md: latest_probe.md
+  probe_history_md: probe_history.md
+  val_batches_per_domain: 2

@@ -346,6 +346,7 @@ class _DynamicRaggedCursorStream:
         world_size: int = 1,
         length_bucketing: bool = True,
         prefetch_workers: int = 2,
+        cap_shard_weights: Optional[Mapping[str, int]] = None,
     ) -> None:
         self.bin_path = bin_path if (bin_path is not None and bin_path.exists()) else None
         self.idx_path = idx_path if (idx_path is not None and idx_path.exists()) else None
@@ -360,8 +361,13 @@ class _DynamicRaggedCursorStream:
         self._cap_datasets: list[Optional[RaggedByteDataset]] = []
         self._cap_keys: list[Optional[tuple[Any, ...]]] = []
         self.stage3_cap_mix_ratio = float(stage3_cap_mix_ratio)
+        self._cap_shard_weights: dict[str, int] = (
+            {str(k): max(1, int(v)) for k, v in cap_shard_weights.items()}
+            if cap_shard_weights
+            else {}
+        )
         if cap_data_dir is not None and cap_data_dir.exists():
-            for pref in ("cap_reasoning", "cap_instruct", "cap_toolcall", "cap_writing"):
+            for pref in ("cap_reasoning", "cap_instruct", "cap_code", "cap_toolcall", "cap_writing"):
                 bp = cap_data_dir / f"{pref}_train.bin"
                 ip = cap_data_dir / f"{pref}_train.idx"
                 if bp.exists() and ip.exists():
@@ -428,6 +434,9 @@ class _DynamicRaggedCursorStream:
         domain_weights: Mapping[int, float],
         wug_ratio: float,
         seed_val: int,
+        max_stage_tier: int = 0,
+        anchor_doc_start: bool = False,
+        wug_mode: str = "classic",
     ) -> Optional[RaggedByteDataset]:
         if not self.has_shards or self.bin_path is None or self.idx_path is None:
             return None
@@ -440,6 +449,9 @@ class _DynamicRaggedCursorStream:
             int(seed_val),
             self.length_bucketing,
             self.world_size,
+            int(max_stage_tier),
+            bool(anchor_doc_start),
+            str(wug_mode),
         )
         if self._ds is not None and self._ds_key == key:
             return self._ds
@@ -456,6 +468,9 @@ class _DynamicRaggedCursorStream:
             seed=int(seed_val),
             length_bucketing=self.length_bucketing,
             bucket_sync_world_size=self.world_size,
+            max_stage_tier=int(max_stage_tier),
+            anchor_doc_start=bool(anchor_doc_start),
+            wug_mode=str(wug_mode),
         )
         self._ds_key = key
         return self._ds
@@ -470,6 +485,10 @@ class _DynamicRaggedCursorStream:
         domain_weights: Mapping[int, float],
         wug_ratio: float,
         seed_val: int,
+        max_stage_tier: int = 0,
+        anchor_doc_start: bool = False,
+        cap_mix_prob: float = -1.0,
+        wug_mode: str = "classic",
     ) -> tuple[Any, ...]:
         dw_key = tuple(sorted((int(k), round(float(v), 6)) for k, v in domain_weights.items()))
         return (
@@ -481,6 +500,10 @@ class _DynamicRaggedCursorStream:
             dw_key,
             round(float(wug_ratio), 6),
             int(seed_val),
+            int(max_stage_tier),
+            bool(anchor_doc_start),
+            round(float(cap_mix_prob), 4),
+            str(wug_mode),
         )
 
     def _select_cap_shard_idx(self, logical_b: int, *, stage_id: int) -> int:
@@ -488,19 +511,29 @@ class _DynamicRaggedCursorStream:
         if n_cap <= 1:
             return 0
         if stage_id == 2:
-            # Stage-2 warm-in focuses on reasoning & instruction following before tool/long-writing
+            # Stage-2 late warm-in focuses on reasoning, writing & code skeletons before tool protocols
             early_idxs = [
-                i for i, nm in enumerate(self._cap_names) if nm in ("cap_reasoning", "cap_instruct")
+                i for i, nm in enumerate(self._cap_names) if nm in ("cap_reasoning", "cap_writing", "cap_code", "cap_instruct")
             ]
             if early_idxs:
                 return early_idxs[logical_b % len(early_idxs)]
-        # Weighted capability schedule in Stage 3: reasoning 35%, instruct 30%, toolcall 20%, writing 15%
-        pref_weights = {
-            "cap_reasoning": 35,
-            "cap_instruct": 30,
-            "cap_toolcall": 20,
-            "cap_writing": 15,
-        }
+        default_weights = (
+            {
+                "cap_reasoning": 35,
+                "cap_writing": 35,
+                "cap_code": 20,
+                "cap_instruct": 5,
+                "cap_toolcall": 5,
+            }
+            if "cap_code" in self._cap_names
+            else {
+                "cap_reasoning": 35,
+                "cap_instruct": 30,
+                "cap_toolcall": 20,
+                "cap_writing": 15,
+            }
+        )
+        pref_weights = self._cap_shard_weights if self._cap_shard_weights else default_weights
         slots: list[int] = []
         for idx_c, nm in enumerate(self._cap_names):
             slots.extend([idx_c] * pref_weights.get(nm, 20))
@@ -516,6 +549,10 @@ class _DynamicRaggedCursorStream:
         domain_weights: dict[int, float],
         wug_ratio: float,
         seed_val: int,
+        max_stage_tier: int = 0,
+        anchor_doc_start: bool = False,
+        cap_mix_prob: float = -1.0,
+        wug_mode: str = "classic",
     ) -> dict[str, torch.Tensor]:
         # Key shard choice AND length-bucket tier on logical `b_idx` so ALL ranks draw homogeneous
         # document lengths on the same step, while `phys_b_idx` gives each rank disjoint documents
@@ -523,11 +560,14 @@ class _DynamicRaggedCursorStream:
         logical_b = int(b_idx)
         phys_b_idx = self._phys_base + (logical_b - self._base_b_idx) * self.world_size + self.rank
         cap_prob = 0.0
-        if len(self._cap_shards) > 0 and self.stage3_cap_mix_ratio > 0.0:
-            if stage_id == 3:
-                cap_prob = self.stage3_cap_mix_ratio
-            elif stage_id == 2 and stage_half >= 1:
-                cap_prob = min(0.15, 0.35 * self.stage3_cap_mix_ratio)
+        if len(self._cap_shards) > 0:
+            if cap_mix_prob >= 0.0:
+                cap_prob = float(cap_mix_prob)
+            elif self.stage3_cap_mix_ratio > 0.0:
+                if stage_id == 3:
+                    cap_prob = self.stage3_cap_mix_ratio
+                elif stage_id == 2 and stage_half >= 1:
+                    cap_prob = min(0.15, 0.35 * self.stage3_cap_mix_ratio)
         use_cap = cap_prob > 0.0 and ((logical_b * 37) % 100) < int(round(cap_prob * 100.0))
         if use_cap:
             c_idx = self._select_cap_shard_idx(logical_b, stage_id=stage_id)
@@ -547,6 +587,9 @@ class _DynamicRaggedCursorStream:
                     domain_weights=domain_weights,
                     wug_ratio=wug_ratio,
                     seed_val=seed_val,
+                    max_stage_tier=max_stage_tier,
+                    anchor_doc_start=anchor_doc_start,
+                    wug_mode=wug_mode,
                 )
             if ds is not None:
                 batch = ds.get_batch(phys_b_idx, sync_group=logical_b)
@@ -575,6 +618,10 @@ class _DynamicRaggedCursorStream:
         seed_val = int(self.cursor["seed"])
         dw_copy = dict(state.domain_weights)
         stage_half = 1 if float(state.stage_progress) >= 0.50 else 0
+        max_tier = int(state.max_stage_tier)
+        anc_start = bool(state.anchor_doc_start)
+        cap_p = float(state.cap_mix_prob)
+        w_mode = str(state.wug_mode)
 
         if self._executor is not None and self._prefetch_depth > 0:
             req_key = self._make_req_key(
@@ -586,6 +633,10 @@ class _DynamicRaggedCursorStream:
                 dw_copy,
                 state.wug_ratio,
                 seed_val,
+                max_tier,
+                anc_start,
+                cap_p,
+                w_mode,
             )
             fut = self._prefetch_futures.pop(req_key, None)
             if fut is not None:
@@ -601,6 +652,10 @@ class _DynamicRaggedCursorStream:
                     dw_copy,
                     state.wug_ratio,
                     seed_val,
+                    max_tier,
+                    anc_start,
+                    cap_p,
+                    w_mode,
                 )
             for off in range(1, self._prefetch_depth + 1):
                 look_b = b_idx + off
@@ -613,6 +668,10 @@ class _DynamicRaggedCursorStream:
                     dw_copy,
                     state.wug_ratio,
                     seed_val,
+                    max_tier,
+                    anc_start,
+                    cap_p,
+                    w_mode,
                 )
                 if look_key not in self._prefetch_futures:
                     self._prefetch_futures[look_key] = self._executor.submit(
@@ -625,6 +684,10 @@ class _DynamicRaggedCursorStream:
                         dict(dw_copy),
                         float(state.wug_ratio),
                         seed_val,
+                        max_tier,
+                        anc_start,
+                        cap_p,
+                        w_mode,
                     )
         else:
             batch = self._fetch_one(
@@ -636,6 +699,10 @@ class _DynamicRaggedCursorStream:
                 dw_copy,
                 state.wug_ratio,
                 seed_val,
+                max_tier,
+                anc_start,
+                cap_p,
+                w_mode,
             )
 
         next_b = b_idx + 1
@@ -1049,6 +1116,7 @@ def run_training(
         val_bin = (Path(data_dir) / "val.bin") if data_dir is not None else None
         val_idx = (Path(data_dir) / "val.idx") if data_dir is not None else None
         s3_cap_ratio = float(curr_cfg.get("stage3", {}).get("cap_mix_ratio", 0.35))
+        cap_shard_weights_cfg = curr_cfg.get("cap_shard_weights")
         cap_dir_path = Path(cap_data_dir) if cap_data_dir is not None else None
         eff_prefetch_depth = int(hw_cfg.get("prefetch_depth", 2)) if device.type == "cuda" else 0
         eff_prefetch_workers = int(hw_cfg.get("prefetch_workers", 2))
@@ -1065,6 +1133,7 @@ def run_training(
             world_size=dist_ctx.world_size,
             length_bucketing=eff_len_bucketing,
             prefetch_workers=eff_prefetch_workers,
+            cap_shard_weights=cap_shard_weights_cfg if isinstance(cap_shard_weights_cfg, Mapping) else None,
         )
         if stream.has_shards:
             _r0_print(

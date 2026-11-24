@@ -739,6 +739,7 @@ _EMPTY_BOOL = torch.empty(0, dtype=torch.bool)
 
 
 ACTIVE_WUG_LANG_IDS: tuple[int, ...] = (0, 1, 3, 5)
+COGNITIVE_V2_WUG_LANG_IDS: tuple[int, ...] = (0, 1, 2, 3, 4, 5)
 
 
 def sample_wug_episode(rng: random.Random, lang_id: int, *, build_tensors: bool = True) -> WugEpisode:
@@ -765,6 +766,414 @@ def sample_wug_episode_fast(rng: random.Random, lang_id: int) -> tuple[bytes, in
     """High-throughput zero-tensor variant returning `(raw_bytes, turn1_len, tgt_start, tgt_end)`."""
     ep = sample_wug_episode(rng, lang_id, build_tensors=False)
     return ep.raw_bytes, ep.turn1_byte_len, ep.target_byte_start, ep.target_byte_end
+
+
+# =============================================================================
+# DCPA v2 Cognitive Stage-4 Generator (World-Bible, Temporary Axioms & Micro-SDK)
+# Zero Rust: 0=en, 1=zh, 2=formal, 3=python, 4=sql_struct, 5=javascript
+# =============================================================================
+
+_ZH_SURNAMES: tuple[str, ...] = ("沈", "陆", "顾", "裴", "温", "谢", "纪", "许", "林", "周", "宋", "叶")
+_ZH_GIVEN_CHARS: tuple[str, ...] = ("知微", "怀瑾", "栖迟", "景行", "清晏", "云深", "明昭", "星河", "砚秋", "听澜", "敬之", "远洲")
+_ZH_PLACES: tuple[str, ...] = ("北麓观测站", "雾港三号船坞", "青石古渡旧档案室", "冷杉岭气象塔", "澄江水文闸口", "白鹤滩地下实验室")
+_ZH_TABOOS: tuple[tuple[str, str], ...] = (
+    ("绝不在雷雨夜开启西侧铜窗", "窗外雷声滚过山脊，他伸手按住西侧铜窗的插销，始终没有推开半寸"),
+    ("从不饮用任何盛在银器里的热茶", "侍者递来银壶热茶时，她只取过一旁的粗陶杯注入清水"),
+    ("夜间巡检绝不携带明火灯具", "进入暗廊前，他吹灭风灯，只靠腕间冷光刻度表辨认石阶"),
+    ("签署纪要前必须先核对双色铅封", "提笔落款之前，她先将匣口的双色铅封对着台灯逐一核验"),
+)
+
+_EN_PLACES: tuple[str, ...] = (
+    "Greyhaven Tide Observatory",
+    "Northridge Glacier Vault",
+    "Coppergate Signal Depot",
+    "Larkspur Canal Lockhouse",
+    "storm-swept Glasscliff Lantern Room",
+)
+_EN_TABOOS: tuple[tuple[str, str], ...] = (
+    (
+        "never unseals brass canisters before checking the barometer",
+        "checked the wall barometer twice before touching a single latch",
+    ),
+    (
+        "refuses to speak mission coordinates over an unshielded wire",
+        "wrote the coordinates on slate instead of speaking them into the line",
+    ),
+    (
+        "never crosses the stone Causeway while the fog-bell rings",
+        "waited calmly beside the pier until the fog-bell fell silent",
+    ),
+    (
+        "always logs tare mass in ink before weighing cold samples",
+        "recorded the tare mass in black ink prior to placing any sample on the pan",
+    ),
+)
+
+
+def _pack_cognitive_fast(
+    turn1_text: str,
+    turn2_prefix: str,
+    target_word: str,
+    turn2_suffix: str,
+    style_id: int,
+) -> tuple[bytes, int, int, int, int]:
+    t1_b = unicodedata.normalize("NFC", turn1_text).encode("utf-8", errors="strict")
+    pre_b = unicodedata.normalize("NFC", turn2_prefix).encode("utf-8", errors="strict")
+    tgt_b = unicodedata.normalize("NFC", target_word).encode("utf-8", errors="strict")
+    suf_b = unicodedata.normalize("NFC", turn2_suffix).encode("utf-8", errors="strict")
+    raw_b = t1_b + pre_b + tgt_b + suf_b
+    t1_len = len(t1_b)
+    tgt_s = t1_len + len(pre_b)
+    tgt_e = tgt_s + len(tgt_b)
+    if raw_b[tgt_s:tgt_e] != tgt_b:
+        raise RuntimeError("Cognitive Stage-4 target span misalignment")
+    return raw_b, t1_len, tgt_s, tgt_e, int(style_id)
+
+
+def _sample_cog_en_fast(rng: random.Random, compact: bool) -> tuple[bytes, int, int, int, int]:
+    artifact = _sample_en_pseudo_word(rng)
+    p1 = _sample_en_pseudo_word(rng).capitalize()
+    p2 = _sample_en_pseudo_word(rng).capitalize()
+    while p2 == p1:
+        p2 = _sample_en_pseudo_word(rng).capitalize()
+    p3 = _sample_en_pseudo_word(rng).capitalize()
+
+    if rng.random() < 0.55:
+        place = rng.choice(_EN_PLACES)
+        taboo_rule, taboo_act = rng.choice(_EN_TABOOS)
+        freq = rng.randint(17, 89)
+        if compact:
+            t1 = (
+                f"[WORLD-BIBLE]\n"
+                f"- Lead: {p1} (rule: {taboo_rule}).\n"
+                f"- Partner: {p2}; Archivist: {p3}.\n"
+                f"- Key relic: the `{artifact}` resonator ({freq} Hz) at {place}.\n\n"
+            )
+            pre = (
+                f"\x1dS\nlead={p1} | taboo=barometer/protocol | relic={artifact}@{freq}Hz\n\x1dE\n"
+                f"Inside {place}, {p1} {taboo_act} while {p2} steadied the bench. "
+                f"Only after {p3} confirmed the log did {p1} calibrate the "
+            )
+            suf = f" at {freq} Hz, preserving clean phase lock across the chamber.\n"
+            return _pack_cognitive_fast(t1, pre, artifact, suf, style_id=3)
+
+        t1 = (
+            f"[WORLD-BIBLE DOSSIER — CANON LOCK]\n"
+            f"Setting: {place}, late autumn.\n"
+            f"Cast & Constraints:\n"
+            f"  1. {p1} — Chief Instrumentalist; strict personal rule: {taboo_rule}.\n"
+            f"  2. {p2} — Hydrographic Surveyor who tracks tidal shear.\n"
+            f"  3. {p3} — Vault Archivist guarding cold-storage manifests.\n"
+            f"Foreshadowed Object: `{artifact}`, a bronze acoustic core tuned to exactly {freq} Hz.\n"
+            f"Task: Write the continuation scene without violating cast roles, taboos, or tuning figures.\n\n"
+        )
+        pre = (
+            f"\x1dS\nanchor: {p1}@{place} | enforce taboo ({taboo_rule}) | callback: {artifact} ({freq} Hz)\n\x1dE\n"
+            f"Wind rattled the upper shutters of {place} as {p2} spread the latest tidal shear chart across the oak table. "
+            f"Near the storage rack, {p3} unlocked the cedar manifest ledger and set the sealed case within reach, expecting a rushed inspection.\n\n"
+            f"Instead, {p1} {taboo_act}. {p2} watched in silence, recognizing the discipline that had prevented three prior instrument faults. "
+            f"Once every safeguard was satisfied, {p1} lifted the bronze "
+        )
+        suf = (
+            f" onto the isolation cradle and aligned its vernier dial to {freq} Hz. "
+            f"A steady harmonic pulse answered the tide gauge, confirming {p3}'s archival notes without a single discrepancy.\n"
+        )
+        return _pack_cognitive_fast(t1, pre, artifact, suf, style_id=3)
+
+    # Temporary compliance / counter-intuitive rulebook adjudication (style_id = 0)
+    clause = f"{artifact.upper()}-{rng.randint(10, 99)}"
+    cutoff = rng.choice((14, 19, 23, 31))
+    fee_low = rng.choice((12, 15, 18))
+    fee_high = rng.choice((45, 60, 75))
+    t1 = (
+        f"[PRIVATE COMPLIANCE RULEBOOK: {clause}]\n"
+        f"Override Notice: Ignore standard intuition; apply ONLY the rules below.\n"
+        f"  R1. Any dispatch tagged `urgent` is DEFERRED to the back of the queue unless its batch size is strictly under {cutoff} units.\n"
+        f"  R2. Standard batches pay {fee_low} credits, whereas deferred batches pay a surcharge of {fee_high} credits.\n"
+        f"Case: Operator {p1} submits an `urgent` dispatch containing {cutoff + 6} units.\n\n"
+    )
+    pre = (
+        f"\x1dS\nrule={clause} | size={cutoff + 6} >= {cutoff} -> R1 defers urgent -> R2 fee={fee_high}\n\x1dE\n"
+        f"Under temporary compliance protocol "
+    )
+    suf = (
+        f", intuition that `urgent` clears first is explicitly overridden by R1: "
+        f"because {p1}'s batch has {cutoff + 6} units (not strictly under {cutoff}), "
+        f"the dispatch is deferred to the back of the queue and assessed the R2 surcharge of {fee_high} credits.\n"
+    )
+    return _pack_cognitive_fast(t1, pre, clause, suf, style_id=0)
+
+
+def _sample_cog_zh_fast(rng: random.Random, compact: bool) -> tuple[bytes, int, int, int, int]:
+    stem = unicodedata.normalize("NFC", rng.choice(_ZH_RARE_CHARS) + rng.choice(_ZH_MORPHEMES))
+    s1, s2, s3 = rng.sample(_ZH_SURNAMES, 3)
+    g1, g2, g3 = rng.sample(_ZH_GIVEN_CHARS, 3)
+    c1, c2, c3 = s1 + g1, s2 + g2, s3 + g3
+
+    if rng.random() < 0.55:
+        place = rng.choice(_ZH_PLACES)
+        taboo_rule, taboo_act = rng.choice(_ZH_TABOOS)
+        metric = rng.randint(24, 96)
+        if compact:
+            t1 = (
+                f"【设定档案】地点：{place}。主理人：{c1}（铁律：{taboo_rule}）；协理：{c2}；记录员：{c3}。"
+                f"核心伏笔物：「{stem}」（临界读数 {metric} 毫伏）。\n\n"
+            )
+            pre = (
+                f"\x1dS\n主视角={c1} | 禁忌={taboo_rule} | 伏笔回收={stem}({metric}mV)\n\x1dE\n"
+                f"夜色笼罩{place}，{taboo_act}。待{c2}与{c3}核准基线后，{c1}才取出封存的"
+            )
+            suf = f"，仪表稳定停在 {metric} 毫伏，与前情记录分毫不差。\n"
+            return _pack_cognitive_fast(t1, pre, stem, suf, style_id=3)
+
+        t1 = (
+            f"【长篇设定集 / 严禁吃书】\n"
+            f"场景：{place}。\n"
+            f"人物关系与硬性禁忌：\n"
+            f"  1. {c1}（总工）：行事克制，铁律为“{taboo_rule}”；\n"
+            f"  2. {c2}（水文测绘师）：负责校准流速与温差基线；\n"
+            f"  3. {c3}（档案保管员）：掌管封存样本的出入库台账。\n"
+            f"关键伏笔器物：「{stem}」，仅在阈值达到 {metric} 毫伏时产生谐振响应。\n"
+            f"写作要求：续写现场核验片段，严守人物分工、性格禁忌与精确数值。\n\n"
+        )
+        pre = (
+            f"\x1dS\n锁定人物: {c1}/{c2}/{c3} | 严守禁忌: {taboo_rule} | 回收伏笔: {stem}@{metric}mV\n\x1dE\n"
+            f"深秋的湿冷雾气贴着{place}的石墙缓慢下沉。{c2}刚把最新一轮温差曲线钉上木板，{c3}便捧着铅封木匣走到长桌旁，低声询问是否立即开匣测绘。\n\n"
+            f"{c1}没有急于动手——{taboo_act}。{c2}见状微微颔首，将流速补偿旋钮归零；{c3}也随即翻开台账核对编号。"
+            f"待全部前置规程逐项落定，{c1}才稳稳托起匣中的"
+        )
+        suf = (
+            f"接入电桥。当电位计读数缓缓爬升至 {metric} 毫伏时，纤细而清亮的谐振波纹如约浮现，"
+            f"三人各自守住职责边界，整场核验未出一处纰漏。\n"
+        )
+        return _pack_cognitive_fast(t1, pre, stem, suf, style_id=3)
+
+    # 反直觉私有合规条款裁定 (style_id = 0)
+    limit_n = rng.choice((15, 25, 40))
+    penalty = rng.choice((30, 50, 80))
+    t1 = (
+        f"【临时私有规则·{stem}条款】请完全抑制日常直觉，仅按以下条款推演：\n"
+        f"  条款一：凡标注“加急”的审阅单，若页数超过 {limit_n} 页，一律转入慢速复核池，不得优先放行。\n"
+        f"  条款二：转入慢速复核池的单据须额外计提 {penalty} 点合规工时。\n"
+        f"待裁定案例：申请人{c1}提交了一份标注“加急”的 {limit_n + 8} 页技术单据。\n\n"
+    )
+    pre = (
+        f"\x1dS\n绑定规则={stem}条款 | 页数={limit_n + 8}>{limit_n} -> 触发条款一转慢速池 -> 条款二计提{penalty}点\n\x1dE\n"
+        f"依据临时生效的「"
+    )
+    suf = (
+        f"条款」裁定：尽管单据带有“加急”标记，但因总页数为 {limit_n + 8} 页（超过 {limit_n} 页上限），"
+        f"必须抑制“加急优先”的日常直觉，按条款一转入慢速复核池，并按条款二计提 {penalty} 点合规工时。\n"
+    )
+    return _pack_cognitive_fast(t1, pre, stem, suf, style_id=0)
+
+
+def _sample_cog_formal_fast(rng: random.Random, compact: bool) -> tuple[bytes, int, int, int, int]:
+    op_name = f"op_{_sample_en_pseudo_word(rng)}"
+    mult = rng.choice((2, 3, 4))
+    sub = rng.choice((3, 5, 7))
+    mod_m = rng.choice((11, 13, 17, 19))
+    x_val = rng.randint(4, 10)
+    y_val = rng.randint(2, 8)
+    step1 = (mult * x_val - y_val) % mod_m
+    z_val = rng.randint(1, 6)
+    final_v = (mult * step1 - z_val) % mod_m
+
+    t1 = (
+        f"[TEMPORARY AXIOM SYSTEM: {op_name}]\n"
+        f"Let binary operator `{op_name}(u, v)` on Z_{mod_m} be defined strictly by:\n"
+        f"  A1. {op_name}(u, v) := ({mult} * u - v) mod {mod_m}\n"
+        f"  A2. Left-associative evaluation: fold({op_name}, a, b, c) := {op_name}({op_name}(a, b), c)\n"
+        f"  A3. Note: `{op_name}` is non-commutative and non-associative; do NOT reorder operands.\n"
+        f"Problem: Evaluate `fold({op_name}, {x_val}, {y_val}, {z_val})` step by step.\n\n"
+    )
+    pre = (
+        f"\x1dS\nA1: {op_name}({x_val},{y_val})=({mult}*{x_val}-{y_val}) mod {mod_m}={step1} "
+        f"-> {op_name}({step1},{z_val})=({mult}*{step1}-{z_val}) mod {mod_m}={final_v}\n\x1dE\n"
+        f"Proof under temporary axiom system:\n"
+        f"  1. Inner left call via A1: {op_name}({x_val}, {y_val}) = ({mult} * {x_val} - {y_val}) mod {mod_m} = {step1}.\n"
+        f"  2. Outer call via A2 & A1: "
+    )
+    suf = (
+        f"({step1}, {z_val}) = ({mult} * {step1} - {z_val}) mod {mod_m} = {final_v}.\n"
+        f"∴ Verified value = {final_v}.\n"
+    )
+    return _pack_cognitive_fast(t1, pre, op_name, suf, style_id=0)
+
+
+def _sample_cog_python_sdk_fast(rng: random.Random, compact: bool) -> tuple[bytes, int, int, int, int]:
+    ctx_cls = _fresh_pascal_ident(rng)
+    fn_open = f"open_{_fresh_snake_ident(rng)}"
+    fn_apply = f"apply_{_fresh_snake_ident(rng)}"
+    fn_seal = f"seal_{_fresh_snake_ident(rng)}"
+    fn_bad = f"legacy_bypass_{_fresh_snake_ident(rng)}"
+    cap_limit = rng.choice((100, 250, 500))
+    fee_bps = rng.choice((15, 25, 40))
+
+    t1 = (
+        f"# === Synthetic Business Micro-SDK Contract ===\n"
+        f"# Precondition: `{fn_open}` MUST run before `{fn_apply}`, followed by `{fn_seal}`.\n"
+        f"# Rule 1: Reject non-positive `amount` with `ValueError`.\n"
+        f"# Rule 2: Clamp `amount` to `{cap_limit}` before computing `{fee_bps}` bps fee.\n"
+        f"# WARNING: `{fn_bad}` is deprecated and unsafe; NEVER call it.\n"
+        f"class {ctx_cls}:\n"
+        f"    def __init__(self, acct_id: str) -> None:\n"
+        f"        self.acct_id = acct_id\n"
+        f"        self.opened = False\n"
+        f"        self.net = 0\n\n"
+        f"def {fn_open}(acct_id: str) -> {ctx_cls}:\n"
+        f"    ctx = {ctx_cls}(acct_id)\n"
+        f"    ctx.opened = True\n"
+        f"    return ctx\n\n"
+        f"def {fn_apply}(ctx: {ctx_cls}, clamped_amt: int, fee: int) -> None:\n"
+        f"    if not ctx.opened:\n"
+        f"        raise RuntimeError('unopened context')\n"
+        f"    ctx.net = clamped_amt - fee\n\n"
+        f"def {fn_seal}(ctx: {ctx_cls}) -> int:\n"
+        f"    return ctx.net\n\n"
+        f"def {fn_bad}(acct_id: str, amount: int) -> int:\n"
+        f"    raise RuntimeError('deprecated path')\n\n"
+    )
+    pre = (
+        f"\x1dS\nguard amount<=0 | clamp<={cap_limit} | order: {fn_open} -> {fn_apply} -> {fn_seal} | skip {fn_bad}\n\x1dE\n"
+        f"def settle_account(acct_id: str, amount: int) -> int:\n"
+        f"    if amount <= 0:\n"
+        f"        raise ValueError('amount must be positive')\n"
+        f"    clamped = min(amount, {cap_limit})\n"
+        f"    fee = (clamped * {fee_bps}) // 10000\n"
+        f"    ctx = {fn_open}(acct_id)\n"
+        f"    "
+    )
+    suf = f"(ctx, clamped, fee)\n    return {fn_seal}(ctx)\n"
+    return _pack_cognitive_fast(t1, pre, fn_apply, suf, style_id=4)
+
+
+def _sample_cog_sql_fast(rng: random.Random, compact: bool) -> tuple[bytes, int, int, int, int]:
+    tbl_main = f"ledger_{_fresh_snake_ident(rng)}"
+    tbl_acct = f"acct_{_fresh_snake_ident(rng)}"
+    col_metric = f"net_{_fresh_snake_ident(rng)}"
+    col_bad = f"shadow_deprecated_{_fresh_snake_ident(rng)}"
+    min_tier = rng.choice((2, 3, 4))
+
+    t1 = (
+        f"-- Schema Contract (SQLite / ANSI SQL)\n"
+        f"-- Rule 1: Join `{tbl_main}` with `{tbl_acct}` on `acct_id` for active accounts (`tier >= {min_tier}`).\n"
+        f"-- Rule 2: Sum `{col_metric}` per `region_code` where `is_void = 0`.\n"
+        f"-- Rule 3: NEVER reference deprecated column `{col_bad}`.\n"
+        f"CREATE TABLE {tbl_acct} (\n"
+        f"    acct_id INTEGER PRIMARY KEY,\n"
+        f"    region_code TEXT NOT NULL,\n"
+        f"    tier INTEGER NOT NULL\n"
+        f");\n"
+        f"CREATE TABLE {tbl_main} (\n"
+        f"    entry_id INTEGER PRIMARY KEY,\n"
+        f"    acct_id INTEGER NOT NULL,\n"
+        f"    {col_metric} INTEGER NOT NULL,\n"
+        f"    {col_bad} INTEGER DEFAULT 0,\n"
+        f"    is_void INTEGER NOT NULL DEFAULT 0\n"
+        f");\n\n"
+    )
+    pre = (
+        f"\x1dS\njoin {tbl_acct}+{tbl_main} on acct_id | filter tier>={min_tier} & is_void=0 | sum({col_metric})\n\x1dE\n"
+        f"SELECT\n"
+        f"    a.region_code,\n"
+        f"    SUM(m."
+    )
+    suf = (
+        f") AS total_net\n"
+        f"FROM {tbl_main} AS m\n"
+        f"INNER JOIN {tbl_acct} AS a ON m.acct_id = a.acct_id\n"
+        f"WHERE a.tier >= {min_tier} AND m.is_void = 0\n"
+        f"GROUP BY a.region_code\n"
+        f"ORDER BY total_net DESC;\n"
+    )
+    return _pack_cognitive_fast(t1, pre, col_metric, suf, style_id=4)
+
+
+def _sample_cog_js_sdk_fast(rng: random.Random, compact: bool) -> tuple[bytes, int, int, int, int]:
+    fn_init = _fresh_camel_ident(rng)
+    fn_stage = _fresh_camel_ident(rng)
+    fn_commit = _fresh_camel_ident(rng)
+    fn_bad = f"unsafe{_fresh_pascal_ident(rng)}"
+    max_items = rng.choice((16, 32, 64))
+
+    t1 = (
+        f"// Synthetic ES6 Micro-SDK Contract\n"
+        f"// Precondition: `{fn_init}` -> `{fn_stage}` -> `{fn_commit}`.\n"
+        f"// Rule: Reject empty arrays; slice batch to at most {max_items} positive integers; NEVER call `{fn_bad}`.\n"
+        f"function {fn_init}(tenantId) {{\n"
+        f"  return {{ tenantId, ready: true, staged: [] }};\n"
+        f"}}\n"
+        f"function {fn_stage}(session, items) {{\n"
+        f"  if (!session.ready) throw new Error('uninitialized session');\n"
+        f"  session.staged = items;\n"
+        f"}}\n"
+        f"function {fn_commit}(session) {{\n"
+        f"  return session.staged.reduce((acc, v) => acc + v, 0);\n"
+        f"}}\n"
+        f"function {fn_bad}() {{\n"
+        f"  throw new Error('deprecated API');\n"
+        f"}}\n\n"
+    )
+    pre = (
+        f"\x1dS\nguard empty | filter >0 & slice(0,{max_items}) | order: {fn_init} -> {fn_stage} -> {fn_commit}\n\x1dE\n"
+        f"function processTenantBatch(tenantId, rawValues) {{\n"
+        f"  if (!Array.isArray(rawValues) || rawValues.length === 0) {{\n"
+        f"    throw new RangeError('rawValues must be non-empty');\n"
+        f"  }}\n"
+        f"  const clean = rawValues.filter((v) => v > 0).slice(0, {max_items});\n"
+        f"  const session = {fn_init}(tenantId);\n"
+        f"  "
+    )
+    suf = f"(session, clean);\n  return {fn_commit}(session);\n}}\n"
+    return _pack_cognitive_fast(t1, pre, fn_stage, suf, style_id=4)
+
+
+def sample_cognitive_stage4_episode_fast(
+    rng: random.Random,
+    lang_id: int,
+    max_bytes: int = 3072,
+) -> tuple[bytes, int, int, int, int]:
+    """Synthesize a DCPA v2 Stage-4 fast-weight binding episode (`(raw_bytes, t1_len, tgt_s, tgt_e, style_id)`).
+
+    Covers all 6 v2 domains with ZERO Rust:
+      - `0=en`, `1=zh`: World-Bible long-form continuation (`style_id=3`) & temporary axiom adjudication (`style_id=0`)
+      - `2=formal`: Counter-intuitive formal operator axiom derivation (`style_id=0`)
+      - `3=python`, `4=sql_struct`, `5=javascript`: Multi-API Micro-SDK / Schema rebinding (`style_id=4`)
+    """
+    compact = int(max_bytes) < 1150
+    if lang_id == 0:
+        out = _sample_cog_en_fast(rng, compact=compact)
+    elif lang_id == 1:
+        out = _sample_cog_zh_fast(rng, compact=compact)
+    elif lang_id == 2:
+        out = _sample_cog_formal_fast(rng, compact=compact)
+    elif lang_id == 3:
+        out = _sample_cog_python_sdk_fast(rng, compact=compact)
+    elif lang_id == 4:
+        out = _sample_cog_sql_fast(rng, compact=compact)
+    elif lang_id == 5:
+        out = _sample_cog_js_sdk_fast(rng, compact=compact)
+    else:
+        raise ValueError(f"Unsupported cognitive_v2 lang_id={lang_id}; expected 0..5")
+
+    if len(out[0]) <= max_bytes:
+        return out
+    if not compact:
+        # Retry in compact mode if full World-Bible exceeded `rem`
+        return sample_cognitive_stage4_episode_fast(rng, lang_id, max_bytes=min(int(max_bytes), 900))
+    # Ultra-short fallback for tight remaining batch tail (`320 <= rem < ~750`)
+    if lang_id in (0, 2):
+        rb, t1, ts, te = sample_wug_episode_fast(rng, 0)
+        return rb, t1, ts, te, 0
+    if lang_id == 1:
+        rb, t1, ts, te = sample_wug_episode_fast(rng, 1)
+        return rb, t1, ts, te, 0
+    if lang_id in (3, 4):
+        rb, t1, ts, te = sample_wug_episode_fast(rng, 3)
+        return rb, t1, ts, te, 4
+    rb, t1, ts, te = sample_wug_episode_fast(rng, 5)
+    return rb, t1, ts, te, 4
 
 
 def format_episode_annotated(ep: WugEpisode) -> str:

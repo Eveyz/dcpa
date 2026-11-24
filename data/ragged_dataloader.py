@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler, get_worker_info
 
+from data import wug_generator
 from data.wug_generator import sample_wug_episode_fast
 
 # Exact 16-byte little-endian structured record layout for {split}.idx (Spec 3.2: 100% backward-compatible!)
@@ -31,16 +32,60 @@ IDX_DTYPE = np.dtype(
     [
         ("offset", "<u8"),     # uint64 byte start offset in .bin
         ("length", "<u4"),     # uint32 exact UTF-8 byte length (> 0)
-        ("lang_id", "<u1"),    # uint8 domain ID in 0..4 (0=en, 1=zh, 2=ja, 3=python, 4=rust)
+        ("lang_id", "<u1"),    # uint8 domain ID in 0..5 (0=en, 1=zh, 2=formal, 3=python, 4=sql_struct, 5=javascript)
         ("source_id", "<u1"),  # uint8 sub-source identifier (11 = latent implicit reasoning -> ponder_tax_scale=0.0)
         ("max_depth", "<u1"),  # uint8 max bracket depth (0 for natural language, 1..16 for code)
-        ("style_id", "<u1"),   # uint8 style subspace ID (0=neutral, 1=memo, 2=expository, 3=narrative, 4=strict_code_tool)
+        ("style_id", "<u1"),   # uint8 style subspace ID (0=rigorous, 1=concise_memo, 2=expository, 3=literary, 4=strict_eng)
     ]
 )
 IDX_RECORD_FMT = "<QIBBBB"
 IDX_RECORD_SIZE = int(IDX_DTYPE.itemsize)  # 16 bytes
 assert IDX_RECORD_SIZE == 16
 LATENT_REASONING_SOURCE_ID = 11
+
+# Deterministic developmental stage difficulty tier (1, 2, or 3) per `.idx` `source_id`:
+#   - Tier 1: Stage-1 clean sensorimotor rhythm, short prose/literature & minimal stdlib/ES6/SQL primitives
+#   - Tier 2: Stage-2 deductive logic edges (FOLIO/LogiQA/FineMath), multi-paragraph discourse & modular AST
+#   - Tier 3: Stage-3 deep slow-thinking, long essays/criticism & complex multi-function engineering modules
+SOURCE_STAGE_TIERS: dict[int, int] = {
+    1: 1,   # nilq/babylm-10M
+    2: 1,   # roneneldan/TinyStories
+    3: 2,   # opencsg/Fineweb-Edu-Chinese-V2.1:4_5
+    4: 2,   # opencsg/Fineweb-Edu-Chinese-V3
+    9: 2,   # nampdn-ai/tiny-codes
+    10: 2,  # TinyPixel/tiny-codes
+    12: 2,  # HuggingFaceFW/fineweb-edu:sample-10BT(>=4)
+    13: 3,  # open-web-math/open-web-math
+    15: 3,  # git:python-ecosystem
+    17: 3,  # git:javascript-ecosystem
+    21: 1,  # HuggingFaceFW/finephrase (Stage 1 clean rephrased prose)
+    22: 1,  # storytracer/US-PD-Books & short classic prose (Stage 1 punctuation/rhythm)
+    23: 1,  # zh_prose_short (Stage 1 Chinese literary/expository short paragraphs)
+    24: 1,  # smollm-corpus:python-edu & cpython stdlib short primitives (Stage 1)
+    25: 1,  # es6_clean_short (Stage 1 JavaScript short primitives)
+    26: 1,  # sql_json_basic (Stage 1 SQL/JSON basic syntax primitives)
+    27: 2,  # tasksource/folio + proofwriter + FOL deductive chains (Stage 2)
+    28: 2,  # logiqa + reclor deductive reading (Stage 2)
+    29: 2,  # HuggingFaceTB/finemath-4plus proofs (Stage 2)
+    30: 2,  # HuggingFaceTB/cosmopedia-v2 humanities/rhetoric/STEM chapters (Stage 2)
+    31: 2,  # BAAI/CCI3-HQ & high-score Chinese deep commentary (Stage 2)
+    32: 2,  # tokyotech-llm/swallow-code-v2 rewritten Python modules (Stage 2)
+    33: 2,  # b-mc2/sql-create-context & JSON schema specs (Stage 2)
+    34: 2,  # js_modular_jsdoc (Stage 2 modular JS/TS)
+    35: 3,  # long_essays_and_criticism (Stage 3)
+    36: 3,  # complex_formal_proofs (Stage 3)
+    37: 3,  # sql_cte_analytic_and_complex_schemas (Stage 3)
+}
+
+
+def infer_doc_stage_tiers(source_ids: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """Compute stage tier in `{1, 2, 3}` for every document record in `.idx`."""
+    tiers = np.where(lengths <= 640, 1, np.where(lengths <= 2048, 2, 3)).astype(np.int64)
+    for sid, tier in SOURCE_STAGE_TIERS.items():
+        mask = source_ids == sid
+        if np.any(mask):
+            tiers[mask] = int(tier)
+    return tiers
 
 
 def assert_not_drive_mmap(path: str | Path) -> None:
@@ -243,6 +288,9 @@ class RaggedByteDataset(Dataset):
         allow_drive_fuse: bool = False,
         length_bucketing: bool = True,
         bucket_sync_world_size: int = 1,
+        max_stage_tier: int = 0,
+        anchor_doc_start: bool = False,
+        wug_mode: str = "classic",
     ) -> None:
         if target_batch_bytes < 64:
             raise ValueError(f"target_batch_bytes must be >= 64, got {target_batch_bytes}")
@@ -277,6 +325,9 @@ class RaggedByteDataset(Dataset):
         self.seed = int(seed)
         self.length_bucketing = bool(length_bucketing)
         self.bucket_sync_world_size = max(1, int(bucket_sync_world_size))
+        self.max_stage_tier = max(0, int(max_stage_tier))
+        self.anchor_doc_start = bool(anchor_doc_start)
+        self.wug_mode = str(wug_mode or "classic")
 
         # Read lightweight index metadata once; .bin mmap is opened lazily per worker process.
         idx_mm = np.memmap(self.idx_path, dtype=IDX_DTYPE, mode="r")
@@ -293,6 +344,7 @@ class RaggedByteDataset(Dataset):
         self._lang_ids = lang_ids
         self._source_ids = source_ids
         self._style_ids = style_ids
+        doc_tiers = infer_doc_stage_tiers(source_ids, lengths) if self.max_stage_tier > 0 else None
 
         self._lang_offsets: dict[int, np.ndarray] = {}
         self._lang_lengths: dict[int, np.ndarray] = {}
@@ -300,6 +352,10 @@ class RaggedByteDataset(Dataset):
         self._lang_styles: dict[int, np.ndarray] = {}
         for lid in sorted(set(lang_ids.tolist())):
             mask = lang_ids == lid
+            if doc_tiers is not None:
+                tier_mask = mask & (doc_tiers <= self.max_stage_tier)
+                if np.any(tier_mask):
+                    mask = tier_mask
             self._lang_offsets[int(lid)] = offsets[mask]
             self._lang_lengths[int(lid)] = lengths[mask]
             self._lang_sources[int(lid)] = source_ids[mask]
@@ -578,9 +634,14 @@ class RaggedByteDataset(Dataset):
                         lid = langs[i]
                         break
 
-            # Optional Stage-D online Wug Episode injection
+            # Optional Stage-D online Wug / Cognitive Stage-4 Episode injection
             if wug_p > 0.0 and rand_fn() < wug_p:
-                raw_b, t1_len, tgt_s, tgt_e = sample_wug_episode_fast(rng, lid)
+                cog_fn = getattr(wug_generator, "sample_cognitive_stage4_episode_fast", None)
+                if self.wug_mode == "cognitive_v2" and cog_fn is not None and rem >= 320:
+                    raw_b, t1_len, tgt_s, tgt_e, wug_style = cog_fn(rng, lid, max_bytes=min(rem, max_doc))
+                else:
+                    raw_b, t1_len, tgt_s, tgt_e = sample_wug_episode_fast(rng, lid)
+                    wug_style = 0
                 ep_len = len(raw_b)
                 if ep_len <= rem:
                     x_buf[cursor : cursor + ep_len] = np.frombuffer(raw_b, dtype=np.uint8)
@@ -588,7 +649,7 @@ class RaggedByteDataset(Dataset):
                     loss_mask[cursor : cursor + t1_len] = False
                     wug_mask[cursor + tgt_s : cursor + tgt_e] = True
                     doc_lang_list.append(lid)
-                    doc_style_list.append(0)
+                    doc_style_list.append(int(wug_style))
                     doc_pts_list.append(1.0)
                     cursor += ep_len
                     cu_list.append(cursor)
@@ -612,8 +673,8 @@ class RaggedByteDataset(Dataset):
             if doc_len <= max_doc:
                 w_start = 0
                 w_end = doc_len
-            elif mask_mm is not None:
-                # Preserve leading user prompt / tool header on framed capability dialogues
+            elif mask_mm is not None or self.anchor_doc_start:
+                # Preserve leading user prompt / tool header or Stage-1 sentence/function start
                 w_start = 0
                 w_end = utf8_safe_end(doc_view, 0, max_doc)
             else:

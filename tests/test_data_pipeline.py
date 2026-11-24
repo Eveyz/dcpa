@@ -50,6 +50,7 @@ from data.wug_generator import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ACTIVE_EXPECTED_LANG_IDS = {0, 1, 3, 5}  # en, zh, python, javascript
 LEGACY_SMOKE_LANG_IDS = {0, 1, 2, 3, 4}  # pre-existing offline smoke cache compatibility
+COGNITIVE_V2_LANG_IDS = {0, 1, 2, 3, 4, 5}  # en, zh, formal, python, sql_struct, javascript
 
 
 @pytest.fixture(scope="module")
@@ -258,7 +259,7 @@ def test_3_train_val_zero_leakage_blake2b(corpus_dir: Path):
     """Test 3: Full-scan blake2b hash deduplication & zero Train/Val overlap + .idx integrity."""
     hashes: dict[str, set[bytes]] = {"train": set(), "val": set()}
     seen_langs: dict[str, set[int]] = {"train": set(), "val": set()}
-    allowed_lids = ACTIVE_EXPECTED_LANG_IDS | LEGACY_SMOKE_LANG_IDS
+    allowed_lids = ACTIVE_EXPECTED_LANG_IDS | LEGACY_SMOKE_LANG_IDS | COGNITIVE_V2_LANG_IDS
 
     for split in ("train", "val"):
         bin_p = corpus_dir / f"{split}.bin"
@@ -294,7 +295,7 @@ def test_3_train_val_zero_leakage_blake2b(corpus_dir: Path):
             del idx_arr, bin_mm
 
     assert seen_langs["train"] == seen_langs["val"]
-    assert seen_langs["train"] in (ACTIVE_EXPECTED_LANG_IDS, LEGACY_SMOKE_LANG_IDS)
+    assert seen_langs["train"] in (ACTIVE_EXPECTED_LANG_IDS, LEGACY_SMOKE_LANG_IDS, COGNITIVE_V2_LANG_IDS)
 
     overlap = hashes["train"] & hashes["val"]
     print(

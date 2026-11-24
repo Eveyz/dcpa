@@ -104,12 +104,12 @@ def compress_to_symbolic_chain(raw_cot: str, answer: str, max_bytes: int = MAX_S
 
 
 def _gen_state_machine_sample(rng: random.Random, idx: int) -> tuple[str, str, str, int, int]:
-    """Deterministic 4..9-variable first-order logic / algebra / inequality state machine (EN/ZH).
+    """Deterministic 4..9-variable FOL / algebra / fallacy / SYNTH-trap state machine (EN/ZH/Formal).
 
     Returns `(question, symbolic_chain, answer, lang_id, style_id)`.
     """
     n_vars = rng.randint(4, 9)
-    kind = idx % 6
+    kind = idx % 8
     is_zh = (idx % 3) == 1
     lang_id = 1 if is_zh else 0
 
@@ -262,6 +262,71 @@ def _gen_state_machine_sample(rng: random.Random, idx: int) -> tuple[str, str, s
         )
         return q, _truncate_utf8(chain, MAX_SCRATCH_BYTES), ans, 5, 4
 
+    if kind == 6:
+        # 13-type bilingual logical fallacy identification
+        fallacies = (
+            (
+                "survivorship_bias",
+                "幸存者偏差",
+                f"All {rng.randint(12, 48)} startups we interviewed in the incubator became profitable after dropping unit tests, so dropping tests increases survival.",
+                f"受访的 {rng.randint(12, 48)} 家存活初创公司都曾砍掉单元测试，因此砍掉单元测试能提高创业存活率。",
+                "Failed startups that dropped tests exited the sample and were never interviewed.",
+                "砍掉测试后倒闭的公司已退出样本未被采访，忽略了沉默的分母。",
+            ),
+            (
+                "post_hoc",
+                "强加因果（先后即因果）",
+                f"Server latency dropped {rng.randint(15, 45)}ms the day after the team repainted the office wall blue, proving blue paint speeds up RPCs.",
+                f"团队把办公室刷成蓝色后的第二天，接口延迟下降了 {rng.randint(15, 45)}ms，证明蓝漆能加速服务响应。",
+                "Temporal sequence alone does not establish a causal mechanism.",
+                "时间上的先后相继不等同于物理或逻辑上的因果传导。",
+            ),
+            (
+                "false_dilemma",
+                "非黑即白（假两难谬误）",
+                "Either we freeze all feature deployments for a full year, or production reliability will collapse completely.",
+                "我们要么冻结全年的新功能发布，要么线上稳定性就会彻底崩溃。",
+                "Ignores intermediate engineering options such as canary rollouts and error budgets.",
+                "人为排除了灰度发布、自动化门禁与错误预算等中间可行方案。",
+            ),
+            (
+                "base_rate_neglect",
+                "忽视基率谬误",
+                "A detector with 99% accuracy flagged an event whose base prevalence is 1 in 10,000, so the event is 99% certain.",
+                "某发生率仅万分之一的罕见故障被准确率 99% 的探针告警，因此该故障有 99% 的把握发生。",
+                "False positives (~100 per 10,000) vastly outnumber true positives (~1 per 10,000).",
+                "在极低先验基率下，假阳性数量（约 100 例）远大于真阳性（约 1 例）。",
+            ),
+        )
+        f_en, f_zh, arg_en, arg_zh, why_en, why_zh = fallacies[(idx // 8) % len(fallacies)]
+        if is_zh:
+            q = f"请识别以下论证中的逻辑谬误并简述原因：\n「{arg_zh}」"
+            chain = f"● premise -> conclusion gap; fallacy={f_en} ({f_zh}) ∴ 缺失反事实对照/基率"
+            ans = f"逻辑谬误类型：{f_zh}。原因：{why_zh}"
+            return q, _truncate_utf8(chain, MAX_SCRATCH_BYTES), ans, 1, 0
+        q = f"Identify the logical fallacy in this argument and explain why it fails:\n\"{arg_en}\""
+        chain = f"● premise -> unwarranted leap; fallacy={f_en} ∴ {why_en[:90]}"
+        ans = f"Fallacy: {f_en.replace('_', ' ')}. {why_en}"
+        return q, _truncate_utf8(chain, MAX_SCRATCH_BYTES), ans, 0, 0
+
+    if kind == 7:
+        # SYNTH-style (`→`, `↺`, `∴`, `●`) semantic trap / formal invariant check (lang_id=2 formal or 1 zh)
+        total_candles = rng.randint(7, 15)
+        blown = rng.randint(2, total_candles - 2)
+        rem_lit = total_candles - blown
+        if is_zh:
+            q = f"桌上点着 {total_candles} 支蜡烛，一阵风吹灭了 {blown} 支，其余蜡烛一直燃尽。最后桌上还剩几支蜡烛？"
+            chain = f"● init={total_candles}, blown={blown} → naive:{rem_lit} ↺ 陷阱:未灭的{rem_lit}支会燃尽消失! ∴ 仅被吹灭的{blown}支留存"
+            ans = f"最后还剩 {blown} 支蜡烛（没被吹灭的 {rem_lit} 支已经燃尽了，只有被吹灭的 {blown} 支保留下来）。"
+            return q, _truncate_utf8(chain, MAX_SCRATCH_BYTES), ans, 1, 0
+        q = (
+            f"A room has {total_candles} lit wax candles. A gust extinguishes {blown} of them, "
+            f"and nobody touches the rest overnight. How many candles remain on the table by morning?"
+        )
+        chain = f"● lit={total_candles}, out={blown} → naive:{rem_lit} ↺ trap:lit {rem_lit} burn down completely ∴ remaining={blown}"
+        ans = f"{blown} candles remain (the {rem_lit} still-burning candles melt away overnight, leaving the {blown} extinguished ones)."
+        return q, _truncate_utf8(chain, MAX_SCRATCH_BYTES), ans, 2, 0
+
     # kind == 5: In-scratchpad constraint satisfaction with hypothesis backtracking (`try -> contra; fix`)
     x_true = rng.randint(3, 9)
     y_true = rng.randint(2, 8)
@@ -364,7 +429,7 @@ def _stream_hf_reasoning(max_items: int, seed: int) -> Iterator[tuple[str, str, 
         pass
 
     # 3. CRUXEval Python execution deduction
-    crux_budget = max(1, int(max_items * 0.15))
+    crux_budget = max(1, int(max_items * 0.12))
     got_crux = 0
     try:
         ds_crux = load_dataset("cruxeval-org/cruxeval", split="test", streaming=True)
@@ -383,6 +448,76 @@ def _stream_hf_reasoning(max_items: int, seed: int) -> Iterator[tuple[str, str, 
             yielded += 1
     except Exception:
         pass
+
+    # 4. PleIAs/SYNTH (`→` derivation, `↺` backtrack, `∴` conclusion)
+    synth_budget = max(1, int(max_items * 0.20))
+    got_synth = 0
+    try:
+        ds_syn = load_dataset("PleIAs/SYNTH", split="train", streaming=True)
+        for row in ds_syn:
+            if got_synth >= synth_budget:
+                break
+            q = sanitize_raw_text(str(row.get("query") or row.get("question") or row.get("prompt") or "")).strip()
+            thought = sanitize_raw_text(str(row.get("synthetic_reasoning") or row.get("reasoning") or "")).strip()
+            ans = sanitize_raw_text(str(row.get("synthetic_answer") or row.get("answer") or row.get("response") or "")).strip()
+            if not q or not ans or len(q.encode("utf-8")) > 900 or len(ans.encode("utf-8")) > 1100:
+                continue
+            chain = _truncate_utf8(thought, MAX_SCRATCH_BYTES) if thought else compress_to_symbolic_chain(ans, ans[:60])
+            yield q, chain, ans, 2, 0
+            got_synth += 1
+            yielded += 1
+    except Exception:
+        pass
+
+    # 5. facebook/natural_reasoning (cross-domain STEM, economics & social science causal chains)
+    nr_budget = max(1, int(max_items * 0.18))
+    got_nr = 0
+    try:
+        ds_nr = load_dataset("facebook/natural_reasoning", split="train", streaming=True)
+        for row in ds_nr:
+            if got_nr >= nr_budget:
+                break
+            q = sanitize_raw_text(str(row.get("question") or "")).strip()
+            ref_ans = sanitize_raw_text(str(row.get("reference_answer") or "")).strip()
+            resps = row.get("responses") or []
+            trace = ""
+            if isinstance(resps, list) and resps:
+                first_r = resps[0]
+                trace = str(first_r.get("response") if isinstance(first_r, dict) else first_r)
+            ans = ref_ans if ref_ans else sanitize_raw_text(trace).strip()[-400:]
+            if not q or not ans or len(q.encode("utf-8")) > 900 or len(ans.encode("utf-8")) > 1000:
+                continue
+            chain = compress_to_symbolic_chain(trace or ans, ans[:60])
+            yield q, chain, ans, 0, 0
+            got_nr += 1
+            yielded += 1
+    except Exception:
+        pass
+
+    # 6. m-a-p/COIG-CQIA (`ruozhiba` semantic traps + `zhihu` critical reasoning) & causalNLP/logical-fallacy
+    coig_budget = max(1, int(max_items * 0.15))
+    got_coig = 0
+    for subset in ("ruozhiba", "zhihu"):
+        if got_coig >= coig_budget:
+            break
+        try:
+            ds_cg = load_dataset("m-a-p/COIG-CQIA", subset, split="train", streaming=True)
+            for row in ds_cg:
+                if got_coig >= coig_budget:
+                    break
+                inst = sanitize_raw_text(str(row.get("instruction") or "")).strip()
+                inp = sanitize_raw_text(str(row.get("input") or "")).strip()
+                out = sanitize_raw_text(str(row.get("output") or "")).strip()
+                q = f"{inst}\n{inp}".strip() if inp else inst
+                if not q or not out or len(q.encode("utf-8")) > 800 or not (60 <= len(out.encode("utf-8")) <= 1200):
+                    continue
+                first_ln = re.split(r"[。！？\n]", out)[0].strip()[:120]
+                chain = _truncate_utf8(f"● 审题辨析 -> 关键前提:{first_ln}", MAX_SCRATCH_BYTES)
+                yield q, chain, out, 1, 0
+                got_coig += 1
+                yielded += 1
+        except Exception:
+            continue
 
 
 def encode_reasoning_sample(
@@ -425,6 +560,7 @@ def build_cap_reasoning_corpus(
     smoke_quota: bool = False,
     offline: bool = False,
     seed: int = 202611,
+    cognitive_v2: bool = False,
 ) -> dict:
     """Build `cap_reasoning_{train,val}.{bin,idx,loss_mask.bin}` pure-byte reasoning corpus."""
     t0 = time.perf_counter()
@@ -453,10 +589,11 @@ def build_cap_reasoning_corpus(
         nonlocal acc_bytes, explicit_count, latent_count, max_scratch_len
         if acc_bytes >= total_target:
             return False
+        eff_lid = int(lid) if cognitive_v2 else (0 if int(lid) == 2 else int(lid))
         # Exact 60% explicit / 40% latent implicit ratio
         is_latent = (rng.random() < 0.40)
         try:
-            raw_b, msk_b, l_i, src_i, sty_i = encode_reasoning_sample(q, chain, ans, lid, sid, is_latent)
+            raw_b, msk_b, l_i, src_i, sty_i = encode_reasoning_sample(q, chain, ans, eff_lid, sid, is_latent)
         except Exception:
             return False
         if len(raw_b) < 32 or len(raw_b) > 2048:
@@ -551,6 +688,7 @@ def main() -> None:
     ap.add_argument("--target-mb", type=float, default=100.0)
     ap.add_argument("--smoke-quota", action="store_true", help="Build 2 MB local smoke quota")
     ap.add_argument("--offline", action="store_true", help="Zero-network deterministic synthesis")
+    ap.add_argument("--cognitive-v2", action="store_true", help="Enable lang_id=2 formal logic slot for DCPA v2")
     ap.add_argument("--seed", type=int, default=202611)
     args = ap.parse_args()
     res = build_cap_reasoning_corpus(
@@ -559,6 +697,7 @@ def main() -> None:
         smoke_quota=args.smoke_quota,
         offline=args.offline,
         seed=args.seed,
+        cognitive_v2=args.cognitive_v2,
     )
     print(json.dumps(res, indent=2, ensure_ascii=False))
 

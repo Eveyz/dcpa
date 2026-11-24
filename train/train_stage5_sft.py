@@ -253,6 +253,7 @@ def _eval_sft_val_bpc(
             if n_sup <= 0:
                 continue
             sft_lam_act = min(0.02, 0.5 * float(model.cfg.lambda_act))
+            eff_w_thresh = float(model.cfg.householder_write_threshold)
             with amp_autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
                 out = model(
                     raw_bytes=x_b.unsqueeze(0),
@@ -269,6 +270,7 @@ def _eval_sft_val_bpc(
                     lambda_pc_override=0.5,
                     lambda_halt_override=0.5,
                     lambda_act_override=sft_lam_act,
+                    write_threshold_override=eff_w_thresh,
                     doc_cu_seqlens=cu,
                 )
             tot_nll += float(out.loss_lang.detach().item()) * n_sup
@@ -398,14 +400,20 @@ def run_stage5_sft(
     ]
     if cap_data_dir is not None:
         cdir = Path(cap_data_dir)
-        for idx_c, pref in enumerate(("cap_reasoning", "cap_instruct", "cap_toolcall", "cap_writing"), start=1):
+        for idx_c, pref in enumerate(
+            ("cap_reasoning", "cap_instruct", "cap_code", "cap_toolcall", "cap_writing"),
+            start=1,
+        ):
             if (cdir / f"{pref}_train.bin").exists() and (cdir / f"{pref}_train.loss_mask.bin").exists():
                 train_datasets.append(
                     SFTByteDataset(
                         data_dir=cdir,
                         split="train",
                         target_batch_bytes=eff_micro_bytes,
-                        max_doc_bytes=max(max_doc_bytes, 4096 if pref in ("cap_writing", "cap_instruct") else max_doc_bytes),
+                        max_doc_bytes=max(
+                            max_doc_bytes,
+                            4096 if pref in ("cap_writing", "cap_instruct", "cap_code") else max_doc_bytes,
+                        ),
                         num_batches=max((total_steps * grad_accum + 100) * dist_ctx.world_size, 1000),
                         seed=seed + idx_c * 313,
                         prefix=pref,
@@ -466,6 +474,7 @@ def run_stage5_sft(
                     x_b, msk, eot_weight=eot_weight, tool_ctrl_weight=tool_ctrl_weight
                 ).unsqueeze(0)
                 sft_lam_act = min(0.02, 0.5 * float(model.cfg.lambda_act))
+                eff_w_thresh = float(model.cfg.householder_write_threshold)
                 with amp_autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
                     out = model(
                         raw_bytes=x_b.unsqueeze(0),
@@ -482,6 +491,7 @@ def run_stage5_sft(
                         lambda_pc_override=0.5,
                         lambda_halt_override=0.5,
                         lambda_act_override=sft_lam_act,
+                        write_threshold_override=eff_w_thresh,
                         doc_cu_seqlens=cu,
                         record_traces=False,
                     )

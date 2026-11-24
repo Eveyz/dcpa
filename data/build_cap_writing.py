@@ -318,9 +318,36 @@ def _stream_hf_writing(max_items: int) -> Iterator[tuple[str, int, str]]:
     except Exception:
         pass
 
-    # 3. HuggingFaceTB/smoltalk (explore-instruct-rewriting)
-    rw_budget = max(1, int(max_items * 0.20))
+    # 3. HuggingFaceTB/smoltalk (explore-instruct-rewriting) & Crownelius high-aesthetic subsets (<= 3 epochs)
+    rw_budget = max(1, int(max_items * 0.25))
     got_rw = 0
+    for crown_repo in ("Crownelius/Creative-Writing-High-Quality-1300x", "Crownelius/Novel-Crafting-250x"):
+        if got_rw >= rw_budget // 2:
+            break
+        try:
+            ds_cr = load_dataset(crown_repo, split="train", streaming=True)
+            for row in ds_cr:
+                if got_rw >= rw_budget // 2:
+                    break
+                msgs = row.get("messages") or row.get("conversations") or []
+                a_txt = ""
+                u_txt = ""
+                if isinstance(msgs, list) and msgs:
+                    u_txt = next((str(m.get("content") or m.get("value") or "") for m in msgs if m.get("role") in ("user", "human") or m.get("from") in ("user", "human")), "")
+                    a_txt = next((str(m.get("content") or m.get("value") or "") for m in msgs if m.get("role") in ("assistant", "gpt") or m.get("from") in ("assistant", "gpt")), "")
+                else:
+                    a_txt = str(row.get("text") or row.get("output") or row.get("response") or "")
+                    u_txt = str(row.get("prompt") or row.get("instruction") or "Write a grounded literary scene.")
+                if not a_txt or not (600 <= len(a_txt.encode("utf-8", errors="ignore")) <= 4096):
+                    continue
+                cleaned = filter_cliches(a_txt)
+                if cleaned is None:
+                    continue
+                yield cleaned, 0, sanitize_raw_text(u_txt).strip()[:220] or "Write a grounded literary scene."
+                got_rw += 1
+        except Exception:
+            continue
+
     try:
         ds_rw = load_dataset("HuggingFaceTB/smoltalk", "explore-instruct-rewriting", split="train", streaming=True)
         for row in ds_rw:
@@ -338,6 +365,60 @@ def _stream_hf_writing(max_items: int) -> Iterator[tuple[str, int, str]]:
             got_rw += 1
     except Exception:
         pass
+
+
+def synthesize_slop_draft_from_clean(clean_article: str, lang_id: int) -> tuple[str, str]:
+    """Corrupt a clean essay/scene into an AI-slop draft (`mask=0` input ONLY!) and return `(slop, diagnosis)`."""
+    paras = [p.strip() for p in clean_article.split("\n\n") if p.strip()]
+    if len(paras) >= 3:
+        # Swap middle two paragraphs to simulate broken causal/narrative flow
+        mut = list(paras)
+        mut[1], mut[2] = mut[2], mut[1]
+    else:
+        mut = list(paras)
+
+    if lang_id == 1:
+        slop = (
+            "值得注意的是，这无疑是一把双刃剑。\n\n"
+            + "\n\n".join(mut)
+            + "\n\n总而言之，综上所述，我们必须全面看待这一深刻议题。"
+        )
+        diag = "诊断:删去首尾AI塑料套话 + 修复第2/3段倒置脉络 -> 凝练重写"
+    else:
+        slop = (
+            "It is worth noting that we must delve into this double-edged sword.\n\n"
+            + "\n\n".join(mut)
+            + "\n\nIn conclusion, needless to say, these dynamics remain crucial."
+        )
+        diag = "诊断:purge AI clichés + restore paragraph 2/3 causal progression -> tighten prose"
+    return slop, diag
+
+
+def encode_anti_slop_rewrite_sample(
+    clean_article: str,
+    lang_id: int,
+    style_id: int,
+) -> tuple[bytes, bytes, int, int]:
+    """Data Alchemy #2: `[Slop Draft in User Turn, mask=0] -> [\x1dS diagnosis \x1dE + Clean Final, mask=1]`."""
+    clean_body = sanitize_raw_text(clean_article).strip()
+    assert not _CLICHE_RE.search(clean_body), "Target clean article must be 100% cliché-free!"
+    slop_draft, diag = synthesize_slop_draft_from_clean(clean_body, lang_id)
+    instruction = (
+        "请删去以下初稿中的空洞 AI 套话、修复错乱的段落因果顺序，并润色为凝练定稿：\n"
+        if lang_id == 1
+        else "Strip all hollow AI clichés, restore logical paragraph order, and tighten this rough draft:\n"
+    )
+    u_text = sanitize_raw_text(instruction + slop_draft).strip()
+    diag_b = _truncate_utf8(sanitize_raw_text(diag).strip(), MAX_OUTLINE_BYTES).encode("utf-8", errors="strict")
+    body_b = clean_body.encode("utf-8", errors="strict")
+
+    u_frame = TURN_USER_PREFIX + u_text.encode("utf-8", errors="strict") + b"\n" + TURN_ASST_PREFIX
+    a_frame = SCRATCH_START + diag_b + SCRATCH_END + body_b + TURN_EOT_SUFFIX
+    raw_bytes = u_frame + a_frame
+    mask_bytes = (b"\x00" * len(u_frame)) + (b"\x01" * len(a_frame))
+    assert len(raw_bytes) == len(mask_bytes)
+    raw_bytes.decode("utf-8", errors="strict")
+    return raw_bytes, mask_bytes, int(lang_id), int(style_id)
 
 
 def encode_writing_sample(
@@ -406,14 +487,17 @@ def build_cap_writing_corpus(
     style_counts = {1: 0, 2: 0, 3: 0}
     max_outline_len = 0
 
-    def _try_add(body: str, lid: int, sid: int, prompt: str, as_dialogue: bool) -> bool:
+    def _try_add(body: str, lid: int, sid: int, prompt: str, as_dialogue: bool, as_antislop: bool = False) -> bool:
         nonlocal acc_bytes, max_outline_len
         if acc_bytes >= total_target:
             return False
         if _CLICHE_RE.search(body):
             return False
         try:
-            raw_b, msk_b, l_i, s_i = encode_writing_sample(body, lid, sid, prompt, as_dialogue=as_dialogue)
+            if as_antislop and len(body.encode("utf-8", errors="ignore")) <= 1800:
+                raw_b, msk_b, l_i, s_i = encode_anti_slop_rewrite_sample(body, lid, sid)
+            else:
+                raw_b, msk_b, l_i, s_i = encode_writing_sample(body, lid, sid, prompt, as_dialogue=as_dialogue)
         except Exception:
             return False
         if len(raw_b) < 256 or len(raw_b) > 4608:
@@ -436,15 +520,29 @@ def build_cap_writing_corpus(
         est_items = max(300, int(hf_cap / 1400))
         for i, (body, lid, prompt) in enumerate(_stream_hf_writing(est_items)):
             sid = classify_writing_style(body)
-            _try_add(body, lid, sid, prompt, as_dialogue=(i % 2 == 0))
+            _try_add(
+                body,
+                lid,
+                sid,
+                prompt,
+                as_dialogue=(i % 2 == 0),
+                as_antislop=((i % 4) == 3),
+            )
             if acc_bytes >= hf_cap:
                 break
 
     idx = 0
     while acc_bytes < total_target:
         body, lid, sid, prompt = _gen_offline_article(rng, idx)
-        # Re-verify heuristic classifier agrees cleanly or keeps balanced styles 1/2/3
-        _try_add(body, lid, sid, prompt, as_dialogue=(idx % 2 == 0))
+        # Mix 25% Anti-Slop Rewriting Pairs (`slop [mask=0] -> diagnosis + clean [mask=1]`)
+        _try_add(
+            body,
+            lid,
+            sid,
+            prompt,
+            as_dialogue=(idx % 2 == 0),
+            as_antislop=((idx % 4) == 3),
+        )
         idx += 1
 
     rng.shuffle(docs)

@@ -52,8 +52,11 @@ from data.wug_generator import (
     inflect_prog,
 )
 from utils.chat_protocol import (
+    SCRATCH_END,
+    SCRATCH_START,
     EncodedDialogue,
     encode_dialogue_turns,
+    sanitize_raw_text,
     verify_mask_alignment,
 )
 
@@ -544,6 +547,493 @@ def _sample_bucket_d_dialogue(rng: random.Random) -> EncodedDialogue:
 
 
 # =============================================================================
+# DCPA v2 Holistic Cognitive Stage-5 Builders (35% Logic : 35% Writing : 30% Code)
+# Zero Rust: 0=en, 1=zh, 2=formal, 3=python, 4=sql_struct, 5=javascript
+# =============================================================================
+
+
+def _wrap_scratch(plan: str, body: str) -> str:
+    p_clean = sanitize_raw_text(plan).strip()
+    b_clean = sanitize_raw_text(body).strip()
+    return f"\x1dS\n{p_clean}\n\x1dE\n{b_clean}"
+
+
+def _sample_v2_logic_socratic_dialogue(rng: random.Random) -> EncodedDialogue:
+    """Bucket 0 (35%): Socratic premise questioning, fallacy pushback & epistemic boundary self-awareness."""
+    mode = rng.random()
+    if mode < 0.45:
+        # Socratic missing-premise detection -> Turn-2 binding & deduction
+        rate_a = rng.randint(62, 88)
+        rate_b = rate_a + rng.randint(5, 11)
+        sample_b = rng.choice((12, 15, 18))
+        sample_a = rng.choice((800, 1200, 2500))
+        if rng.random() < 0.52:
+            u1 = (
+                f"方案 B 的转化率达到 {rate_b}%，高于方案 A 的 {rate_a}%。"
+                f"我们是否应该立刻全量切换到方案 B？"
+            )
+            a1 = _wrap_scratch(
+                f"◐ missing_premise: sample_size & traffic_split unknown -> guard against base-rate/survivorship fallacy",
+                "目前不能直接下结论：缺少两组的样本量、流量分层是否同质以及统计显著性边界。"
+                "如果方案 B 仅在小样本或高意向子群上测得高转化，直接全量切换可能触发辛普森悖论或均值回归。"
+                "请补充两组的样本规模与分流方式。",
+            )
+            u2 = f"补充数据：方案 A 测试了 {sample_a} 人（全量随机流量），方案 B 只在老客群测试了 {sample_b} 人。"
+            a2 = _wrap_scratch(
+                f"● bound: A={sample_a}(random) vs B={sample_b}(loyal_bias) -> selection bias confirmed -> reject full rollout",
+                f"不应立即全量切换。方案 B 不仅样本量极小（仅 {sample_b} 人，置信区间过宽），"
+                f"而且局限于高留存老客群，与方案 A 的 {sample_a} 人随机流量不具可比性。"
+                f"建议先在同质随机流量下补做等权 A/B 实验，再决定是否放量。",
+            )
+            return encode_dialogue_turns([(u1, a1), (u2, a2)], lang_id=1, bucket_id=0, style_id=0, allow_assistant_controls=True)
+
+        u1 = (
+            f"Vendor B reports {rate_b}% uptime resolution within 10 minutes versus Vendor A's {rate_a}%. "
+            f"Does that prove Vendor B has strictly stronger engineering reliability?"
+        )
+        a1 = _wrap_scratch(
+            "◐ missing_premise: incident severity mix & sample denominator unstated -> ask before concluding",
+            "Not necessarily. That comparison omits two critical premises: total incident count and severity distribution. "
+            "A vendor handling mostly trivial tickets can post a higher 10-minute resolution percentage while failing on severe outages. "
+            "Please share the ticket volume and P1/P2 breakdown for both vendors.",
+        )
+        u2 = f"Vendor A handled {sample_a} mixed P1/P2 incidents; Vendor B handled {sample_b} minor P4 tickets only."
+        a2 = _wrap_scratch(
+            f"● Simpson/selection bias: A={sample_a}(P1/P2) vs B={sample_b}(P4) -> premise invalidates claim",
+            f"With that breakdown, Vendor B's {rate_b}% figure reflects {sample_b} minor P4 requests rather than comparable outage load, "
+            f"whereas Vendor A sustained {rate_a}% across {sample_a} severe P1/P2 incidents. "
+            f"Compare both vendors within matching severity tiers before switching.",
+        )
+        return encode_dialogue_turns([(u1, a1), (u2, a2)], lang_id=0, bucket_id=0, style_id=0, allow_assistant_controls=True)
+
+    if mode < 0.78:
+        # Epistemic boundary self-awareness + live fast-weight rule/metric binding
+        metric_v = rng.randint(120, 960)
+        delta_v = rng.randint(15, 85)
+        if rng.random() < 0.5:
+            q = rng.choice(_BUCKET_D_PROMPTS_ZH)
+            a1 = _wrap_scratch(
+                "○ epistemic_boundary: unverified external/private fact -> refuse fabrication & invite fast-weight input",
+                _REFUSAL_ZH,
+            )
+            u2 = f"给你现场数据：基准读数为 {metric_v}，安全余量需要扣除 {delta_v}。请给出可用上限。"
+            a2 = _wrap_scratch(
+                f"● fast_weight_bound: base={metric_v}, margin={delta_v} -> net={metric_v - delta_v}",
+                f"已锁定你提供的基准数据：{metric_v} - {delta_v} = {metric_v - delta_v}，当前可用安全上限为 {metric_v - delta_v}。",
+            )
+            return encode_dialogue_turns([(q, a1), (u2, a2)], lang_id=1, bucket_id=0, style_id=0, allow_assistant_controls=True)
+
+        q = rng.choice(_BUCKET_D_PROMPTS_EN)
+        a1 = _wrap_scratch(
+            "○ epistemic_boundary: live/private fact absent from context -> decline guesswork & request input",
+            _REFUSAL_EN,
+        )
+        u2 = f"Here is the live figure: baseline capacity is {metric_v} units and reserve holdback is {delta_v} units. Compute net dispatchable capacity."
+        a2 = _wrap_scratch(
+            f"● fast_weight_bound: {metric_v} - {delta_v} = {metric_v - delta_v}",
+            f"Binding your live figures: {metric_v} - {delta_v} = {metric_v - delta_v} dispatchable units.",
+        )
+        return encode_dialogue_turns([(q, a1), (u2, a2)], lang_id=0, bucket_id=0, style_id=0, allow_assistant_controls=True)
+
+    # Formal logic consistency & countermodel check (lang_id = 2, style_id = 0)
+    k_mod = rng.choice((6, 8, 10, 12))
+    odd_c = rng.choice((1, 3, 5))
+    u1 = (
+        f"Check consistency of this formal constraint set over integers:\n"
+        f"  C1: x ≡ 0 (mod 2)\n"
+        f"  C2: y = {k_mod} * q + x for some integer q\n"
+        f"  C3: y ≡ {odd_c} (mod 2)\n"
+        f"Does a valid integer solution (x, y, q) exist?"
+    )
+    a1 = _wrap_scratch(
+        f"● C1: x even & {k_mod} even -> C2 implies y even -> contradicts C3 (y odd={odd_c}) -> ∴ UNSAT",
+        f"No solution exists (the system is unsatisfiable).\n"
+        f"1. By C1, `x` is even (`x ≡ 0 mod 2`).\n"
+        f"2. Since `{k_mod}` is even, `{k_mod} * q` is also even for every integer `q`; hence `y = {k_mod} * q + x` must satisfy `y ≡ 0 (mod 2)`.\n"
+        f"3. This directly contradicts C3 (`y ≡ {odd_c} ≡ 1 mod 2`).\n"
+        f"∴ `{{C1, C2, C3}}` is inconsistent.",
+    )
+    u2 = f"If we relax C3 to `y ≡ 0 (mod 2)` and add `x = 4, q = 2`, what is `y`?"
+    y_ans = k_mod * 2 + 4
+    a2 = _wrap_scratch(
+        f"● C3' consistent -> substitute q=2, x=4 -> y={k_mod}*2+4={y_ans}",
+        f"With C3 relaxed to `y ≡ 0 (mod 2)`, the parity constraint is consistent. Substituting `x = 4` and `q = 2` into C2 gives `y = {k_mod} * 2 + 4 = {y_ans}`.",
+    )
+    return encode_dialogue_turns([(u1, a1), (u2, a2)], lang_id=2, bucket_id=0, style_id=0, allow_assistant_controls=True)
+
+
+_ZH_POLISH_SEEDS: tuple[tuple[str, str, str, str, int], ...] = (
+    (
+        "请以“技术系统中的冗余设计”为题写一段短评，先给初稿，再接受审校打磨。",
+        "立意: 冗余不是浪费而是容错边界 | 结构: 误区 -> 工程机制 -> 结论",
+        "在当今快速发展的技术时代，值得注意的是，冗余设计往往被很多人误解为一种资源浪费。不仅如此，许多团队为了追求极致的短期效率，会砍掉备用链路。总而言之，一旦发生突发故障，没有冗余的系统就会陷入瘫痪，因此冗余其实非常重要。",
+        "诊断: 删去“当今时代/值得注意的是/总而言之”等套话；补入热备切换与尾部风险的具体因果锚点",
+        2,
+    ),
+    (
+        "写一段关于“老旧船坞清晨停航检修”的叙事速写（约 150 字）。",
+        "意象锚点: 铁锈、退潮刻度、扳手敲击声 | 情绪: 克制沉静",
+        "清晨的海港非常安静，令人印象深刻。老工匠走进船坞，看到大船停在那里，心里有很多感慨。他拿起工具开始认真检查船底的阀门，展现出了极高的敬业精神，晨光洒在他身上显得十分温暖。",
+        "诊断: 剔除“令人印象深刻/极高敬业精神”等空洞总结词，改用退潮水痕与金属冷感动作细节呈现",
+        3,
+    ),
+    (
+        "起草一封向研发团队通报“周三晚间索引库只读维护 20 分钟”的内部备忘录。",
+        "要素: 窗口 22:00-22:20 | 影响: 写入排队、读取正常 | 回滚预案",
+        "各位同事大家好，为了进一步全面提升我们的系统稳定性和综合服务体验，经过慎重讨论，我们计划在本周三晚上对索引库开展一次非常重要的维护工作。届时可能会对部分写入操作产生一定程度的影响，希望大家提前做好准备并予以配合。",
+        "诊断: 砍掉寒暄与虚词；精确列出起止时间、只读表现、上游重试策略与超时回滚阈值",
+        1,
+    ),
+)
+
+_EN_POLISH_SEEDS: tuple[tuple[str, str, str, str, int], ...] = (
+    (
+        "Draft a short analytical paragraph on why small engineering teams should prefer boring protocols.",
+        "thesis: predictable failure modes beat novelty | arc: hidden maintenance tax -> debuggability -> takeaway",
+        "In today's fast-paced software landscape, it is important to note that shiny new protocols often attract teams. Moreover, cutting-edge tools look impressive in benchmarks. All in all, boring protocols are actually much better because they save time when things break.",
+        "diagnosis: strip AI throat-clearing ('In today's...', 'important to note', 'All in all'); replace vague praise with concrete failure-mode visibility and on-call recovery cost",
+        2,
+    ),
+    (
+        "Write a brief scene of a watchmaker testing a repaired marine chronometer before dawn.",
+        "anchor: brass balance wheel, frost on window, tick interval | tone: quiet precision",
+        "The workshop was very quiet and atmospheric before sunrise. The dedicated watchmaker looked closely at the antique chronometer with deep focus. After hours of hard work, the gears finally moved smoothly, proving that patience always pays off.",
+        "diagnosis: cut telling adjectives ('atmospheric', 'dedicated') and moralizing ending; ground the paragraph in physical sound, loupe magnification, and beat error",
+        3,
+    ),
+    (
+        "Write a crisp executive memo recommending a two-week freeze on schema migrations before peak quarter-end close.",
+        "decision: freeze DDL Sep 20 - Oct 4 | exception path: P0 hotfix sign-off | rationale: settlement stability",
+        "It goes without saying that quarter-end financial close is a critical period for our organization. Furthermore, database changes can sometimes introduce unexpected risks. Therefore, we would like to suggest pausing schema updates for two weeks so everything runs smoothly.",
+        "diagnosis: delete filler transitions; state exact freeze window, operational blast radius, and single-owner P0 exception gate upfront",
+        1,
+    ),
+)
+
+
+def _sample_v2_writing_polish_dialogue(rng: random.Random) -> EncodedDialogue:
+    """Bucket 1 (35%): Multi-draft author loop (`Brief -> Slot-0 Outline + Draft 1 -> Self-Critique -> Polished Final`)."""
+    batch_tag = rng.randint(12, 48)
+    if rng.random() < 0.52:
+        idx = rng.randrange(len(_ZH_POLISH_SEEDS))
+        prompt, outline, draft1, diag, sid = _ZH_POLISH_SEEDS[idx]
+        if idx == 0:
+            polished = (
+                f"冗余设计的本质不是堆叠闲置算力，而是为极端尾部故障预留隔离带。"
+                f"日常负载下，双路校验与旁路缓存看似拉高了约 {batch_tag}% 的静态成本；"
+                f"但当主链路遭遇瞬时拥塞或硬件静默损坏时，正是这层缓冲决定了系统是平滑降级，还是触发雪崩式停摆。"
+            )
+            crit_u = "初稿有明显的套话（如“值得注意的是”“总而言之”），且论证偏空泛。请自我审校并精修定稿。"
+        elif idx == 1:
+            polished = (
+                f"潮水退至三号石阶下方，露出船底暗褐色的藤壶与湿冷铁锈。"
+                f"老师傅蹲在龙骨阴影里，用铜锤轻叩止回阀法兰，侧耳辨认回音是否发闷；"
+                f"直到第 {batch_tag} 颗螺栓渗出的盐水被棉纱拭净，坞门外才透进第一缕灰白晨光。"
+            )
+            crit_u = "初稿用了太多抽象概括词，缺少触觉和听觉细节。请删掉空洞抒情，重写成克制凝练的定稿。"
+        else:
+            polished = (
+                f"【维护窗口】周三 22:00–22:{batch_tag}（共 {batch_tag} 分钟），主索引库切换为只读模式。\n"
+                f"【业务影响】在线查询不受影响；异步写入请求将暂存本地队列，恢复后自动重放。\n"
+                f"【回滚边界】若切换后只读延迟 P99 超过 80ms，22:08 前无损切回原主库。"
+            )
+            crit_u = "请删掉客套话和模糊表述，改成条理分明、可直接发给研发值班群的精炼工程备忘录。"
+        a1 = _wrap_scratch(outline, draft1)
+        a2 = _wrap_scratch(diag, polished)
+        return encode_dialogue_turns([(prompt, a1), (crit_u, a2)], lang_id=1, bucket_id=1, style_id=sid, allow_assistant_controls=True)
+
+    idx = rng.randrange(len(_EN_POLISH_SEEDS))
+    prompt, outline, draft1, diag, sid = _EN_POLISH_SEEDS[idx]
+    if idx == 0:
+        polished = (
+            f"Small teams pay for protocol novelty twice: first during integration, and again at 3 a.m. when an undocumented edge case stalls traffic. "
+            f"A battle-tested protocol with {batch_tag} years of field postmortems trades marginal benchmark throughput for known failure modes, "
+            f"plain-text wire inspection, and fast recovery under pressure."
+        )
+        crit_u = "Cut the AI clichés ('In today's fast-paced...', 'All in all') and tighten this into sharp, concrete prose."
+    elif idx == 1:
+        polished = (
+            f"Frost rimmed the north pane while the brass balance wheel swung under his loupe. "
+            f"He nudged the regulator screw a hairbreadth, counted {batch_tag} crisp beats against the wall pendulum, "
+            f"and closed the mahogany lid only when the beat error settled to zero."
+        )
+        crit_u = "Strip the abstract adjectives and moralizing conclusion; revise using concrete sensory action."
+    else:
+        polished = (
+            f"Effective Day 1 through Day {batch_tag} of close, all non-emergency production DDL migrations are frozen.\n"
+            f"- Scope: Ledger, settlement, and reporting schemas (read/write DML unaffected).\n"
+            f"- Exception Gate: P0 data-integrity fixes require joint sign-off from On-Call Lead and Finance Eng."
+        )
+        crit_u = "Remove the throat-clearing filler and rewrite as a direct, high-signal executive memo."
+    a1 = _wrap_scratch(outline, draft1)
+    a2 = _wrap_scratch(diag, polished)
+    return encode_dialogue_turns([(prompt, a1), (crit_u, a2)], lang_id=0, bucket_id=1, style_id=sid, allow_assistant_controls=True)
+
+
+def _sample_v2_code_bugfix_dialogue(rng: random.Random) -> EncodedDialogue:
+    """Bucket 2 (30%): Python/SQL/JS root-cause bugfix + Turn-2 live spec evolution (`style_id=4`, zero Rust)."""
+    lang_choice = rng.random()
+    if lang_choice < 0.50:
+        # Python AST-verified bugfix + Turn-2 extension (lang_id = 3)
+        fn_name = f"window_max_{_fresh_snake_ident(rng)}"
+        cap_hi = rng.choice((256, 512, 1024))
+        buggy_py = (
+            f"def {fn_name}(xs: list[int], k: int, seen: list[int] = []) -> list[int]:\n"
+            f"    for i in range(len(xs) - k):\n"
+            f"        seen.append(max(xs[i : i + k]))\n"
+            f"    return seen"
+        )
+        fixed_py_1 = (
+            f"def {fn_name}(xs: list[int], k: int) -> list[int]:\n"
+            f"    if k <= 0 or k > len(xs):\n"
+            f"        return []\n"
+            f"    return [max(xs[i : i + k]) for i in range(len(xs) - k + 1)]"
+        )
+        fixed_py_2 = (
+            f"def {fn_name}(xs: list[int], k: int, ceiling: int = {cap_hi}) -> list[int]:\n"
+            f"    if k <= 0 or k > len(xs):\n"
+            f"        return []\n"
+            f"    return [min(ceiling, max(xs[i : i + k])) for i in range(len(xs) - k + 1)]"
+        )
+        assert is_valid_code_ast(fixed_py_1, "python") and is_valid_code_ast(fixed_py_2, "python")
+        u1 = f"Diagnose both bugs in this Python sliding-window helper and provide a clean fix:\n```python\n{buggy_py}\n```"
+        a1 = _wrap_scratch(
+            "bugs: 1) mutable default `seen=[]` leaks state across calls; 2) off-by-one `len(xs)-k` drops final window & lacks `k<=0` guard",
+            f"Two root causes:\n"
+            f"1. `seen: list[int] = []` mutates a shared default list across invocations.\n"
+            f"2. `range(len(xs) - k)` misses the last valid window (`len(xs) - k + 1`) and fails when `k <= 0` or `k > len(xs)`.\n\n"
+            f"```python\n{fixed_py_1}\n```",
+        )
+        u2 = f"Now extend `{fn_name}` with an optional `ceiling: int = {cap_hi}` parameter that clamps each window maximum."
+        a2 = _wrap_scratch(
+            f"extend signature -> clamp each window max via min(ceiling, ...)",
+            f"```python\n{fixed_py_2}\n```",
+        )
+        return encode_dialogue_turns([(u1, a1), (u2, a2)], lang_id=3, bucket_id=2, style_id=4, allow_assistant_controls=True)
+
+    if lang_choice < 0.75:
+        # SQL LEFT JOIN filter trap bugfix (lang_id = 4, style_id = 4)
+        tbl_u = f"orgs_{_fresh_snake_ident(rng)}"
+        tbl_o = f"invoices_{_fresh_snake_ident(rng)}"
+        min_amt = rng.choice((50, 100, 200))
+        u1 = (
+            f"Why does this SQL query drop organizations with zero paid invoices, and how do we fix it?\n"
+            f"```sql\n"
+            f"SELECT o.org_id, COUNT(i.invoice_id) AS paid_cnt\n"
+            f"FROM {tbl_u} o\n"
+            f"LEFT JOIN {tbl_o} i ON o.org_id = i.org_id\n"
+            f"WHERE i.status = 'paid' AND i.amount_cents >= {min_amt}\n"
+            f"GROUP BY o.org_id;\n"
+            f"```"
+        )
+        fixed_sql_1 = (
+            f"SELECT\n"
+            f"    o.org_id,\n"
+            f"    COUNT(i.invoice_id) AS paid_cnt\n"
+            f"FROM {tbl_u} AS o\n"
+            f"LEFT JOIN {tbl_o} AS i\n"
+            f"    ON o.org_id = i.org_id\n"
+            f"    AND i.status = 'paid'\n"
+            f"    AND i.amount_cents >= {min_amt}\n"
+            f"GROUP BY o.org_id;"
+        )
+        fixed_sql_2 = (
+            f"SELECT\n"
+            f"    o.org_id,\n"
+            f"    COUNT(i.invoice_id) AS paid_cnt,\n"
+            f"    COALESCE(SUM(i.amount_cents), 0) AS paid_total_cents\n"
+            f"FROM {tbl_u} AS o\n"
+            f"LEFT JOIN {tbl_o} AS i\n"
+            f"    ON o.org_id = i.org_id\n"
+            f"    AND i.status = 'paid'\n"
+            f"    AND i.amount_cents >= {min_amt}\n"
+            f"GROUP BY o.org_id;"
+        )
+        a1 = _wrap_scratch(
+            "root_cause: filtering right-table columns `i.status` in WHERE turns LEFT JOIN into INNER JOIN on NULL rows -> move predicates into ON",
+            f"Filtering `i.status = 'paid'` inside `WHERE` rejects unmatched rows where `i.*` is `NULL`, silently converting the `LEFT JOIN` into an `INNER JOIN`. Move right-table predicates into the `ON` clause:\n\n```sql\n{fixed_sql_1}\n```",
+        )
+        u2 = "Also return `paid_total_cents` defaulting to `0` instead of `NULL` for zero-invoice organizations."
+        a2 = _wrap_scratch(
+            "wrap SUM(i.amount_cents) in COALESCE(..., 0)",
+            f"```sql\n{fixed_sql_2}\n```",
+        )
+        return encode_dialogue_turns([(u1, a1), (u2, a2)], lang_id=4, bucket_id=2, style_id=4, allow_assistant_controls=True)
+
+    # JavaScript ES6 mutation & numeric sort bugfix (lang_id = 5, style_id = 4)
+    fn_js = _fresh_camel_ident(rng)
+    top_n = rng.choice((3, 5, 10))
+    buggy_js = (
+        f"function {fn_js}(scores) {{\n"
+        f"  return scores.sort().slice(0, {top_n});\n"
+        f"}}"
+    )
+    fixed_js_1 = (
+        f"function {fn_js}(scores) {{\n"
+        f"  if (!Array.isArray(scores)) return [];\n"
+        f"  return [...scores].sort((a, b) => b - a).slice(0, {top_n});\n"
+        f"}}"
+    )
+    fixed_js_2 = (
+        f"function {fn_js}(scores, minScore = 0) {{\n"
+        f"  if (!Array.isArray(scores)) return [];\n"
+        f"  return scores.filter((v) => v >= minScore).sort((a, b) => b - a).slice(0, {top_n});\n"
+        f"}}"
+    )
+    assert is_valid_code_ast(fixed_js_1, "javascript") and is_valid_code_ast(fixed_js_2, "javascript")
+    u1 = f"Fix the two bugs in `{fn_js}` (intended to return the top {top_n} numeric scores descending without mutating the caller's array):\n```javascript\n{buggy_js}\n```"
+    a1 = _wrap_scratch(
+        "bugs: 1) Array.prototype.sort() mutates in place; 2) default comparator sorts lexicographically ('10' < '2')",
+        f"1. `scores.sort()` mutates `scores` in place.\n"
+        f"2. Without `(a, b) => b - a`, JavaScript coerces numbers to UTF-16 strings and sorts lexicographically.\n\n"
+        f"```javascript\n{fixed_js_1}\n```",
+    )
+    u2 = f"Add an optional `minScore = 0` threshold filter before sorting."
+    a2 = _wrap_scratch(
+        "filter(v => v >= minScore) creates fresh copy -> numeric sort descending -> slice",
+        f"```javascript\n{fixed_js_2}\n```",
+    )
+    return encode_dialogue_turns([(u1, a1), (u2, a2)], lang_id=5, bucket_id=2, style_id=4, allow_assistant_controls=True)
+
+
+def _stream_hf_v2_logic(max_items: int, max_doc_bytes: int) -> Iterator[EncodedDialogue]:
+    """Stream analytical logic & Socratic dialogues from OpenHermes-2.5 and COIG-CQIA when online."""
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        return
+
+    yielded = 0
+    try:
+        ds = load_dataset("teknium/OpenHermes-2.5", split="train", streaming=True)
+        for row in ds:
+            if yielded >= max_items // 2:
+                break
+            cat = str(row.get("category") or "").lower()
+            if cat and cat not in ("logic", "reasoning", "philosophy", "analytical", "math", "general"):
+                continue
+            convs = row.get("conversations") or []
+            turns: list[tuple[str, str]] = []
+            for i in range(len(convs) - 1):
+                r0 = str(convs[i].get("from", "")).lower()
+                r1 = str(convs[i + 1].get("from", "")).lower()
+                if r0 in ("human", "user") and r1 in ("gpt", "assistant"):
+                    u = sanitize_raw_text(str(convs[i].get("value", ""))).strip()
+                    a = sanitize_raw_text(str(convs[i + 1].get("value", ""))).strip()
+                    if u and a and "```rust" not in a.lower():
+                        turns.append((u, a))
+            if not turns:
+                continue
+            enc = encode_dialogue_turns(turns[:2], lang_id=0, bucket_id=0, style_id=0)
+            if 160 <= len(enc.raw_bytes) <= max_doc_bytes:
+                yield enc
+                yielded += 1
+    except Exception:
+        pass
+
+    for cfg_name in ("ruozhiba", "zhihu"):
+        if yielded >= max_items:
+            break
+        try:
+            ds_zh = load_dataset("m-a-p/COIG-CQIA", cfg_name, split="train", streaming=True)
+            for row in ds_zh:
+                if yielded >= max_items:
+                    break
+                inst = sanitize_raw_text(str(row.get("instruction", ""))).strip()
+                inp = sanitize_raw_text(str(row.get("input", ""))).strip()
+                out = sanitize_raw_text(str(row.get("output", ""))).strip()
+                u = f"{inst}\n{inp}".strip() if inp else inst
+                if not u or len(out) < 40:
+                    continue
+                enc = encode_dialogue_turns([(u, out)], lang_id=1, bucket_id=0, style_id=2 if cfg_name == "zhihu" else 0)
+                if 160 <= len(enc.raw_bytes) <= max_doc_bytes:
+                    yield enc
+                    yielded += 1
+        except Exception:
+            continue
+
+
+def _stream_hf_v2_writing(max_items: int, max_doc_bytes: int) -> Iterator[EncodedDialogue]:
+    """Stream multi-turn writing & rewriting dialogues when online."""
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        return
+
+    yielded = 0
+    for repo, subset in (
+        ("Crownelius/Creative-Writing-Multiturn_Enhanced", None),
+        ("HuggingFaceTB/smoltalk", "explore-instruct-rewriting"),
+    ):
+        if yielded >= max_items:
+            break
+        try:
+            ds = (
+                load_dataset(repo, split="train", streaming=True)
+                if subset is None
+                else load_dataset(repo, subset, split="train", streaming=True)
+            )
+            for row in ds:
+                if yielded >= max_items:
+                    break
+                msgs = row.get("messages") or row.get("conversations") or []
+                turns: list[tuple[str, str]] = []
+                for i in range(len(msgs) - 1):
+                    r0 = str(msgs[i].get("role") or msgs[i].get("from") or "").lower()
+                    r1 = str(msgs[i + 1].get("role") or msgs[i + 1].get("from") or "").lower()
+                    if r0 in ("user", "human") and r1 in ("assistant", "gpt"):
+                        u = sanitize_raw_text(str(msgs[i].get("content") or msgs[i].get("value") or "")).strip()
+                        a = sanitize_raw_text(str(msgs[i + 1].get("content") or msgs[i + 1].get("value") or "")).strip()
+                        if u and a:
+                            turns.append((u, a))
+                if not turns:
+                    continue
+                sid = 3 if "Creative-Writing" in repo else 2
+                enc = encode_dialogue_turns(turns[:2], lang_id=0, bucket_id=1, style_id=sid)
+                if 200 <= len(enc.raw_bytes) <= max_doc_bytes:
+                    yield enc
+                    yielded += 1
+        except Exception:
+            continue
+
+
+def _stream_hf_v2_code_bugfix(rng: random.Random, max_items: int, max_doc_bytes: int) -> Iterator[EncodedDialogue]:
+    """Stream compact Python/JS bugfix & commit-repair dialogues (`commitpackft` / `SWE-smith-py`) when online."""
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        return
+
+    yielded = 0
+    for lang_cfg, lid in (("python", 3), ("javascript", 5)):
+        if yielded >= max_items:
+            break
+        try:
+            ds = load_dataset("bigcode/commitpackft", lang_cfg, split="train", streaming=True)
+            for row in ds:
+                if yielded >= max_items:
+                    break
+                old_c = sanitize_raw_text(str(row.get("old_contents", ""))).strip()
+                new_c = sanitize_raw_text(str(row.get("new_contents", ""))).strip()
+                subj = sanitize_raw_text(str(row.get("subject", "") or row.get("message", ""))).strip()
+                if not old_c or not new_c or old_c == new_c or len(old_c) > 1400 or len(new_c) > 1400:
+                    continue
+                if not is_stdlib_only(new_c, lang_cfg) or not is_valid_code_ast(new_c, lang_cfg):
+                    continue
+                u = f"Fix the issue ({subj or 'bugfix'}) in the following {lang_cfg} snippet:\n```{lang_cfg}\n{old_c}\n```"
+                a = _wrap_scratch(
+                    f"fix: {subj[:120] or 'apply minimal AST-valid patch'}",
+                    f"```{lang_cfg}\n{new_c}\n```",
+                )
+                enc = encode_dialogue_turns([(u, a)], lang_id=lid, bucket_id=2, style_id=4, allow_assistant_controls=True)
+                if len(enc.raw_bytes) <= max_doc_bytes:
+                    yield enc
+                    yielded += 1
+        except Exception:
+            continue
+
+
+# =============================================================================
 # Builder Entrypoint & Zero-Padding Memmap SFT Dataset
 # =============================================================================
 
@@ -556,12 +1046,14 @@ def build_stage5_sft_corpus(
     smoke_quota: bool = False,
     offline: bool = False,
     seed: int = 202605,
-    max_doc_bytes: int = 2048,
+    max_doc_bytes: Optional[int] = None,
+    cognitive_v2: bool = False,
 ) -> dict:
-    """Build Stage 5 four-bucket SFT dataset (`sft_train.*` + `sft_val.*` + `loss_mask.bin`)."""
+    """Build Stage 5 SFT dataset (`sft_train.*` + `sft_val.*` + `loss_mask.bin`)."""
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     assert_not_drive_mmap(out_path)
+    eff_max_doc_bytes = int(max_doc_bytes) if max_doc_bytes is not None else (4096 if cognitive_v2 else 2048)
 
     if smoke_quota:
         train_bytes_target = int(1.0 * 1024 * 1024)
@@ -571,24 +1063,65 @@ def build_stage5_sft_corpus(
         val_bytes_target = int(val_mb * 1024 * 1024)
 
     total_target = train_bytes_target + val_bytes_target
-    bucket_ratios = {0: 0.35, 1: 0.25, 2: 0.25, 3: 0.15}
+    if cognitive_v2:
+        # Exact 35% Logic : 35% Multi-Draft Writing : 30% Engineering Bugfix/SDK (Zero Rust)
+        bucket_ids: tuple[int, ...] = (0, 1, 2)
+        bucket_ratios = {0: 0.35, 1: 0.35, 2: 0.30}
+    else:
+        bucket_ids = (0, 1, 2, 3)
+        bucket_ratios = {0: 0.35, 1: 0.25, 2: 0.25, 3: 0.15}
     bucket_targets = {b: int(total_target * r) for b, r in bucket_ratios.items()}
 
     rng = random.Random(seed)
     t0 = time.perf_counter()
 
-    # Optional HF streaming pools for Buckets B & C when online
-    hf_b_iter = iter(()) if offline else _stream_hf_bucket_b(rng, max_items=6000)
-    hf_c_iter = iter(()) if offline else _stream_hf_bucket_c(max_items=6000)
-    hf_b_exhausted = offline
-    hf_c_exhausted = offline
+    if cognitive_v2:
+        hf_v2_0 = iter(()) if offline else _stream_hf_v2_logic(max_items=6000, max_doc_bytes=eff_max_doc_bytes)
+        hf_v2_1 = iter(()) if offline else _stream_hf_v2_writing(max_items=6000, max_doc_bytes=eff_max_doc_bytes)
+        hf_v2_2 = iter(()) if offline else _stream_hf_v2_code_bugfix(rng, max_items=6000, max_doc_bytes=eff_max_doc_bytes)
+        v2_exhausted = {0: offline, 1: offline, 2: offline}
+        hf_b_iter = iter(())
+        hf_c_iter = iter(())
+        hf_b_exhausted = True
+        hf_c_exhausted = True
+    else:
+        v2_exhausted = {}
+        hf_v2_0 = iter(())
+        hf_v2_1 = iter(())
+        hf_v2_2 = iter(())
+        hf_b_iter = iter(()) if offline else _stream_hf_bucket_b(rng, max_items=6000)
+        hf_c_iter = iter(()) if offline else _stream_hf_bucket_c(max_items=6000)
+        hf_b_exhausted = offline
+        hf_c_exhausted = offline
 
     seen_hashes: set[bytes] = set()
-    bucket_docs: dict[int, list[EncodedDialogue]] = {0: [], 1: [], 2: [], 3: []}
-    bucket_bytes: dict[int, int] = {0: 0, 1: 0, 2: 0, 3: 0}
+    bucket_docs: dict[int, list[EncodedDialogue]] = {b: [] for b in bucket_ids}
+    bucket_bytes: dict[int, int] = {b: 0 for b in bucket_ids}
 
     def _next_for_bucket(b_id: int) -> EncodedDialogue:
         nonlocal hf_b_exhausted, hf_c_exhausted
+        if cognitive_v2:
+            if b_id == 0:
+                if not v2_exhausted[0] and rng.random() < 0.45:
+                    try:
+                        return next(hf_v2_0)
+                    except StopIteration:
+                        v2_exhausted[0] = True
+                return _sample_v2_logic_socratic_dialogue(rng)
+            if b_id == 1:
+                if not v2_exhausted[1] and rng.random() < 0.40:
+                    try:
+                        return next(hf_v2_1)
+                    except StopIteration:
+                        v2_exhausted[1] = True
+                return _sample_v2_writing_polish_dialogue(rng)
+            if not v2_exhausted[2] and rng.random() < 0.45:
+                try:
+                    return next(hf_v2_2)
+                except StopIteration:
+                    v2_exhausted[2] = True
+            return _sample_v2_code_bugfix_dialogue(rng)
+
         if b_id == 0:
             return _sample_bucket_a_dialogue(rng)
         if b_id == 1:
@@ -607,24 +1140,24 @@ def build_stage5_sft_corpus(
             return _sample_offline_bucket_c(rng)
         return _sample_bucket_d_dialogue(rng)
 
-    for b_id in (0, 1, 2, 3):
+    for b_id in bucket_ids:
         target_b = bucket_targets[b_id]
         stalls = 0
         while bucket_bytes[b_id] < target_b:
             dlg = _next_for_bucket(b_id)
-            if len(dlg.raw_bytes) > max_doc_bytes:
+            if len(dlg.raw_bytes) > eff_max_doc_bytes:
                 continue
             h = hashlib.blake2b(dlg.raw_bytes, digest_size=16).digest()
             if h in seen_hashes:
                 stalls += 1
-                if stalls > 2000:
+                if stalls > 200:
                     # Allow parameterized synthetic suffix variation if small template pool saturates
-                    nonce = f" [ref #{rng.randint(1000, 99999)}]"
+                    nonce = f" [case #{rng.randint(1000, 999999)}]"
                     u_end = dlg.raw_bytes.find(b"\n\x1fA\n")
                     if u_end > 3:
                         raw_mod = dlg.raw_bytes[:u_end] + nonce.encode("utf-8") + dlg.raw_bytes[u_end:]
                         mask_mod = dlg.loss_mask_bytes[:u_end] + (b"\x00" * len(nonce)) + dlg.loss_mask_bytes[u_end:]
-                        if len(raw_mod) <= max_doc_bytes and verify_mask_alignment(raw_mod, mask_mod):
+                        if len(raw_mod) <= eff_max_doc_bytes and verify_mask_alignment(raw_mod, mask_mod):
                             dlg = EncodedDialogue(
                                 raw_bytes=raw_mod,
                                 loss_mask_bytes=mask_mod,
@@ -632,6 +1165,7 @@ def build_stage5_sft_corpus(
                                 bucket_id=dlg.bucket_id,
                                 num_turns=dlg.num_turns,
                                 eot_positions=tuple(p + len(nonce) for p in dlg.eot_positions),
+                                style_id=dlg.style_id,
                             )
                             h = hashlib.blake2b(dlg.raw_bytes, digest_size=16).digest()
                 if h in seen_hashes:
@@ -645,7 +1179,7 @@ def build_stage5_sft_corpus(
     train_docs: list[EncodedDialogue] = []
     val_docs: list[EncodedDialogue] = []
     val_frac = val_bytes_target / max(float(total_target), 1.0)
-    for b_id in (0, 1, 2, 3):
+    for b_id in bucket_ids:
         docs = bucket_docs[b_id]
         rng.shuffle(docs)
         n_val = max(4, int(round(len(docs) * val_frac)))
@@ -662,8 +1196,9 @@ def build_stage5_sft_corpus(
         meta_p = out_path / f"sft_{split_name}.meta.json"
 
         offset = 0
-        lang_bytes = {i: 0 for i in range(5)}
-        bkt_bytes = {i: 0 for i in range(4)}
+        lang_bytes = {i: 0 for i in range(6)}
+        bkt_bytes = {b: 0 for b in bucket_ids}
+        style_bytes = {i: 0 for i in range(5)}
         sup_bytes = 0
 
         with bin_p.open("wb") as fb, idx_p.open("wb") as fi, msk_p.open("wb") as fm:
@@ -685,6 +1220,7 @@ def build_stage5_sft_corpus(
                 offset += n
                 lang_bytes[d.lang_id] = lang_bytes.get(d.lang_id, 0) + n
                 bkt_bytes[d.bucket_id] = bkt_bytes.get(d.bucket_id, 0) + n
+                style_bytes[int(d.style_id)] = style_bytes.get(int(d.style_id), 0) + n
                 sup_bytes += d.loss_mask_bytes.count(1)
 
         meta = {
@@ -695,6 +1231,7 @@ def build_stage5_sft_corpus(
             "supervised_ratio": round(sup_bytes / max(offset, 1), 4),
             "bytes_by_lang": lang_bytes,
             "bytes_by_bucket": bkt_bytes,
+            "bytes_by_style": style_bytes,
         }
         meta_p.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return meta
@@ -703,7 +1240,9 @@ def build_stage5_sft_corpus(
     val_meta = _write_split("val", val_docs)
 
     summary = {
-        "schema_version": 1,
+        "schema_version": 2 if cognitive_v2 else 1,
+        "cognitive_v2": bool(cognitive_v2),
+        "max_doc_bytes": eff_max_doc_bytes,
         "smoke_quota": smoke_quota,
         "offline": offline,
         "elapsed_sec": round(time.perf_counter() - t0, 2),
@@ -762,7 +1301,7 @@ class SFTByteDataset(Dataset):
         self._tier_cum_probs: list[float] = []
         valid_mask = self._lengths <= self.max_doc_bytes
         if self.length_bucketing and self.max_doc_bytes > 512 and int(np.count_nonzero(valid_mask)) > 0:
-            edges = [0, 512, 1024, 2048, 1 << 60]
+            edges = [0, 512, 1024, 2048, 4096, 1 << 60]
             byte_masses_t: list[float] = []
             for lo, hi in zip(edges[:-1], edges[1:]):
                 if lo >= self.max_doc_bytes:
@@ -869,12 +1408,18 @@ class SFTByteDataset(Dataset):
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build Stage 5 4-Bucket Pragmatic SFT Dataset")
+    ap = argparse.ArgumentParser(description="Build Stage 5 Pragmatic / Holistic Cognitive SFT Dataset")
     ap.add_argument("--out-dir", type=str, default="artifacts/sft_data")
     ap.add_argument("--train-mb", type=float, default=20.0)
     ap.add_argument("--val-mb", type=float, default=1.0)
     ap.add_argument("--smoke-quota", action="store_true", help="Build 1MB train + 128KB val locally")
     ap.add_argument("--offline", action="store_true", help="Zero-network offline synthesis mode")
+    ap.add_argument(
+        "--cognitive-v2",
+        action="store_true",
+        help="Build DCPA v2 35:35:30 holistic cognitive SFT (Socratic logic + multi-draft polish + Py/SQL/JS bugfix, zero Rust)",
+    )
+    ap.add_argument("--max-doc-bytes", type=int, default=None)
     ap.add_argument("--seed", type=int, default=202605)
     args = ap.parse_args()
 
@@ -885,6 +1430,8 @@ def main() -> None:
         smoke_quota=args.smoke_quota,
         offline=args.offline,
         seed=args.seed,
+        max_doc_bytes=args.max_doc_bytes,
+        cognitive_v2=args.cognitive_v2,
     )
     print(json.dumps(res, indent=2, ensure_ascii=False))
 

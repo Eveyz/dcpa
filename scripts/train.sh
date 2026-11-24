@@ -36,7 +36,7 @@ BACKUP_DIR=""
 FROM_ARCHIVE=""
 PACK_ARCHIVE=""
 TOTAL_STEPS=""
-SFT_STEPS="8000"
+SFT_STEPS=""
 SKIP_DATA=0
 SKIP_SFT=0
 RESUME_MODE="auto"
@@ -57,6 +57,7 @@ ORIG_ARGS=("$@")
 for arg in "$@"; do
   case "${arg}" in
     --config=*) CONFIG_PATH="${arg#*=}" ;;
+    --v2-cognitive|--cognitive-v2) CONFIG_PATH="configs/dcpa_210m_v2_cognitive.yaml" ;;
     --preset=*) PRESET="${arg#*=}" ;;
     --data-profile=*) DATA_PROFILE="${arg#*=}" ;;
     --gpus=*) GPUS="${arg#*=}" ;;
@@ -127,9 +128,16 @@ else
   EFF_GPUS="${GPUS}"
 fi
 
-# Smart defaults when --preset / --data-profile are omitted
+# Smart defaults when --preset / --data-profile / --sft-steps are omitted
+IS_V2_COGNITIVE=0
+if [[ "${CONFIG_PATH}" == *"dcpa_210m_v2_cognitive"* ]]; then
+  IS_V2_COGNITIVE=1
+fi
+
 if [[ -z "${PRESET}" ]]; then
-  if [[ "${EFF_GPUS}" -ge 2 ]]; then
+  if [[ "${IS_V2_COGNITIVE}" -eq 1 ]]; then
+    PRESET="moe_210m"
+  elif [[ "${EFF_GPUS}" -ge 2 ]]; then
     PRESET="moe_2_6b"
   elif [[ "${DETECTED_GPUS}" -ge 1 ]]; then
     PRESET="moe_650m"
@@ -139,12 +147,26 @@ if [[ -z "${PRESET}" ]]; then
 fi
 
 if [[ -z "${DATA_PROFILE}" ]]; then
-  if [[ "${EFF_GPUS}" -ge 2 ]]; then
+  if [[ "${IS_V2_COGNITIVE}" -eq 1 ]]; then
+    if [[ "${DETECTED_GPUS}" -ge 1 ]]; then
+      DATA_PROFILE="v2_cognitive_5g"
+    else
+      DATA_PROFILE="v2_cognitive_smoke"
+    fi
+  elif [[ "${EFF_GPUS}" -ge 2 ]]; then
     DATA_PROFILE="v2_stem_10g"
   elif [[ "${DETECTED_GPUS}" -ge 1 ]]; then
     DATA_PROFILE="v1_fast"
   else
     DATA_PROFILE="smoke"
+  fi
+fi
+
+if [[ -z "${SFT_STEPS}" ]]; then
+  if [[ "${IS_V2_COGNITIVE}" -eq 1 ]]; then
+    SFT_STEPS="15000"
+  else
+    SFT_STEPS="8000"
   fi
 fi
 

@@ -95,6 +95,10 @@ class CurriculumStepState:
     use_broca_cq: bool
     active_owners: tuple[str, ...]
     frozen_owners: tuple[str, ...]
+    max_stage_tier: int = 0            # 0 = unrestricted; 1..3 = cap .idx stage difficulty tier
+    anchor_doc_start: bool = False     # True in Stage 1 to prevent mid-sentence / mid-function slicing
+    cap_mix_prob: float = -1.0         # < 0 uses legacy stream fallback; >= 0 sets exact capability shard prob
+    wug_mode: str = "classic"          # "classic" | "cognitive_v2" (World-Bible / Axioms / Multi-API SDK)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -399,11 +403,18 @@ class CurriculumController:
         self.s3_cfg = dict(cfg.get("stage3", {}))
         self.s4_cfg = dict(cfg.get("stage4", {}))
 
-        # Nominal stage lengths from the 100k specification
-        self._nom_s1 = 15000
-        self._nom_s2 = 50000
-        self._nom_s3 = 20000
-        self._nom_s4 = 15000
+        # Nominal stage lengths derived from the YAML's own stage_boundaries (falling back to 100k defaults)
+        cfg_nom_bounds = list(cfg.get("stage_boundaries", self.NOMINAL_BOUNDARIES))
+        if len(cfg_nom_bounds) == 5 and all(cfg_nom_bounds[i] < cfg_nom_bounds[i + 1] for i in range(4)):
+            self._nom_s1 = int(cfg_nom_bounds[1]) - int(cfg_nom_bounds[0])
+            self._nom_s2 = int(cfg_nom_bounds[2]) - int(cfg_nom_bounds[1])
+            self._nom_s3 = int(cfg_nom_bounds[3]) - int(cfg_nom_bounds[2])
+            self._nom_s4 = int(cfg_nom_bounds[4]) - int(cfg_nom_bounds[3])
+        else:
+            self._nom_s1 = 15000
+            self._nom_s2 = 50000
+            self._nom_s3 = 20000
+            self._nom_s4 = 15000
 
         # Active step tracking for serialization
         self._last_step: int = 0
@@ -486,6 +497,10 @@ class CurriculumController:
                 use_broca_cq=False,
                 active_owners=active_owners,
                 frozen_owners=frozen_owners,
+                max_stage_tier=int(self.s1_cfg.get("max_stage_tier", 0)),
+                anchor_doc_start=bool(self.s1_cfg.get("anchor_doc_start", False)),
+                cap_mix_prob=float(self.s1_cfg.get("cap_mix_ratio", 0.0)),
+                wug_mode=str(self.s1_cfg.get("wug_mode", "classic")),
             )
         elif stage_id == 2:
             # Local linear warmup 0.01 -> 1.0 for newly unfrozen BCG-PC params over first 1,000 steps
@@ -542,6 +557,11 @@ class CurriculumController:
                     1.0, float(step_in_stage - act_delay + 1) / float(max(act_ramp, 1))
                 )
 
+            s2_cap_prob = -1.0
+            if "cap_mix_ratio" in self.s2_cfg:
+                cap_warm_prog = float(self.s2_cfg.get("cap_warmup_start_progress", 0.50))
+                s2_cap_prob = float(self.s2_cfg["cap_mix_ratio"]) if progress >= cap_warm_prog else 0.0
+
             target_rho = float(self.s2_cfg.get("target_rho", 9.5))
             state = CurriculumStepState(
                 step=s,
@@ -573,6 +593,10 @@ class CurriculumController:
                 use_broca_cq=False,
                 active_owners=active_owners,
                 frozen_owners=frozen_owners,
+                max_stage_tier=int(self.s2_cfg.get("max_stage_tier", 0)),
+                anchor_doc_start=bool(self.s2_cfg.get("anchor_doc_start", False)),
+                cap_mix_prob=s2_cap_prob,
+                wug_mode=str(self.s2_cfg.get("wug_mode", "classic")),
             )
         elif stage_id == 3:
             end_ratio = float(self.s3_cfg.get("lr_cosine_end_ratio", 0.25))
@@ -586,6 +610,7 @@ class CurriculumController:
             else:
                 cq_period = max(2, int(round(1.0 / broca_prob)))
                 use_cq = (s % cq_period) == (cq_period - 1)
+            s3_cap_prob = float(self.s3_cfg["cap_mix_ratio"]) if "cap_mix_ratio" in self.s3_cfg else -1.0
             state = CurriculumStepState(
                 step=s,
                 stage_id=3,
@@ -616,6 +641,10 @@ class CurriculumController:
                 use_broca_cq=use_cq,
                 active_owners=active_owners,
                 frozen_owners=frozen_owners,
+                max_stage_tier=int(self.s3_cfg.get("max_stage_tier", 0)),
+                anchor_doc_start=bool(self.s3_cfg.get("anchor_doc_start", False)),
+                cap_mix_prob=s3_cap_prob,
+                wug_mode=str(self.s3_cfg.get("wug_mode", "classic")),
             )
         else:
             # Stage 4 (85k..100k): freeze 95%+ slow weights, unfreeze Hippocampus gates + adapter
@@ -664,6 +693,10 @@ class CurriculumController:
                 use_broca_cq=False,
                 active_owners=active_owners,
                 frozen_owners=frozen_owners,
+                max_stage_tier=int(self.s4_cfg.get("max_stage_tier", 0)),
+                anchor_doc_start=bool(self.s4_cfg.get("anchor_doc_start", False)),
+                cap_mix_prob=0.0,
+                wug_mode=str(self.s4_cfg.get("wug_mode", "classic")),
             )
 
         self._last_step = s

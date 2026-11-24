@@ -528,7 +528,7 @@ def lif_membrane_scan(
             torch.full((B, T), lif_lambda, device=device, dtype=torch.float32),
         )
         v_tilde = parallel_diag_scan(
-            decay_a.unsqueeze(-1), drive.unsqueeze(-1), max_span=max_seg_len
+            decay_a.unsqueeze(-1), drive.unsqueeze(-1), max_span=max_seg_len + 4
         ).squeeze(-1)
     return v_tilde, spikes
 

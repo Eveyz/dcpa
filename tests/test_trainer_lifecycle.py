@@ -38,7 +38,7 @@ from utils.device import capture_rng_state, get_device, restore_rng_state
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SMOKE_DATA_DIR = REPO_ROOT / "artifacts" / "data"
-PROD_CONFIG_YAML = REPO_ROOT / "configs" / "dcpa_48m_train.yaml"
+PROD_CONFIG_YAML = REPO_ROOT / "configs" / "v1" / "dcpa_48m_train.yaml"
 
 
 class _FakeClock:

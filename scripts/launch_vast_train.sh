@@ -26,7 +26,7 @@ if [[ -f "${REPO_ROOT}/.vast_env.sh" ]]; then
   source "${REPO_ROOT}/.vast_env.sh"
 fi
 
-CONFIG_PATH="configs/dcpa_v2_4xa100.yaml"
+CONFIG_PATH="configs/v1/dcpa_v2_4xa100.yaml"
 PRESET="moe_2_6b"
 DATA_PROFILE="v2_stem_10g"
 NVME_DIR="${DCPA_NVME_ROOT:-}"

@@ -23,6 +23,7 @@ pub struct ByteIngestTrace {
     pub mean_info: f32,
     pub sem_norm: f32,
     pub pin_triggered: bool,
+    pub unpin_triggered: bool,
 }
 
 /// Scalar telemetry emitted by a single concept graph + hippocampus step.
@@ -225,6 +226,13 @@ impl DcpaEngine {
                 self.sgsc.pending_asst_ticks = 1;
             }
         }
+        // Turn boundary `0x04` (EOT) or `0x1E` (user RS) schedules unpinning and cancels any earlier pin in this segment.
+        if byte == 0x04 || byte == 0x1E {
+            self.sgsc.seg_unpin_hit = true;
+            self.sgsc.seg_pin_hit = false;
+            self.sgsc.pending_asst_pin = false;
+            self.sgsc.pending_asst_ticks = 0;
+        }
 
         // 3. Strictly causal UTF-8 codepoint completion tracker
         if byte < 0x80 {
@@ -259,6 +267,7 @@ impl DcpaEngine {
                 mean_info: 0.0,
                 sem_norm: 0.0,
                 pin_triggered: false,
+                unpin_triggered: false,
             };
         }
 
@@ -338,10 +347,12 @@ impl DcpaEngine {
 
         // Reset LIF accumulator & segment counters
         let pin_triggered = self.sgsc.seg_pin_hit;
+        let unpin_triggered = self.sgsc.seg_unpin_hit;
         self.sgsc.v = 0.0;
         self.sgsc.seg_len = 0;
         self.sgsc.seg_info_sum = 0.0;
         self.sgsc.seg_pin_hit = false;
+        self.sgsc.seg_unpin_hit = false;
 
         ByteIngestTrace {
             info,
@@ -350,6 +361,7 @@ impl DcpaEngine {
             mean_info,
             sem_norm,
             pin_triggered,
+            unpin_triggered,
         }
     }
 
@@ -403,6 +415,22 @@ impl DcpaEngine {
     /// Strictly ZERO heap allocations!
     pub fn step_concept_from_scratch(&mut self, mean_info: f32, sem_norm: f32) -> ConceptStepTrace {
         self.step_concept_from_scratch_with_opts(mean_info, sem_norm, false, None)
+    }
+
+    /// Full Spec 2 + Spec 5 concept transition handling both turn-boundary unpin and Slot-0 re-pin.
+    /// Strictly ZERO heap allocations!
+    pub fn step_concept_from_scratch_with_turn_opts(
+        &mut self,
+        mean_info: f32,
+        sem_norm: f32,
+        pin_trigger: bool,
+        unpin_trigger: bool,
+        ach_override: Option<f32>,
+    ) -> ConceptStepTrace {
+        if unpin_trigger {
+            self.graph.slot0_pinned = false;
+        }
+        self.step_concept_from_scratch_with_opts(mean_info, sem_norm, pin_trigger, ach_override)
     }
 
     /// Full Spec 2 + Spec 5 concept transition with optional `Slot-0 Thesis Pinning` trigger and `ach_override`
@@ -1654,5 +1682,114 @@ impl DcpaEngine {
         }
 
         (last_len, done, last_err)
+    }
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+    use crate::config::DcpaConfig;
+    use crate::state::FastWeightPrecision;
+
+    #[test]
+    fn test_multiturn_slot0_unpin_and_repin() {
+        let cfg = DcpaConfig {
+            vocab_size: 256,
+            d_s: 64,
+            d_concept: 64,
+            k_slots: 8,
+            d_r: 16,
+            d_merge: 32,
+            d_h: 128,
+            s_active: 8,
+            dg_seed_lex: 17,
+            dg_seed_sem: 29,
+            gamma_hip: 0.995,
+            lambda_eta: 0.85,
+            kappa_quench: 0.9,
+            c0_ema_momentum: 0.99,
+            householder_max_writes: 128,
+            householder_write_threshold: 0.05,
+            num_experts: 4,
+            top_k_experts: 2,
+            expert_hidden: 64,
+            l_max: 4,
+            tau_skip: 0.32,
+            tau_halt: 0.22,
+            ponder_eta: 0.5,
+            lambda_moe_bal: 0.01,
+            lif_lambda: 0.85,
+            lif_beta1: 1.0,
+            lif_beta2: 0.5,
+            lif_theta_init: 1.5,
+            lif_theta_min: 0.5,
+            max_seg_len: 16,
+            target_spike_rate: 0.105,
+            lambda_rate: 1.0,
+            delta_decay: 0.05,
+            d_l: 64,
+            num_lang_domains: 6,
+            num_style_domains: 5,
+            stack_depth: 16,
+            stack_tag_dim: 4,
+            tau_e: 0.5,
+            tau_q: 0.5,
+            lambda_inh: 2.0,
+            tau_done: 0.1,
+            tau_repair: 0.45,
+            max_repair_retries: 2,
+            rope_period: 20.0,
+            rope_num_harmonics: 8,
+            lambda_var: 1.0,
+            lambda_act: 0.01,
+            lambda_halt: 0.01,
+            eps: 1e-6,
+        };
+        let w = DcpaWeights::dummy_for_test(cfg);
+        let mut engine = DcpaEngine::new(w, FastWeightPrecision::F32);
+        let d = engine.weights.cfg.d_concept;
+
+        // Turn 1: pin Slot-0 with evidence A, then emit EOT + Turn 2 user header
+        let turn1 = b"\x1dE\nAlpha cobalt quantum fact.\n";
+        for (i, &b) in turn1.iter().enumerate() {
+            let tr = engine.sgsc_ingest_byte(b, i + 1 == turn1.len());
+            if tr.spiked {
+                let _ = engine.step_concept_from_scratch_with_turn_opts(
+                    tr.mean_info,
+                    tr.sem_norm,
+                    tr.pin_triggered,
+                    tr.unpin_triggered,
+                    None,
+                );
+            }
+        }
+        assert!(engine.graph.slot0_pinned, "Turn 1 should pin Slot 0");
+        let slot0_t1 = engine.graph.slots[0..d].to_vec();
+
+        // Turn boundary + Turn 2: must unpin stale Slot-0 and re-pin Turn 2 evidence B
+        let turn2 = b"\x04\x1eU\nNext question\n\x1dE\nBravo amber photon fact.\n";
+        for (i, &b) in turn2.iter().enumerate() {
+            let tr = engine.sgsc_ingest_byte(b, i + 1 == turn2.len());
+            if tr.spiked {
+                let _ = engine.step_concept_from_scratch_with_turn_opts(
+                    tr.mean_info,
+                    tr.sem_norm,
+                    tr.pin_triggered,
+                    tr.unpin_triggered,
+                    None,
+                );
+            }
+        }
+        assert!(engine.graph.slot0_pinned, "Turn 2 should re-pin Slot 0");
+        let max_diff = engine.graph.slots[0..d]
+            .iter()
+            .zip(slot0_t1.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-3,
+            "Slot 0 remained locked across turn boundary (max_diff={})",
+            max_diff
+        );
     }
 }

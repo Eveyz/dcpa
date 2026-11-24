@@ -1,7 +1,7 @@
 """Production cross-platform 100,000-step DCPA developmental training orchestrator.
 
 Integrates Deliverables 1-5 and Global Override Iron Laws #1-#5:
-  - YAML hyperparameter & curriculum contract (`configs/dcpa_48m_train.yaml`).
+  - YAML hyperparameter & curriculum contract (`configs/v1/dcpa_48m_train.yaml` or `configs/v2/*.yaml`).
   - Four-stage developmental state machine (`train/curriculum_state_machine.py`) with hard
     `requires_grad_(False)` + `grad = None` freezing (NEVER grad-zeroing) and fixed Step-0
     three-way differentiated AdamW parameter groups.
@@ -103,7 +103,7 @@ from utils.distributed import (
 )
 
 
-DEFAULT_CONFIG_PATH = _REPO_ROOT / "configs" / "dcpa_48m_train.yaml"
+DEFAULT_CONFIG_PATH = _REPO_ROOT / "configs" / "v1" / "dcpa_48m_train.yaml"
 
 
 @dataclass

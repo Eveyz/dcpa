@@ -350,7 +350,7 @@ def _gen_procedural_toolcall(
         t_spec = STANDARD_TOOLS[3]  # read_file_span
         fn = make_oov_tool_alias(rng, t_spec.name, used_aliases) if use_oov else t_spec.name
         lines = _build_header_with_distractors(rng, [(t_spec, fn)])
-        fname = rng.choice(["configs/dcpa_48m_train.yaml", "README.md", "utils/device.py"])
+        fname = rng.choice(["configs/v1/dcpa_48m_train.yaml", "README.md", "utils/device.py"])
         s_line, e_line = rng.randint(1, 15), rng.randint(20, 35)
         bad_call = _format_kw_call(fn, {"path": fname, "start": e_line, "end": s_line})
         ok_call = _format_kw_call(fn, {"path": fname, "start": s_line, "end": e_line})

@@ -26,7 +26,7 @@ if [[ -f "${REPO_ROOT}/.vast_env.sh" ]]; then
   source "${REPO_ROOT}/.vast_env.sh"
 fi
 
-CONFIG_PATH="configs/dcpa_unified.yaml"
+CONFIG_PATH="configs/v1/dcpa_unified.yaml"
 PRESET=""
 DATA_PROFILE=""
 GPUS="auto"
@@ -57,7 +57,8 @@ ORIG_ARGS=("$@")
 for arg in "$@"; do
   case "${arg}" in
     --config=*) CONFIG_PATH="${arg#*=}" ;;
-    --v2-cognitive|--cognitive-v2) CONFIG_PATH="configs/dcpa_210m_v2_cognitive.yaml" ;;
+    --v2-cognitive|--cognitive-v2) CONFIG_PATH="configs/v2/dcpa_210m_v2_cognitive.yaml" ;;
+    --v2-cognitive-48m|--cognitive-v2-48m) CONFIG_PATH="configs/v2/dcpa_48m_v2_cognitive.yaml" ;;
     --preset=*) PRESET="${arg#*=}" ;;
     --data-profile=*) DATA_PROFILE="${arg#*=}" ;;
     --gpus=*) GPUS="${arg#*=}" ;;
@@ -130,12 +131,18 @@ fi
 
 # Smart defaults when --preset / --data-profile / --sft-steps are omitted
 IS_V2_COGNITIVE=0
-if [[ "${CONFIG_PATH}" == *"dcpa_210m_v2_cognitive"* ]]; then
+IS_V2_COGNITIVE_48M=0
+if [[ "${CONFIG_PATH}" == *"dcpa_48m_v2_cognitive"* ]]; then
+  IS_V2_COGNITIVE=1
+  IS_V2_COGNITIVE_48M=1
+elif [[ "${CONFIG_PATH}" == *"dcpa_210m_v2_cognitive"* ]]; then
   IS_V2_COGNITIVE=1
 fi
 
 if [[ -z "${PRESET}" ]]; then
-  if [[ "${IS_V2_COGNITIVE}" -eq 1 ]]; then
+  if [[ "${IS_V2_COGNITIVE_48M}" -eq 1 ]]; then
+    PRESET="proto_48m"
+  elif [[ "${IS_V2_COGNITIVE}" -eq 1 ]]; then
     PRESET="moe_210m"
   elif [[ "${EFF_GPUS}" -ge 2 ]]; then
     PRESET="moe_2_6b"
@@ -147,7 +154,13 @@ if [[ -z "${PRESET}" ]]; then
 fi
 
 if [[ -z "${DATA_PROFILE}" ]]; then
-  if [[ "${IS_V2_COGNITIVE}" -eq 1 ]]; then
+  if [[ "${IS_V2_COGNITIVE_48M}" -eq 1 ]]; then
+    if [[ "${DETECTED_GPUS}" -ge 1 ]]; then
+      DATA_PROFILE="v2_cognitive_3g"
+    else
+      DATA_PROFILE="v2_cognitive_smoke"
+    fi
+  elif [[ "${IS_V2_COGNITIVE}" -eq 1 ]]; then
     if [[ "${DETECTED_GPUS}" -ge 1 ]]; then
       DATA_PROFILE="v2_cognitive_5g"
     else
@@ -163,7 +176,9 @@ if [[ -z "${DATA_PROFILE}" ]]; then
 fi
 
 if [[ -z "${SFT_STEPS}" ]]; then
-  if [[ "${IS_V2_COGNITIVE}" -eq 1 ]]; then
+  if [[ "${IS_V2_COGNITIVE_48M}" -eq 1 ]]; then
+    SFT_STEPS="10000"
+  elif [[ "${IS_V2_COGNITIVE}" -eq 1 ]]; then
     SFT_STEPS="15000"
   else
     SFT_STEPS="8000"
@@ -235,6 +250,7 @@ SFT_CMD=(
   "${GPU_FLAGS[@]}"
   "--weights" "${EXPORT_DIR}/dcpa_final.safetensors"
   "--config" "${EXPORT_DIR}/config.json"
+  "--train-config" "${CONFIG_PATH}"
   "--data-dir" "${SFT_DIR}"
   "--cap-data-dir" "${CAP_DIR}"
   "--export-dir" "${EXPORT_DIR}"

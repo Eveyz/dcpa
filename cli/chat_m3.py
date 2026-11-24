@@ -54,7 +54,13 @@ for _p in (str(_REPO_ROOT), str(_TRAIN_PY)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from dcpa.model import DCPACarryState, DCPAModel, _compute_pin_trigger_byte_mask
+from dcpa.model import (
+    DCPACarryState,
+    DCPAModel,
+    _compute_pin_trigger_byte_mask,
+    _compute_unpin_trigger_byte_mask,
+)
+from dcpa.modules.bcg_pc import ConceptGraphState
 from dcpa.modules.hippocampus import ColumnMajorFastWeights, EligibilityState
 from dcpa.ops.ragged import ragged_local_offsets, ragged_segment_sum
 from train.train_dcpa import export_final_safetensors
@@ -420,7 +426,12 @@ class DCPAChatSession:
             batch_size=1, device=self.device, dtype=torch.float32
         )
         # Fixed O(1) episodic prototype ring buffer (max 64 entries) feeding `/sleep` SWR replay
-        self._swr_ring: deque[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = deque(maxlen=64)
+        self._swr_ring: deque[tuple[torch.Tensor, ...]] = deque(maxlen=64)
+        self._slot_h_end: torch.Tensor = torch.zeros(
+            (self.model.cfg.k_slots, self.model.cfg.d_s),
+            device=self.device,
+            dtype=torch.float32,
+        )
 
         # Safe stdlib tool registry + Hippocampus startup pre-registration (`M_tools_base`)
         self.tool_registry, self.tool_signatures = build_builtin_tools(workspace_root=workspace_root)
@@ -433,6 +444,7 @@ class DCPAChatSession:
         sig_block = ("\n".join(sanitize_raw_text(s).strip() for s in signatures) + "\n").encode("utf-8")
         self.ingest_bytes(sig_block, lang_id=0, style_id=4)
         self.m_tools_base = self.carry.fast_state.clone_snapshot()
+        self._slot_h_end.zero_()
         # Clear transient 8-slot working memory after seeding tools so Turn 1 starts fresh
         fresh = self.model.init_carry_state(batch_size=1, device=self.device, dtype=torch.float32)
         self.carry = DCPACarryState(
@@ -466,6 +478,7 @@ class DCPAChatSession:
         """`/reset`: clear 8-slot WM and restore Hippocampus to `M_tools_base` (built-in tools stay active!)."""
         fresh = self.model.init_carry_state(batch_size=1, device=self.device, dtype=torch.float32)
         self.carry.fast_state.restore_from(self.m_tools_base)
+        self._slot_h_end.zero_()
         self.carry = DCPACarryState(
             sgsc_h=fresh.sgsc_h,
             graph_state=fresh.graph_state,
@@ -481,6 +494,7 @@ class DCPAChatSession:
         """`/wipe`: clear both 8-slot working memory AND Hippocampus fast weights back to factory zero."""
         self.carry = self.model.init_carry_state(batch_size=1, device=self.device, dtype=torch.float32)
         self._swr_ring.clear()
+        self._slot_h_end.zero_()
 
     def resolve_lang_id(self, text: str) -> int:
         if self.lang_mode != "auto" and self.lang_mode in LANG_NAME_TO_ID:
@@ -515,14 +529,21 @@ class DCPAChatSession:
         cu = sgsc_out.cu_seqlens.detach().cpu().tolist()
         seg_preview, _ = format_sgsc_segmentation(raw_bytes, cu)
 
-        # Compute per-segment Slot-0 Thesis Pinning trigger (`\x1dE\n` or first `\x1fA\n`)
+        # Compute per-segment Slot-0 Thesis Pinning & Turn-Boundary Unpinning triggers (`\x1dE\n` / `\x1fA\n`, `0x04` / `0x1E`)
         if m_total > 0 and x_t.shape[1] > 0:
             pin_bm = _compute_pin_trigger_byte_mask(x_t, None)
-            seg_id_flat, _, _, _ = ragged_local_offsets(sgsc_out.cu_seqlens, x_t.shape[1])
-            seg_pin_trig = (
-                ragged_segment_sum(pin_bm.float().reshape(-1, 1), seg_id_flat, m_total).squeeze(-1) > 0.5
-            ).float()
+            unpin_bm = _compute_unpin_trigger_byte_mask(x_t)
+            seg_id_flat, local_pos, _, _ = ragged_local_offsets(sgsc_out.cu_seqlens, x_t.shape[1])
+            pos_pow = torch.pow(
+                torch.tensor(2.0, device=self.device, dtype=torch.float32),
+                local_pos.clamp_max(22).float(),
+            ).unsqueeze(-1)
+            pin_w = ragged_segment_sum(pin_bm.float().reshape(-1, 1) * pos_pow, seg_id_flat, m_total).squeeze(-1)
+            unpin_w = ragged_segment_sum(unpin_bm.float().reshape(-1, 1) * pos_pow, seg_id_flat, m_total).squeeze(-1)
+            seg_unpin_trig = (unpin_w > 0.5).float()
+            seg_pin_trig = (pin_w > unpin_w).float()
         else:
+            seg_unpin_trig = torch.zeros((m_total,), device=self.device, dtype=torch.float32)
             seg_pin_trig = torch.zeros((m_total,), device=self.device, dtype=torch.float32)
 
         g_state = self.carry.graph_state
@@ -541,6 +562,13 @@ class DCPAChatSession:
             sn_m = sgsc_out.sem_norm[m : m + 1]
             mi_m = sgsc_out.mean_info[m : m + 1]
             trig_m = seg_pin_trig[m : m + 1]
+            if float(seg_unpin_trig[m].item()) > 0.5 and g_state.slot0_pinned is not None:
+                g_state = ConceptGraphState(
+                    slots=g_state.slots,
+                    edges=g_state.edges,
+                    salience=g_state.salience,
+                    slot0_pinned=torch.zeros_like(g_state.slot0_pinned),
+                )
 
             hip_r = self.model.hippocampus.read_comprehension(
                 f_stem=f_m,
@@ -571,6 +599,21 @@ class DCPAChatSession:
             if ach_val > max_ach:
                 max_ach = ach_val
 
+            prev_eta = e_state.eta[0].detach().float().clone()
+            wi = int(bcg_o.win_i[0].item())
+            wj = int(bcg_o.win_j[0].item())
+            k_slots = self.model.cfg.k_slots
+            end_byte_idx = int(cu[m + 1]) - 1
+            h_end_m = sgsc_out.h_seq[0, end_byte_idx, :].detach().float().clone()
+            eta_i = float(prev_eta[wi].item()) if wi < k_slots else ach_val
+            eta_j = float(prev_eta[wj].item()) if wj < k_slots else ach_val
+            p_star = wi if eta_i >= eta_j else wj
+            u_slot = min(wi, wj)
+            v_slot = max(wi, wj)
+            self._slot_h_end[u_slot] = h_end_m if p_star == k_slots else self._slot_h_end[p_star].clone()
+            if v_slot < k_slots:
+                self._slot_h_end[v_slot] = h_end_m
+
             e_state = self.model.hippocampus.inherit_eligibility_on_merge(
                 elig=e_state,
                 cand_idx=hip_r.psi_idx,
@@ -598,6 +641,7 @@ class DCPAChatSession:
                         e_state.e_idx[0, win_slot].detach().clone(),
                         e_state.f_tilde[0, win_slot].detach().float().clone(),
                         bcg_o.s_bar_post[0, win_slot].detach().float().clone(),
+                        self._slot_h_end[win_slot].clone(),
                     )
                 )
 
@@ -929,11 +973,21 @@ class DCPAChatSession:
 
         f_list: list[torch.Tensor] = []
         c_list: list[torch.Tensor] = []
-        for e_idx, f_tilde, s_bar in self._swr_ring:
+        h_list: list[torch.Tensor] = []
+        for entry in self._swr_ring:
+            e_idx = entry[0]
+            f_tilde = entry[1]
+            s_bar = entry[2]
+            h_end = (
+                entry[3]
+                if len(entry) >= 4
+                else torch.zeros((self.model.cfg.d_s,), device=self.device, dtype=torch.float32)
+            )
             col_u = float(fast.u_lex[e_idx].mean().item())
             if high_fam_count == 0 or col_u >= float(familiarity_threshold) * 0.5:
                 f_list.append(f_tilde.to(self.device))
                 c_list.append(s_bar.to(self.device))
+                h_list.append(h_end.to(self.device))
 
         if not f_list:
             nz_cols = high_fam_cols if high_fam_count > 0 else torch.nonzero(fast.u_lex > 0.0, as_tuple=False).squeeze(-1)
@@ -943,6 +997,7 @@ class DCPAChatSession:
                 f_cols = self.model.hippocampus.w_lex_slow(c_cols).detach()
                 f_list.append(f_cols)
                 c_list.append(c_cols)
+                h_list.append(torch.zeros((take.shape[0], self.model.cfg.d_s), device=self.device, dtype=torch.float32))
 
         out_dst = Path(out_path)
         if not f_list:
@@ -958,8 +1013,10 @@ class DCPAChatSession:
 
         f_batch = torch.stack(f_list, dim=0) if f_list[0].ndim == 1 else torch.cat(f_list, dim=0)
         c_batch = torch.stack(c_list, dim=0) if c_list[0].ndim == 1 else torch.cat(c_list, dim=0)
+        h_batch = torch.stack(h_list, dim=0) if h_list[0].ndim == 1 else torch.cat(h_list, dim=0)
         f_batch = f_batch.detach().float()
         c_batch = c_batch.detach().float()
+        h_batch = h_batch.detach().float()
 
         prev_req_grad = {n: p.requires_grad for n, p in self.model.named_parameters()}
         for p in self.model.parameters():
@@ -977,7 +1034,7 @@ class DCPAChatSession:
             self.model.train()
             for s in range(int(steps)):
                 opt.zero_grad(set_to_none=True)
-                c_pred = self.model.sgsc.w_sem(f_batch)
+                c_pred = self.model.sgsc.norm_c(self.model.sgsc.w_res(h_batch) + self.model.sgsc.w_sem(f_batch))
                 f_pred = self.model.hippocampus.w_lex_slow(c_batch)
                 loss = F.mse_loss(c_pred, c_batch) + F.mse_loss(f_pred, f_batch)
                 if s == 0:
@@ -1049,7 +1106,7 @@ class DCPAChatSession:
             if arg == "auto" or arg in LANG_NAME_TO_ID:
                 self.lang_mode = arg
                 return False, f"[lang] Broca register mode set to `{self.lang_mode}`."
-            return False, "[lang] Usage: /lang auto|zh|en|py|js"
+            return False, "[lang] Usage: /lang auto|en|zh|ja|formal|py|rs|sql|js"
         if raw.startswith("/sleep"):
             parts = raw.split()
             n_steps = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 50

@@ -37,6 +37,7 @@ pub struct SgscState {
     pub recent_bytes: [u8; 6],
     pub recent_len: usize,
     pub seg_pin_hit: bool,
+    pub seg_unpin_hit: bool,
     pub pending_asst_pin: bool,
     pub pending_asst_ticks: u8,
 }
@@ -57,6 +58,7 @@ impl SgscState {
             recent_bytes: [0u8; 6],
             recent_len: 0,
             seg_pin_hit: false,
+            seg_unpin_hit: false,
             pending_asst_pin: false,
             pending_asst_ticks: 0,
         }
@@ -74,6 +76,7 @@ impl SgscState {
         self.recent_bytes = [0u8; 6];
         self.recent_len = 0;
         self.seg_pin_hit = false;
+        self.seg_unpin_hit = false;
         self.pending_asst_pin = false;
         self.pending_asst_ticks = 0;
     }
@@ -92,6 +95,7 @@ impl SgscState {
         self.recent_bytes = src.recent_bytes;
         self.recent_len = src.recent_len;
         self.seg_pin_hit = src.seg_pin_hit;
+        self.seg_unpin_hit = src.seg_unpin_hit;
         self.pending_asst_pin = src.pending_asst_pin;
         self.pending_asst_ticks = src.pending_asst_ticks;
     }

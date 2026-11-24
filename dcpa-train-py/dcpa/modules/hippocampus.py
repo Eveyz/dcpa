@@ -138,6 +138,12 @@ class CompactHouseholderState:
         self.c_from_l_traces: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
         self.l_from_c_traces: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
 
+        # Lazy dense base matrices holding exact folded contributions of traces evicted beyond W_max
+        self._m_c_base: Optional[torch.Tensor] = None
+        self._base_step_c: int = 0
+        self._m_l_base: Optional[torch.Tensor] = None
+        self._base_step_l: int = 0
+
     def advance_step(self) -> None:
         self.step_count += 1
         if self.gamma_hip != 1.0:
@@ -161,7 +167,53 @@ class CompactHouseholderState:
         sliced.u_sem = self.u_sem[:n]
         sliced.c_from_l_traces = [(ki[:n], kv[:n], d[:n], st) for (ki, kv, d, st) in self.c_from_l_traces]
         sliced.l_from_c_traces = [(ki[:n], kv[:n], d[:n], st) for (ki, kv, d, st) in self.l_from_c_traces]
+        sliced._m_c_base = self._m_c_base[:n] if self._m_c_base is not None else None
+        sliced._base_step_c = self._base_step_c
+        sliced._m_l_base = self._m_l_base[:n] if self._m_l_base is not None else None
+        sliced._base_step_l = self._base_step_l
         return sliced
+
+    def _fold_oldest_c_trace(self) -> None:
+        """Fold oldest comprehension delta trace into dense `_m_c_base` without growing autograd graph."""
+        k_idx, k_val, delta, t_step = self.c_from_l_traces.pop(0)
+        with torch.no_grad():
+            if self._m_c_base is None:
+                self._m_c_base = torch.zeros(
+                    (k_idx.shape[0], self.d_h, self.d_concept),
+                    device=k_idx.device,
+                    dtype=torch.float32,
+                )
+                self._base_step_c = self.step_count
+            elif self.gamma_hip != 1.0 and self.step_count != self._base_step_c:
+                self._m_c_base.mul_(self.gamma_hip ** (self.step_count - self._base_step_c))
+                self._base_step_c = self.step_count
+            evict_decay = self.gamma_hip ** (self.step_count - t_step)
+            contrib = k_val.detach().float().unsqueeze(-1) * (
+                delta.detach().float().unsqueeze(1) * evict_decay
+            )
+            idx_exp = k_idx.detach().unsqueeze(-1).expand(-1, -1, self.d_concept)
+            self._m_c_base.scatter_add_(1, idx_exp, contrib)
+
+    def _fold_oldest_l_trace(self) -> None:
+        """Fold oldest expression delta trace into dense `_m_l_base` without growing autograd graph."""
+        k_idx, k_val, delta, t_step = self.l_from_c_traces.pop(0)
+        with torch.no_grad():
+            if self._m_l_base is None:
+                self._m_l_base = torch.zeros(
+                    (k_idx.shape[0], self.d_h, self.d_s),
+                    device=k_idx.device,
+                    dtype=torch.float32,
+                )
+                self._base_step_l = self.step_count
+            elif self.gamma_hip != 1.0 and self.step_count != self._base_step_l:
+                self._m_l_base.mul_(self.gamma_hip ** (self.step_count - self._base_step_l))
+                self._base_step_l = self.step_count
+            evict_decay = self.gamma_hip ** (self.step_count - t_step)
+            contrib = k_val.detach().float().unsqueeze(-1) * (
+                delta.detach().float().unsqueeze(1) * evict_decay
+            )
+            idx_exp = k_idx.detach().unsqueeze(-1).expand(-1, -1, self.d_s)
+            self._m_l_base.scatter_add_(1, idx_exp, contrib)
 
     def read_familiarity_lex(self, psi_idx: torch.Tensor, psi_val: torch.Tensor) -> torch.Tensor:
         """gamma_hip = sum_{k in I} psi_k^2 * u_lex[k] -> [B] float32."""
@@ -176,34 +228,58 @@ class CompactHouseholderState:
     def read_c_from_l(self, psi_idx: torch.Tensor, psi_val: torch.Tensor) -> torch.Tensor:
         """Compute M^{C<-L} @ psi -> [B, D] float32."""
         B = psi_idx.shape[0]
-        if not self.c_from_l_traces:
+        if self._m_c_base is None and not self.c_from_l_traces:
             return torch.zeros((B, self.d_concept), device=psi_idx.device, dtype=torch.float32)
-        k_idx = torch.stack([t[0] for t in self.c_from_l_traces], dim=1)  # [B, W, s]
-        k_val = torch.stack([t[1] for t in self.c_from_l_traces], dim=1)  # [B, W, s]
-        deltas = torch.stack([t[2] for t in self.c_from_l_traces], dim=1)  # [B, W, D]
-        decays = torch.tensor(
-            [self.gamma_hip ** (self.step_count - t[3]) for t in self.c_from_l_traces],
-            device=psi_idx.device,
-            dtype=torch.float32,
-        ).view(1, -1)  # [1, W]
-        dots = _sparse_dot_pairs(k_idx, k_val, psi_idx, psi_val.float()) * decays  # [B, W]
-        return torch.einsum("bw,bwd->bd", dots, deltas)
+
+        out: Optional[torch.Tensor] = None
+        if self._m_c_base is not None:
+            base_decay = self.gamma_hip ** (self.step_count - self._base_step_c)
+            cols = self._m_c_base.gather(1, psi_idx.unsqueeze(-1).expand(-1, -1, self.d_concept))
+            out = torch.einsum("bs,bsd->bd", psi_val.float(), cols) * base_decay
+
+        if self.c_from_l_traces:
+            k_idx = torch.stack([t[0] for t in self.c_from_l_traces], dim=1)  # [B, W, s]
+            k_val = torch.stack([t[1] for t in self.c_from_l_traces], dim=1)  # [B, W, s]
+            deltas = torch.stack([t[2] for t in self.c_from_l_traces], dim=1)  # [B, W, D]
+            decays = torch.tensor(
+                [self.gamma_hip ** (self.step_count - t[3]) for t in self.c_from_l_traces],
+                device=psi_idx.device,
+                dtype=torch.float32,
+            ).view(1, -1)  # [1, W]
+            dots = _sparse_dot_pairs(k_idx, k_val, psi_idx, psi_val.float()) * decays  # [B, W]
+            recent = torch.einsum("bw,bwd->bd", dots, deltas)
+            out = recent if out is None else (out + recent)
+
+        assert out is not None
+        return out
 
     def read_l_from_c(self, phi_idx: torch.Tensor, phi_val: torch.Tensor) -> torch.Tensor:
         """Compute M^{L<-C} @ phi -> [B, d_s] float32."""
         B = phi_idx.shape[0]
-        if not self.l_from_c_traces:
+        if self._m_l_base is None and not self.l_from_c_traces:
             return torch.zeros((B, self.d_s), device=phi_idx.device, dtype=torch.float32)
-        k_idx = torch.stack([t[0] for t in self.l_from_c_traces], dim=1)
-        k_val = torch.stack([t[1] for t in self.l_from_c_traces], dim=1)
-        deltas = torch.stack([t[2] for t in self.l_from_c_traces], dim=1)
-        decays = torch.tensor(
-            [self.gamma_hip ** (self.step_count - t[3]) for t in self.l_from_c_traces],
-            device=phi_idx.device,
-            dtype=torch.float32,
-        ).view(1, -1)
-        dots = _sparse_dot_pairs(k_idx, k_val, phi_idx, phi_val.float()) * decays
-        return torch.einsum("bw,bwd->bd", dots, deltas)
+
+        out: Optional[torch.Tensor] = None
+        if self._m_l_base is not None:
+            base_decay = self.gamma_hip ** (self.step_count - self._base_step_l)
+            cols = self._m_l_base.gather(1, phi_idx.unsqueeze(-1).expand(-1, -1, self.d_s))
+            out = torch.einsum("bs,bsd->bd", phi_val.float(), cols) * base_decay
+
+        if self.l_from_c_traces:
+            k_idx = torch.stack([t[0] for t in self.l_from_c_traces], dim=1)
+            k_val = torch.stack([t[1] for t in self.l_from_c_traces], dim=1)
+            deltas = torch.stack([t[2] for t in self.l_from_c_traces], dim=1)
+            decays = torch.tensor(
+                [self.gamma_hip ** (self.step_count - t[3]) for t in self.l_from_c_traces],
+                device=phi_idx.device,
+                dtype=torch.float32,
+            ).view(1, -1)
+            dots = _sparse_dot_pairs(k_idx, k_val, phi_idx, phi_val.float()) * decays
+            recent = torch.einsum("bw,bwd->bd", dots, deltas)
+            out = recent if out is None else (out + recent)
+
+        assert out is not None
+        return out
 
     def write_slot(
         self,
@@ -217,30 +293,34 @@ class CompactHouseholderState:
         write_threshold: float = 0.05,
         _skip_thresh_check: bool = False,
     ) -> None:
-        """Apply single-slot Householder Gated Delta update & familiarity update.
+        """Apply per-document masked single-slot Householder Gated Delta & familiarity update.
 
-        Only appends a trace entry if max(beta) > write_threshold (keeping trace <= W_max).
+        Documents with `beta <= write_threshold` receive exact zero delta/familiarity updates.
+        Traces evicted beyond `w_max` are folded losslessly into `_m_c_base` / `_m_l_base`.
         """
-        if (not _skip_thresh_check) and float(beta.detach().max().item()) <= write_threshold:
+        doc_active = (beta.detach().float() > float(write_threshold)).float()
+        if (not _skip_thresh_check) and float(doc_active.max().item()) <= 0.0:
+            return
+        if float(doc_active.max().item()) <= 0.0:
             return
 
         # Precision Island #5 (Red Line #1): s=32 active sparse column Householder Gated Delta
         # erase/write & familiarity accumulation strictly in float32 (zero residual ghosting!).
         with fp32_island(beta.device):
-            beta_f = beta.float().unsqueeze(-1)  # [B, 1]
+            beta_f = (beta.float() * doc_active).unsqueeze(-1)  # [B, 1]
             # Comprehension write: delta_c = beta * (s_bar - M^{C<-L} @ e)
             old_c = self.read_c_from_l(e_idx, e_val)
             delta_c = beta_f * (s_bar.float() - old_c)
             self.c_from_l_traces.append((e_idx.detach(), e_val.detach().float(), delta_c, self.step_count))
             if len(self.c_from_l_traces) > self.w_max:
-                self.c_from_l_traces.pop(0)
+                self._fold_oldest_c_trace()
 
             # Expression write: delta_l = beta * (f_tilde - M^{L<-C} @ phi)
             old_l = self.read_l_from_c(phi_idx, phi_val)
             delta_l = beta_f * (f_tilde.float() - old_l)
             self.l_from_c_traces.append((phi_idx.detach(), phi_val.detach().float(), delta_l, self.step_count))
             if len(self.l_from_c_traces) > self.w_max:
-                self.l_from_c_traces.pop(0)
+                self._fold_oldest_l_trace()
 
             # Familiarity trace updates (out-of-place for clean autograd)
             active_e = (e_val.float() > 0).float()

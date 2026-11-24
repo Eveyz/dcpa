@@ -64,10 +64,15 @@ LANG_NAME_TO_ID: dict[str, int] = {
     "en": 0,
     "zh": 1,
     "ja": 2,
+    "formal": 2,
+    "fol": 2,
+    "math": 2,
+    "lean": 2,
     "py": 3,
     "python": 3,
     "rs": 4,
     "rust": 4,
+    "sql": 4,
     "js": 5,
     "javascript": 5,
 }
@@ -204,6 +209,18 @@ def compute_pin_trigger_byte_mask(
     return out
 
 
+def compute_unpin_trigger_byte_mask(
+    raw_bytes: torch.Tensor,
+    doc_reset_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Vectorized [B, T] bool mask marking turn-boundary bytes `0x04` (EOT) or `0x1E` (user RS)."""
+    rb = raw_bytes.to(dtype=torch.long)
+    out = (rb == TURN_EOT_BYTE) | (rb == TURN_USER_BYTE)
+    if doc_reset_mask is not None:
+        out = out & ~doc_reset_mask.bool()
+    return out
+
+
 @dataclass(frozen=True)
 class EncodedDialogue:
     raw_bytes: bytes
@@ -310,7 +327,7 @@ def build_sft_byte_loss_weights(
 
 
 def detect_lang_id(text: str) -> int:
-    """Lightweight heuristic language/domain detector for `/lang auto` (`0=en,1=zh,2=ja,3=py,4=rs,5=js`)."""
+    """Lightweight heuristic language/domain detector matching v2 domains (`4=Code/SQL`, `2=Formal/JA`, etc.)."""
     s = text.strip()
     low = s.lower()
 
@@ -319,7 +336,40 @@ def detect_lang_id(text: str) -> int:
         for kw in ("function ", "const ", "=>", "console.log", "export ", "async function", "=== ", "!== ")
     )
     rust_hits = sum(kw in s for kw in ("fn ", "let mut ", "impl ", "struct ", "-> ", "usize", "Vec<", "pub fn", "match "))
+    sql_hits = sum(
+        kw in low
+        for kw in (
+            "select ",
+            " from ",
+            " where ",
+            "insert into ",
+            "update ",
+            "create table ",
+            "join ",
+            "group by ",
+            "order by ",
+            "inner join ",
+            "left join ",
+        )
+    )
     py_hits = sum(kw in s for kw in ("def ", "class ", "import ", "return ", "elif ", "lambda ", "-> int", "-> list"))
+    fol_hits = sum(
+        kw in low
+        for kw in (
+            "forall ",
+            "exists ",
+            "|-",
+            "|=",
+            "<->",
+            "==>",
+            "\\forall",
+            "\\exists",
+            "\\implies",
+            "\\vdash",
+            "theorem ",
+            "lemma ",
+        )
+    )
     if (
         "```javascript" in low
         or "```js" in low
@@ -327,10 +377,24 @@ def detect_lang_id(text: str) -> int:
         or (("javascript" in low or "nodejs" in low) and ("function" in s or "const " in s or "=>" in s or "函数" in s))
     ):
         return 5
-    if rust_hits >= 2 or "```rust" in low or ("rust" in low and ("struct " in s or "fn " in s)):
+    if (
+        rust_hits >= 2
+        or sql_hits >= 2
+        or "```rust" in low
+        or "```sql" in low
+        or ("rust" in low and ("struct " in s or "fn " in s))
+    ):
         return 4
     if py_hits >= 2 or "```python" in low or ("python" in low and ("def " in s or "函数" in s or "function" in low)):
         return 3
+    if (
+        any(sym in s for sym in ("∀", "∃", "⊢", "⊨", "⟹", "⟺"))
+        or "```lean" in low
+        or "```coq" in low
+        or "```fol" in low
+        or fol_hits >= 2
+    ):
+        return 2
 
     ja_kana = sum(1 for ch in s if ("\u3040" <= ch <= "\u309f") or ("\u30a0" <= ch <= "\u30ff"))
     if ja_kana >= 2:

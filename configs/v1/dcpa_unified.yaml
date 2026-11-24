@@ -1,10 +1,10 @@
 # DCPA Unified Single-GPU <-> Multi-GPU Training Config (`1..N` GPUs / MPS / CPU)
 #
 # One config for ALL environments — switch between 1 GPU and Multi-GPU with ONLY `--gpus`:
-#   - Auto-detect all GPUs : python train/train_dcpa.py --config configs/dcpa_unified.yaml
-#   - Force Single-GPU     : python train/train_dcpa.py --config configs/dcpa_unified.yaml --gpus 1
-#   - Pick specific GPU #2 : python train/train_dcpa.py --config configs/dcpa_unified.yaml --gpus 1 --gpu-ids 2
-#   - Run 4-GPU Multi-GPU  : python train/train_dcpa.py --config configs/dcpa_unified.yaml --gpus 4 --preset moe_2_6b
+#   - Auto-detect all GPUs : python train/train_dcpa.py --config configs/v1/dcpa_unified.yaml
+#   - Force Single-GPU     : python train/train_dcpa.py --config configs/v1/dcpa_unified.yaml --gpus 1
+#   - Pick specific GPU #2 : python train/train_dcpa.py --config configs/v1/dcpa_unified.yaml --gpus 1 --gpu-ids 2
+#   - Run 4-GPU Multi-GPU  : python train/train_dcpa.py --config configs/v1/dcpa_unified.yaml --gpus 4 --preset moe_2_6b
 #   - Elastic Resume       : Checkpoints saved on 1 GPU resume directly on 2/4/8 GPUs (and vice versa)!
 #
 # Automatic Hardware & Scale Adaptation:

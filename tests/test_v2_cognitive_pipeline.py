@@ -1,7 +1,7 @@
 """Acceptance test suite for DCPA v2 (`moe_210m`) Holistic 35:35:30 Cognitive Pipeline.
 
 Covers (100% offline — zero network downloads):
-  1. `configs/dcpa_210m_v2_cognitive.yaml`:
+  1. `configs/v2/dcpa_210m_v2_cognitive.yaml`:
        - `moe_210m` config & `W_max=64`, `householder_write_threshold=0.08`, `num_lang_domains=6`
        - Stage boundaries `[0, 12000, 42000, 78000, 100000]`
        - Stage 1 `max_stage_tier == 1` & `anchor_doc_start is True`
@@ -57,7 +57,7 @@ from utils.chat_protocol import SCRATCH_END, SCRATCH_START, verify_mask_alignmen
 
 
 def test_v2_cognitive_yaml_and_curriculum_schedule() -> None:
-    cfg_path = REPO_ROOT / "configs" / "dcpa_210m_v2_cognitive.yaml"
+    cfg_path = REPO_ROOT / "configs" / "v2" / "dcpa_210m_v2_cognitive.yaml"
     assert cfg_path.is_file()
     raw_yaml = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
 
@@ -262,7 +262,7 @@ def test_v2_builders_offline_6domain_alchemy_and_end_to_end_train(tmp_path: Path
     del idx_sft, bin_sft, msk_sft
 
     # 4. Run end-to-end mini Stage 1..4 pre-train + Stage 5 SFT using `dcpa_210m_v2_cognitive.yaml`
-    cfg_path = REPO_ROOT / "configs" / "dcpa_210m_v2_cognitive.yaml"
+    cfg_path = REPO_ROOT / "configs" / "v2" / "dcpa_210m_v2_cognitive.yaml"
     summary = run_training(
         config_path=cfg_path,
         preset="micro",
@@ -344,3 +344,77 @@ def test_v2_orchestrator_profile_and_train_sh_dry_run(tmp_path: Path) -> None:
     assert "dcpa_210m_v2_cognitive.yaml" in proc.stdout
     assert "preset=moe_210m" in proc.stdout
     assert "--total-steps 15000" in proc.stdout
+
+
+def test_v2_cognitive_48m_config_profile_and_launcher(tmp_path: Path) -> None:
+    cfg_path = REPO_ROOT / "configs" / "v2" / "dcpa_48m_v2_cognitive.yaml"
+    assert cfg_path.is_file()
+    raw_yaml = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+    cfg = build_dcpa_config("proto_48m", raw_yaml)
+    assert cfg.vocab_size == 256
+    assert cfg.d_s == 192
+    assert cfg.d_concept == 512
+    assert cfg.num_lang_domains == 6
+    assert cfg.num_style_domains == 5
+    assert cfg.num_experts == 16
+    assert cfg.top_k_experts == 2
+    assert cfg.expert_hidden == 896
+    assert cfg.householder_max_writes == 64
+    assert abs(cfg.householder_write_threshold - 0.08) < 1e-6
+
+    with torch.device("meta"):
+        model = DCPAModel(cfg)
+        counts = model.count_parameters()
+    assert 47_000_000 <= counts["total"] <= 51_000_000
+    assert 10_000_000 <= counts["active_per_step"] <= 12_000_000
+
+    csm = CurriculumController(raw_yaml.get("curriculum", {}))
+    assert csm.boundaries == (0, 7200, 25200, 46800, 60000)
+
+    s1 = csm.get(500)
+    assert s1.stage_id == 1 and s1.max_stage_tier == 1 and s1.anchor_doc_start is True and s1.cap_mix_prob == 0.0
+    s2_early = csm.get(10000)
+    assert s2_early.stage_id == 2 and s2_early.max_stage_tier == 2 and s2_early.cap_mix_prob == 0.0
+    s2_late = csm.get(21000)
+    assert s2_late.stage_id == 2 and abs(s2_late.cap_mix_prob - 0.15) < 1e-6
+    s3 = csm.get(35000)
+    assert s3.stage_id == 3 and s3.max_stage_tier == 3 and abs(s3.cap_mix_prob - 0.45) < 1e-6
+    s4 = csm.get(52000)
+    assert s4.stage_id == 4 and s4.wug_mode == "cognitive_v2" and abs(s4.wug_ratio - 0.55) < 1e-6
+    assert s4.max_doc_bytes == 3072
+
+    plan = prepare_vast_corpus(
+        profile="v2_cognitive_3g",
+        nvme_root=tmp_path / "nvme_v2_48m",
+        dry_run=True,
+    )
+    assert plan["dry_run"] is True
+    assert set(plan["commands"].keys()) == {
+        "corpus_5domain",
+        "cap_reasoning",
+        "cap_instruct",
+        "cap_writing",
+        "cap_toolcall",
+        "cap_code",
+        "stage5_sft",
+    }
+    assert "--cognitive-v2" in plan["commands"]["corpus_5domain"]
+
+    proc = subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "scripts" / "train.sh"),
+            "--v2-cognitive-48m",
+            "--gpus=1",
+            "--dry-run",
+            f"--nvme-dir={tmp_path / 'nvme_v2_48m'}",
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "dcpa_48m_v2_cognitive.yaml" in proc.stdout
+    assert "preset=proto_48m" in proc.stdout
+    assert "--total-steps 10000" in proc.stdout

@@ -167,6 +167,10 @@ pub fn run_swr_sleep_replay(
 
     for (idx_pos, &k) in candidate_cols.iter().enumerate() {
         engine.fast_mem.read_lex_column_f32(k, &mut c_proto);
+        let scale = (engine.weights.cfg.s_active as f32).sqrt();
+        for v in c_proto.iter_mut() {
+            *v *= scale;
+        }
         let f_proto = &engine.weights.hip_r_lex[k * d_s..(k + 1) * d_s];
 
         // Local SWR Replay micro-steps mixing 1 new prototype : 4 old cortical anchors

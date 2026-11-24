@@ -203,7 +203,7 @@ def _ddp_train_worker(rank: int, world_size: int, port: int, work_dir_str: str) 
 
     work_dir = Path(work_dir_str)
     summary = run_training(
-        config_path=REPO_ROOT / "configs" / "dcpa_210m_moe.yaml",
+        config_path=REPO_ROOT / "configs" / "v1" / "dcpa_210m_moe.yaml",
         preset="micro",
         total_steps=8,
         stage_boundaries=(0, 2, 4, 6, 8),
@@ -259,7 +259,7 @@ def test_distributed_2rank_gloo_stage1_to_4_and_elastic_resume(tmp_path: Path) -
         os.environ.pop(k, None)
 
     resumed = run_training(
-        config_path=REPO_ROOT / "configs" / "dcpa_210m_moe.yaml",
+        config_path=REPO_ROOT / "configs" / "v1" / "dcpa_210m_moe.yaml",
         preset="micro",
         total_steps=10,
         stage_boundaries=(0, 2, 4, 6, 10),
@@ -316,7 +316,7 @@ def test_distributed_2rank_stage5_sft(tmp_path: Path) -> None:
     _write_synthetic_multitier_corpus(tmp_path / "data")
     # Produce a fast micro base export first
     run_training(
-        config_path=REPO_ROOT / "configs" / "dcpa_210m_moe.yaml",
+        config_path=REPO_ROOT / "configs" / "v1" / "dcpa_210m_moe.yaml",
         preset="micro",
         total_steps=2,
         stage_boundaries=(0, 2, 3, 4, 5),
@@ -351,7 +351,7 @@ def test_distributed_2rank_stage5_sft(tmp_path: Path) -> None:
 def test_v2_presets_and_vast_orchestrator_dry_run_and_scripts(tmp_path: Path) -> None:
     from dcpa.model import DCPAModel
 
-    yaml_cfg = yaml.safe_load((REPO_ROOT / "configs" / "dcpa_v2_4xa100.yaml").read_text(encoding="utf-8"))
+    yaml_cfg = yaml.safe_load((REPO_ROOT / "configs" / "v1" / "dcpa_v2_4xa100.yaml").read_text(encoding="utf-8"))
     expected_param_ranges = {
         "moe_210m": (180_000_000, 240_000_000),
         "moe_650m": (600_000_000, 780_000_000),
@@ -579,7 +579,7 @@ def test_cap_instruct_and_js_reasoning_offline_builders_and_sidecar_mask(tmp_pat
 
 def test_unified_cli_single_to_multi_to_single_gpu_switch(tmp_path: Path) -> None:
     """End-to-end test of seamless `--gpus 1 <-> --gpus 2` switching using the SAME command,
-    SAME `configs/dcpa_unified.yaml`, and SAME checkpoint directory (zero manual `torchrun`).
+    SAME `configs/v1/dcpa_unified.yaml`, and SAME checkpoint directory (zero manual `torchrun`).
     """
     data_dir = tmp_path / "data"
     _write_synthetic_multitier_corpus(data_dir)
@@ -600,7 +600,7 @@ def test_unified_cli_single_to_multi_to_single_gpu_switch(tmp_path: Path) -> Non
         sys.executable,
         str(REPO_ROOT / "train" / "train_dcpa.py"),
         "--config",
-        str(REPO_ROOT / "configs" / "dcpa_unified.yaml"),
+        str(REPO_ROOT / "configs" / "v1" / "dcpa_unified.yaml"),
         "--preset",
         "micro",
         "--device",

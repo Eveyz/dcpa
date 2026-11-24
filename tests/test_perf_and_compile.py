@@ -213,7 +213,7 @@ def test_compile_checkpoint_portability(tmp_path: Path):
             )
 
     summary = run_training(
-        config_path=REPO_ROOT / "configs" / "dcpa_48m_train.yaml",
+        config_path=REPO_ROOT / "configs" / "v1" / "dcpa_48m_train.yaml",
         preset="micro",
         total_steps=5,
         stage_boundaries=(0, 2, 5, 6, 7),  # crosses Stage 1 -> Stage 2 so Hotspot A (BCG-PC) executes!

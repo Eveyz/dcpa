@@ -10,8 +10,8 @@
 #                    Stage 4 expands window to 3072B + `householder_max_writes=64` for World-Bible, Temporary Axioms & Multi-API SDKs.
 #
 # Launch Commands:
-#   - Single-GPU (primary) : bash scripts/train.sh --config=configs/dcpa_210m_v2_cognitive.yaml --gpus=1 --preset=moe_210m --data-profile=v2_cognitive_5g
-#   - Multi-GPU (elastic)  : bash scripts/train.sh --config=configs/dcpa_210m_v2_cognitive.yaml --gpus=4 --preset=moe_210m --data-profile=v2_cognitive_5g
+#   - Single-GPU (primary) : bash scripts/train.sh --config=configs/v2/dcpa_210m_v2_cognitive.yaml --gpus=1 --preset=moe_210m --data-profile=v2_cognitive_5g
+#   - Multi-GPU (elastic)  : bash scripts/train.sh --config=configs/v2/dcpa_210m_v2_cognitive.yaml --gpus=4 --preset=moe_210m --data-profile=v2_cognitive_5g
 
 schema_version: 2
 experiment_name: dcpa_v2_210m_cognitive_5stage_100k

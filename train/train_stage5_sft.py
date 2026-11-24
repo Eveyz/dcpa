@@ -283,20 +283,38 @@ def _eval_sft_val_bpc(
     return (tot_nll / tot_sup) / math.log(2.0)
 
 
+def resolve_stage5_yaml_defaults(train_config_path: Optional[str | Path]) -> dict[str, Any]:
+    """Read optional `stage5_sft:` block from a YAML training config (e.g. `dcpa_210m_v2_cognitive.yaml`)."""
+    if not train_config_path:
+        return {}
+    p = Path(train_config_path)
+    if not p.is_file():
+        return {}
+    try:
+        import yaml  # type: ignore
+    except ImportError:
+        return {}
+    raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    s5 = raw.get("stage5_sft")
+    return dict(s5) if isinstance(s5, dict) else {}
+
+
 def run_stage5_sft(
     *,
     weights_path: str | Path,
     data_dir: str | Path = "artifacts/sft_data",
     cap_data_dir: Optional[str | Path] = None,
     config_path: Optional[str | Path] = None,
+    train_config_path: Optional[str | Path] = None,
     export_dir: str | Path = "artifacts/export",
     drive_export_dir: Optional[str | Path] = None,
-    total_steps: int = 8000,
+    total_steps: Optional[int] = None,
     warmup_steps: Optional[int] = None,
-    target_tokens_bytes_per_step: int = 65536,
+    target_tokens_bytes_per_step: Optional[int] = None,
     micro_batch_bytes: Optional[int] = None,
     fixed_global_batch: bool = False,
-    max_doc_bytes: int = 2048,
+    max_doc_bytes: Optional[int] = None,
+    write_threshold_override: Optional[float] = None,
     eot_weight: float = 2.0,
     tool_ctrl_weight: float = 2.5,
     device_str: str = "auto",
@@ -306,13 +324,32 @@ def run_stage5_sft(
     log_every: int = 50,
     step_hook: Optional[Callable[[int, DCPAModel, dict[str, float]], None]] = None,
 ) -> Stage5SFTSummary:
-    """Run Stage 5 surgical pragmatic + capability SFT (default 8,000 steps) and export `dcpa_chat_sft.safetensors`."""
+    """Run Stage 5 surgical pragmatic + capability SFT and export `dcpa_chat_sft.safetensors`."""
     dist_ctx, dist_owned = init_distributed_context(preferred_device=device_str)
     is_primary = dist_ctx.is_primary
 
     def _r0_print(*args: Any, **kwargs: Any) -> None:
         if is_primary:
             print(*args, **kwargs)
+
+    s5_yaml = resolve_stage5_yaml_defaults(train_config_path)
+    total_steps = int(total_steps if total_steps is not None else s5_yaml.get("total_steps", 8000))
+    target_tokens_bytes_per_step = int(
+        target_tokens_bytes_per_step
+        if target_tokens_bytes_per_step is not None
+        else s5_yaml.get("target_tokens_bytes_per_step", 65536)
+    )
+    max_doc_bytes = int(max_doc_bytes if max_doc_bytes is not None else s5_yaml.get("max_doc_bytes", 2048))
+    yaml_warmup = s5_yaml.get("warmup_steps")
+    eff_write_thresh_opt: Optional[float] = (
+        float(write_threshold_override)
+        if write_threshold_override is not None
+        else (
+            float(s5_yaml["write_threshold_override"])
+            if s5_yaml.get("write_threshold_override") is not None
+            else None
+        )
+    )
 
     assert_not_drive_path(data_dir, role="--data-dir")
     if cap_data_dir is not None:
@@ -353,11 +390,14 @@ def run_stage5_sft(
         if (dist_ctx.is_distributed and global_step_bytes > 65536)
         else 1.0
     )
-    eff_warmup = (
-        int(warmup_steps)
-        if warmup_steps is not None
-        else (300 if total_steps == 8000 else (200 if total_steps == 4000 else max(1, int(round(total_steps * 0.05)))))
-    )
+    if warmup_steps is not None:
+        eff_warmup = int(warmup_steps)
+    elif yaml_warmup is not None:
+        eff_warmup = int(yaml_warmup)
+    else:
+        eff_warmup = (
+            300 if total_steps == 8000 else (200 if total_steps == 4000 else max(1, int(round(total_steps * 0.05))))
+        )
 
     _r0_print(describe_hardware_profile(profile), flush=True)
     seed_everything(seed, device=device)
@@ -474,7 +514,11 @@ def run_stage5_sft(
                     x_b, msk, eot_weight=eot_weight, tool_ctrl_weight=tool_ctrl_weight
                 ).unsqueeze(0)
                 sft_lam_act = min(0.02, 0.5 * float(model.cfg.lambda_act))
-                eff_w_thresh = float(model.cfg.householder_write_threshold)
+                eff_w_thresh = (
+                    eff_write_thresh_opt
+                    if eff_write_thresh_opt is not None
+                    else float(model.cfg.householder_write_threshold)
+                )
                 with amp_autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
                     out = model(
                         raw_bytes=x_b.unsqueeze(0),
@@ -589,20 +633,22 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="DCPA Stage 5 Pragmatic & Capability SFT Trainer")
     ap.add_argument("--weights", type=str, default="artifacts/export/dcpa_final.safetensors")
     ap.add_argument("--config", type=str, default=None)
+    ap.add_argument("--train-config", type=str, default=None, help="Optional YAML config providing stage5_sft defaults.")
     ap.add_argument("--data-dir", type=str, default="artifacts/sft_data")
     ap.add_argument("--cap-data-dir", type=str, default=None, help="Optional capability shards dir (cap_reasoning/writing/toolcall)")
     ap.add_argument("--export-dir", type=str, default="artifacts/export")
     ap.add_argument("--drive-export-dir", type=str, default=None)
-    ap.add_argument("--total-steps", type=int, default=8000)
+    ap.add_argument("--total-steps", type=int, default=None)
     ap.add_argument("--warmup-steps", type=int, default=None)
-    ap.add_argument("--target-tokens-bytes-per-step", type=int, default=65536)
+    ap.add_argument("--target-tokens-bytes-per-step", type=int, default=None)
     ap.add_argument("--micro-batch-bytes", type=int, default=None)
     ap.add_argument(
         "--fixed-global-batch",
         action="store_true",
         help="Keep exact global step bytes across ranks instead of scaling 64 KB per GPU.",
     )
-    ap.add_argument("--max-doc-bytes", type=int, default=2048)
+    ap.add_argument("--max-doc-bytes", type=int, default=None)
+    ap.add_argument("--write-threshold-override", type=float, default=None)
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument(
         "--gpus",
@@ -634,6 +680,7 @@ def main() -> None:
     run_stage5_sft(
         weights_path=args.weights,
         config_path=args.config,
+        train_config_path=args.train_config,
         data_dir=args.data_dir,
         cap_data_dir=args.cap_data_dir,
         export_dir=args.export_dir,
@@ -644,6 +691,7 @@ def main() -> None:
         micro_batch_bytes=args.micro_batch_bytes,
         fixed_global_batch=args.fixed_global_batch,
         max_doc_bytes=args.max_doc_bytes,
+        write_threshold_override=args.write_threshold_override,
         device_str=args.device,
         compile_mode=args.compile_mode,
         seed=args.seed,

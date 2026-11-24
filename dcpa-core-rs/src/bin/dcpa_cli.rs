@@ -385,7 +385,13 @@ fn cmd_bench(dir: &Path) {
     for &b in sample.iter() {
         let tr = engine.sgsc_ingest_byte(b, false);
         if tr.spiked {
-            let _ = engine.step_concept_from_scratch_with_opts(tr.mean_info, tr.sem_norm, tr.pin_triggered, None);
+            let _ = engine.step_concept_from_scratch_with_turn_opts(
+                tr.mean_info,
+                tr.sem_norm,
+                tr.pin_triggered,
+                tr.unpin_triggered,
+                None,
+            );
         }
     }
 
@@ -395,7 +401,13 @@ fn cmd_bench(dir: &Path) {
         let b = sample[i % sample.len()];
         let tr = engine.sgsc_ingest_byte(b, i == 511);
         if tr.spiked {
-            let _ = engine.step_concept_from_scratch_with_opts(tr.mean_info, tr.sem_norm, tr.pin_triggered, None);
+            let _ = engine.step_concept_from_scratch_with_turn_opts(
+                tr.mean_info,
+                tr.sem_norm,
+                tr.pin_triggered,
+                tr.unpin_triggered,
+                None,
+            );
         }
     }
     // Exercise closed-loop Mode-1 motor drive + PMD byte steps (strictly 0 allocs)
@@ -487,7 +499,7 @@ fn format_tool_observation_after_suspend(result_text: &str) -> Vec<u8> {
     out
 }
 
-/// Exact language ID mapping matching `utils/chat_protocol.py` (`0=en, 1=zh, 2=ja, 3=py, 4=rs, 5=js`).
+/// Exact language/domain ID mapping matching `utils/chat_protocol.py` (`4=Code/SQL`, `2=Formal/JA`, etc.).
 fn detect_lang_id(text: &str) -> usize {
     let s = text.trim();
     let low = s.to_ascii_lowercase();
@@ -508,10 +520,43 @@ fn detect_lang_id(text: &str) -> usize {
         .iter()
         .filter(|&&kw| s.contains(kw))
         .count();
+    let sql_hits = [
+        "select ",
+        " from ",
+        " where ",
+        "insert into ",
+        "update ",
+        "create table ",
+        "join ",
+        "group by ",
+        "order by ",
+        "inner join ",
+        "left join ",
+    ]
+    .iter()
+    .filter(|&&kw| low.contains(kw))
+    .count();
     let py_hits = ["def ", "class ", "import ", "return ", "elif ", "lambda ", "-> int", "-> list"]
         .iter()
         .filter(|&&kw| s.contains(kw))
         .count();
+    let fol_hits = [
+        "forall ",
+        "exists ",
+        "|-",
+        "|=",
+        "<->",
+        "==>",
+        "\\forall",
+        "\\exists",
+        "\\implies",
+        "\\vdash",
+        "theorem ",
+        "lemma ",
+    ]
+    .iter()
+    .filter(|&&kw| low.contains(kw))
+    .count();
     if low.contains("```javascript")
         || low.contains("```js")
         || js_hits >= 2
@@ -520,7 +565,12 @@ fn detect_lang_id(text: &str) -> usize {
     {
         return 5;
     }
-    if rust_hits >= 2 || low.contains("```rust") || (low.contains("rust") && (s.contains("struct ") || s.contains("fn "))) {
+    if rust_hits >= 2
+        || sql_hits >= 2
+        || low.contains("```rust")
+        || low.contains("```sql")
+        || (low.contains("rust") && (s.contains("struct ") || s.contains("fn ")))
+    {
         return 4;
     }
     if py_hits >= 2
@@ -528,6 +578,14 @@ fn detect_lang_id(text: &str) -> usize {
         || (low.contains("python") && (s.contains("def ") || s.contains("函数") || low.contains("function")))
     {
         return 3;
+    }
+    if ["∀", "∃", "⊢", "⊨", "⟹", "⟺"].iter().any(|&sym| s.contains(sym))
+        || low.contains("```lean")
+        || low.contains("```coq")
+        || low.contains("```fol")
+        || fol_hits >= 2
+    {
+        return 2;
     }
     let ja_kana = s
         .chars()
@@ -954,10 +1012,11 @@ fn ingest_slice(engine: &mut DcpaEngine, bytes: &[u8], ach_override: Option<f32>
         let tr = engine.sgsc_ingest_byte(b, i + 1 == bytes.len());
         if tr.spiked {
             spikes += 1;
-            let ctr = engine.step_concept_from_scratch_with_opts(
+            let ctr = engine.step_concept_from_scratch_with_turn_opts(
                 tr.mean_info,
                 tr.sem_norm,
                 tr.pin_triggered,
+                tr.unpin_triggered,
                 ach_override,
             );
             if ctr.ach > max_ach {
@@ -1071,7 +1130,7 @@ fn cmd_chat(dir: &Path) {
         weight_path.file_name().and_then(|s| s.to_str()).unwrap_or("safetensors"),
         (engine.fast_mem.byte_footprint() as f64) / (1024.0 * 1024.0)
     );
-    println!("Commands: /style <name> | /lang auto|en|zh|ja|py|rs | /think show|dim|hide | /probe on|off | /teach <text> | /tools | /reset | /wipe | /quit");
+    println!("Commands: /style <name> | /lang auto|en|zh|ja|formal|py|rs|sql|js | /think show|dim|hide | /probe on|off | /teach <text> | /tools | /reset | /wipe | /quit");
 
     let stdin = io::stdin();
     let mut rng_state = 0xCAFE_BABE_1337_0001u64;
@@ -1165,6 +1224,10 @@ fn cmd_chat(dir: &Path) {
                         lang_override = Some(2);
                         println!("[lang] ja (2)");
                     }
+                    "formal" | "fol" | "math" | "lean" => {
+                        lang_override = Some(2);
+                        println!("[lang] formal (2)");
+                    }
                     "py" | "python" => {
                         lang_override = Some(3);
                         println!("[lang] py (3)");
@@ -1173,11 +1236,15 @@ fn cmd_chat(dir: &Path) {
                         lang_override = Some(4);
                         println!("[lang] rs (4)");
                     }
+                    "sql" => {
+                        lang_override = Some(4);
+                        println!("[lang] sql (4)");
+                    }
                     "js" | "javascript" => {
                         lang_override = Some(5);
                         println!("[lang] js (5)");
                     }
-                    _ => println!("Choices: auto | en | zh | py | js"),
+                    _ => println!("Choices: auto | en | zh | ja | formal | py | rs | sql | js"),
                 },
                 "/think" => {
                     if matches!(arg, "show" | "dim" | "hide") {
@@ -1462,8 +1529,14 @@ mod cli_tests {
         assert_eq!(detect_lang_id("Explain causal byte segmentation."), 0);
         assert_eq!(detect_lang_id("请解释海马体三因子可塑性机制"), 1);
         assert_eq!(detect_lang_id("海馬の高速重みについて説明してください"), 2);
+        assert_eq!(detect_lang_id("∀x ∈ S, ∃y: P(x, y) ⟹ Q(x)"), 2);
+        assert_eq!(detect_lang_id("forall x in S, exists y: P(x, y) |- Q(x)"), 2);
         assert_eq!(detect_lang_id("def foo(x):\n    return x + 1"), 3);
         assert_eq!(detect_lang_id("pub fn step(&mut self) -> usize { let mut x = 1; x }"), 4);
+        assert_eq!(
+            detect_lang_id("SELECT u.id, COUNT(o.id) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.id;"),
+            4
+        );
         assert_eq!(detect_lang_id("const sum = (xs) => xs.reduce((a, b) => a + b, 0);"), 5);
     }
 }

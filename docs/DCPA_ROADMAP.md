@@ -25,7 +25,7 @@
 1. **训练稳定性与数值安全红线**：
    * **唤醒 Pondering MoE 容量**：`tau_skip = 0.32`、`tau_halt = 0.22`、`lambda_act = 0.01`，配合 SM80+ `F.grouped_mm` 零同步稀疏分派（32 专家减少 16 倍无效专家计算）。
    * **谱安全 `0.5` 循环阻尼与归并器 `detach`**：在 v1/v2 的 `RMSNorm + Gumbel-STE` 结构下保持 `_DampedBoundedCarry(0.5, 0.25)` 与 `s_tilde.detach()`，彻底杜绝长序列雅可比爆炸饿死 `W_gen`（无损长程梯度留待 v3 对数收缩门解决）。
-   * **尾部对齐 `Broca CQ`** 与 **单卡 ↔ 多卡无缝弹性续跑（`scripts/train.sh` + `configs/dcpa_unified.yaml`）**：支持 `--gpus=1` 与 `--gpus=N` 共享同一套 Checkpoint 无缝切换，内置 `phys_offset` 单调游标与双向 `sqrt` 学习率自动缩放。
+   * **尾部对齐 `Broca CQ`** 与 **单卡 ↔ 多卡无缝弹性续跑（`scripts/train.sh` + `configs/v1/dcpa_unified.yaml`）**：支持 `--gpus=1` 与 `--gpus=N` 共享同一套 Checkpoint 无缝切换，内置 `phys_offset` 单调游标与双向 `sqrt` 学习率自动缩放。
 2. **本地 Rust 推理与睡眠巩固运行时（`dcpa-core-rs` + `dcpa-sleep-daemon`）**：
    * Python 与纯静态 `no_std` Rust 双端统一采用 Mode-1 闭环流式生成，原生支持 `\x1dS...\x1dE` 草稿帧、`Slot-0 Thesis Pinning`、`128B` 多帧下推栈自动清零、4-Row SIMD `BF16` 微内核以及 `0` 堆分配 `BrainSnapshot` 快照捕获/恢复。
 

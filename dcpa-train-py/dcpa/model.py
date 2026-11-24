@@ -103,6 +103,12 @@ def _compute_pin_trigger_byte_mask(
     return out
 
 
+def _compute_unpin_trigger_byte_mask(raw_bytes: torch.Tensor) -> torch.Tensor:
+    """Vectorized [B, T] bool mask marking turn-boundary bytes `0x04` (EOT) or `0x1E` (user RS)."""
+    rb = raw_bytes.to(dtype=torch.long)
+    return (rb == 0x04) | (rb == 0x1E)
+
+
 @dataclass
 class DCPACarryState:
     """Strictly O(1) constant-size runtime working memory carried across streaming chunks.
@@ -433,19 +439,26 @@ class DCPAModel(nn.Module):
             V = B
             seg_counts = sgsc_out.seg_counts  # [V]
 
-        # Vectorized per-segment Slot-0 Thesis Pinning trigger (Spec 2: fires once on `\x1dE\n` or first `\x1fA\n`)
+        # Vectorized per-segment Slot-0 Thesis Pinning & Turn-Boundary Unpinning triggers (Spec 2)
         if m_total > 0 and T > 0:
             pin_byte_mask = _compute_pin_trigger_byte_mask(raw_bytes, doc_reset_mask)  # [B, T]
-            seg_id_flat, _, _, _ = ragged_local_offsets(sgsc_out.cu_seqlens, B * T)
-            seg_pin_trigger = (
-                ragged_segment_sum(
-                    pin_byte_mask.float().reshape(B * T, 1),
-                    seg_id_flat,
-                    m_total,
-                ).squeeze(-1)
-                > 0.5
-            ).float()  # [M_total]
+            unpin_byte_mask = _compute_unpin_trigger_byte_mask(raw_bytes)  # [B, T]
+            seg_id_flat, local_pos, _, _ = ragged_local_offsets(sgsc_out.cu_seqlens, B * T)
+            pos_pow = torch.pow(2.0, local_pos.clamp_max(22).float()).unsqueeze(-1)
+            pin_w = ragged_segment_sum(
+                pin_byte_mask.float().reshape(B * T, 1) * pos_pow,
+                seg_id_flat,
+                m_total,
+            ).squeeze(-1)
+            unpin_w = ragged_segment_sum(
+                unpin_byte_mask.float().reshape(B * T, 1) * pos_pow,
+                seg_id_flat,
+                m_total,
+            ).squeeze(-1)
+            seg_unpin_trigger = (unpin_w > 0.5).float()  # [M_total]
+            seg_pin_trigger = (pin_w > unpin_w).float()  # [M_total]
         else:
+            seg_unpin_trigger = torch.zeros((m_total,), device=device, dtype=torch.float32)
             seg_pin_trigger = torch.zeros((m_total,), device=device, dtype=torch.float32)
 
         seg_offsets = torch.zeros_like(seg_counts)
@@ -567,6 +580,7 @@ class DCPAModel(nn.Module):
                 # (alpha_1, theta_i, alpha_q, theta_q, alpha_out) always receive clean Turn-2 gradients.
                 eff_write_thresh = 0.0
 
+            use_cq = bool(use_broca_cq and stage in ("C", "D"))
             eval_isolated_path = (
                 (doc_cu_seqlens is not None) and (not self.training) and (graph_state is None) and (V <= 8)
             )
@@ -584,6 +598,7 @@ class DCPAModel(nn.Module):
             # (eliminates 2-3x straggler-tail wasted BCG-PC work & removes per-step torch.nonzero syncs!).
             use_prefix_shrink = bool(
                 (not hip_enabled)
+                and (not use_cq)
                 and (not eval_isolated_path)
                 and graph_state is None
                 and fast_state is None
@@ -695,6 +710,11 @@ class DCPAModel(nn.Module):
                 if eval_isolated_path
                 else None
             )
+            c_fused_flat: Optional[torch.Tensor] = (
+                torch.zeros((m_total, D), device=device, dtype=sgsc_out.c_slow.dtype)
+                if (eval_isolated_path and hip_enabled)
+                else None
+            )
 
             s_trace_flat = (
                 torch.zeros((m_total, K, D), device=device, dtype=sgsc_out.c_slow.dtype)
@@ -771,6 +791,12 @@ class DCPAModel(nn.Module):
                     )
                     l_reg_d = l_reg[d_idx : d_idx + 1]
                     pts_d = pts_base[d_idx : d_idx + 1]
+                    cq_q_cur = torch.sigmoid(gd.salience.float()) if use_cq else None
+                    cq_a_prev = (
+                        torch.zeros((1, self.cfg.k_slots, self.cfg.d_r), device=device, dtype=gd.edges.dtype)
+                        if use_cq
+                        else None
+                    )
                     for m_step in range(m_doc):
                         f_idx = d_off + m_step
                         f_step = sgsc_out.f_stem[f_idx : f_idx + 1]
@@ -778,6 +804,14 @@ class DCPAModel(nn.Module):
                         sn_step = sgsc_out.sem_norm[f_idx : f_idx + 1]
                         mi_step = sgsc_out.mean_info[f_idx : f_idx + 1]
                         trig_step = seg_pin_trigger[f_idx : f_idx + 1]
+                        if float(seg_unpin_trigger[f_idx].item()) > 0.5 and gd.slot0_pinned is not None:
+                            gd = ConceptGraphState(
+                                slots=gd.slots,
+                                edges=gd.edges,
+                                salience=gd.salience,
+                                slot0_pinned=torch.zeros_like(gd.slot0_pinned),
+                            )
+                        gd_prev = gd
 
                         hip_read = self.hippocampus.read_comprehension(
                             f_stem=f_step,
@@ -819,23 +853,51 @@ class DCPAModel(nn.Module):
                             win_pair_flat[f_idx, 2] = torch.minimum(wi, wj)
 
                         # Strictly causal expressive retrieval BEFORE segment-m hippocampal write:
-                        # PMD decodes segment m strictly from top-down prediction c_hat_m (G_{m-1})
-                        # and pre-write fast_state M_{m-1} (ZERO same-segment byte leakage!).
-                        f_out_step, _ = self.hippocampus.read_expression(
-                            z_out=bcg_out.c_hat,
-                            l_reg=l_reg_d,
-                            fast_state=fd if hip_enabled else None,
-                            enabled=hip_enabled,
-                        )
-                        delta_syn_step = self.pmd.compute_streaming_delta_syn(
-                            g_ctx=bcg_out.g_ctx,
-                            z_star=bcg_out.c_hat,
-                            l_reg=l_reg_d,
-                        )
+                        # Mode 2 (Broca CQ) queries strictly from pre-step G_{m-1} and pre-write M_{m-1};
+                        # Mode 1 queries from top-down prediction c_hat_m (G_{m-1}) and M_{m-1}.
+                        if use_cq:
+                            assert cq_q_cur is not None and cq_a_prev is not None
+                            q_init_d = torch.sigmoid(gd_prev.salience.float())
+                            if m_step % self.cfg.k_slots == 0:
+                                q_in_d = q_init_d
+                                a_in_d = torch.zeros_like(cq_a_prev)
+                            else:
+                                q_in_d = cq_q_cur
+                                a_in_d = cq_a_prev
+                            cq_out = self.pmd.broca_cq_step(
+                                graph=gd_prev,
+                                q_prev=q_in_d,
+                                q_init=q_init_d,
+                                a_prev=a_in_d,
+                                l_reg=l_reg_d,
+                            )
+                            cq_q_cur = cq_out.q_next
+                            cq_a_prev = cq_out.a_prev_next
+                            f_out_step, _ = self.hippocampus.read_expression(
+                                z_out=cq_out.z_out,
+                                l_reg=l_reg_d,
+                                fast_state=fd if hip_enabled else None,
+                                enabled=hip_enabled,
+                            )
+                            delta_syn_step = cq_out.delta_syn
+                        else:
+                            f_out_step, _ = self.hippocampus.read_expression(
+                                z_out=bcg_out.c_hat,
+                                l_reg=l_reg_d,
+                                fast_state=fd if hip_enabled else None,
+                                enabled=hip_enabled,
+                            )
+                            delta_syn_step = self.pmd.compute_streaming_delta_syn(
+                                g_ctx=bcg_out.g_ctx,
+                                z_star=bcg_out.c_hat,
+                                l_reg=l_reg_d,
+                            )
                         f_out_flat[f_idx] = f_out_step[0].to(f_out_flat.dtype)
                         delta_syn_flat[f_idx] = delta_syn_step[0].to(delta_syn_flat.dtype)
                         assert z_star_flat is not None
                         z_star_flat[f_idx] = bcg_out.z_star[0].to(z_star_flat.dtype)
+                        if hip_enabled and c_fused_flat is not None:
+                            c_fused_flat[f_idx] = hip_read.c_fused[0].detach().to(c_fused_flat.dtype)
 
                         if hip_enabled and fd is not None and ed is not None:
                             ed = self.hippocampus.inherit_eligibility_on_merge(
@@ -905,6 +967,7 @@ class DCPAModel(nn.Module):
                 delta_syn_chunks: list[torch.Tensor] = []
                 c_hat_chunks: list[torch.Tensor] = []
                 z_star_chunks: list[torch.Tensor] = []
+                c_fused_chunks: list[torch.Tensor] = []
                 g_ctx_chunks: list[torch.Tensor] = []
                 pi_m_chunks: list[torch.Tensor] = []
                 ponder_chunks: list[torch.Tensor] = []
@@ -943,6 +1006,12 @@ class DCPAModel(nn.Module):
                 finished_edges: list[torch.Tensor] = []
                 finished_sal: list[torch.Tensor] = []
                 finished_pin: list[torch.Tensor] = []
+                cq_q_cur: Optional[torch.Tensor] = torch.sigmoid(g_state.salience.float()) if use_cq else None
+                cq_a_prev: Optional[torch.Tensor] = (
+                    torch.zeros((V_eff, self.cfg.k_slots, self.cfg.d_r), device=device, dtype=g_state.edges.dtype)
+                    if use_cq
+                    else None
+                )
 
                 for m_step in range(m_max):
                     if use_prefix_shrink:
@@ -988,6 +1057,7 @@ class DCPAModel(nn.Module):
                     am_col_c = active_f.unsqueeze(-1).to(sgsc_out.c_slow.dtype)
                     c_step = sgsc_out.c_slow[safe_idx] * am_col_c
                     trig_step = seg_pin_trigger[safe_idx] * active_f
+                    unpin_step = (seg_unpin_trigger[safe_idx] * active_f) > 0.5
 
                     # Module 3 Read Path (hoisted zero-overhead cortical pass-through in Stages B/C!)
                     if hip_enabled:
@@ -1028,6 +1098,19 @@ class DCPAModel(nn.Module):
                         in_edges = g_state.edges
                         in_sal = g_state.salience
                     assert g_state.slot0_pinned is not None
+                    eff_slot0_pinned = torch.where(
+                        unpin_step, torch.zeros_like(g_state.slot0_pinned), g_state.slot0_pinned
+                    )
+                    g_prev_cq = (
+                        ConceptGraphState(
+                            slots=in_slots,
+                            edges=in_edges,
+                            salience=in_sal,
+                            slot0_pinned=eff_slot0_pinned,
+                        )
+                        if use_cq
+                        else None
+                    )
 
                     # Pre-sample 72-pair Gumbel uniform noise ONCE outside checkpointing:
                     #   1. Eliminates 100% of fork_rng CUDA generator save/restore syncs (`preserve_rng_state=False`).
@@ -1057,7 +1140,7 @@ class DCPAModel(nn.Module):
                             tau_m_t,
                             active_mask,
                             mix_t,
-                            g_state.slot0_pinned,
+                            eff_slot0_pinned,
                             trig_step,
                             w_gu1,
                             w_d1,
@@ -1081,7 +1164,7 @@ class DCPAModel(nn.Module):
                             tau_m_t,
                             active_mask,
                             mix_t,
-                            g_state.slot0_pinned,
+                            eff_slot0_pinned,
                             trig_step,
                             use_gumbel=self.training,
                             update_c0_ema=self.training,
@@ -1138,11 +1221,52 @@ class DCPAModel(nn.Module):
                         alpha_trace_flat[flat_idx] = merge_alpha_step[active_b].detach().float()
 
                     # Strictly causal expressive retrieval BEFORE segment-m hippocampal write:
-                    # - In Stage D (hip_enabled): fast_state mutates per step, so retrieve per step
-                    #   from pre-write fast_state M_{m-1} using causal top-down prediction c_hat_m!
-                    # - In Stages B/C (not hip_enabled): hoist both expression & L_PC/ponder reductions
-                    #   into ONE single vectorized pass after the loop!
-                    if hip_enabled:
+                    # - Mode 2 (use_cq): rolling causal Broca CQ from pre-step graph G_{m-1} and M_{m-1}.
+                    # - Mode 1 Stage D (hip_enabled): per-step retrieval from M_{m-1} via c_hat_m.
+                    # - Mode 1 Stages B/C: hoist expression & L_PC/ponder reductions into one pass after loop.
+                    if use_cq:
+                        assert g_prev_cq is not None and cq_q_cur is not None and cq_a_prev is not None
+                        q_init_step = torch.sigmoid(in_sal.float())
+                        if m_step % self.cfg.k_slots == 0:
+                            q_in_step = q_init_step
+                            a_in_step = torch.zeros_like(cq_a_prev)
+                        else:
+                            q_in_step = cq_q_cur
+                            a_in_step = cq_a_prev
+                        cq_out = self.pmd.broca_cq_step(
+                            graph=g_prev_cq,
+                            q_prev=q_in_step,
+                            q_init=q_init_step,
+                            a_prev=a_in_step,
+                            l_reg=l_reg_cur,
+                        )
+                        cq_q_cur = torch.where(active_mask.unsqueeze(-1), cq_out.q_next, cq_q_cur)
+                        cq_a_prev = torch.where(
+                            active_mask.view(-1, 1, 1),
+                            cq_out.a_prev_next.to(cq_a_prev.dtype),
+                            cq_a_prev,
+                        )
+                        f_cq_all, _ = self.hippocampus.read_expression(
+                            z_out=cq_out.z_out,
+                            l_reg=l_reg_cur,
+                            fast_state=f_state if hip_enabled else None,
+                            enabled=hip_enabled,
+                        )
+                        f_out_chunks.append(f_cq_all[active_b].to(sgsc_out.f_stem.dtype))
+                        delta_syn_chunks.append(cq_out.delta_syn[active_b].to(sgsc_out.f_stem.dtype))
+                        if hip_enabled:
+                            z_star_chunks.append(z_star_step[active_b].detach())
+                            c_fused_chunks.append(c_fused_step[active_b].detach())
+                        else:
+                            c_hat_chunks.append(c_hat_step[active_b])
+                            z_star_chunks.append(z_star_step[active_b])
+                            g_ctx_chunks.append(g_ctx_step[active_b])
+                            pi_m_chunks.append(pi_m_step[active_b])
+                            ponder_chunks.append(ponder_step[active_b])
+                            pts_chunks.append(pts_cur[active_b])
+                            merge_probs_chunks.append(merge_probs_step[active_b])
+                            moe_bal_chunks.append(moe_bal_step)
+                    elif hip_enabled:
                         f_out_all, _ = self.hippocampus.read_expression(
                             z_out=c_hat_step,
                             l_reg=l_reg_cur,
@@ -1157,6 +1281,8 @@ class DCPAModel(nn.Module):
                         )
                         f_out_chunks.append(f_out_step.to(sgsc_out.f_stem.dtype))
                         delta_syn_chunks.append(delta_syn_step.to(sgsc_out.f_stem.dtype))
+                        z_star_chunks.append(z_star_step[active_b].detach())
+                        c_fused_chunks.append(c_fused_step[active_b].detach())
                     else:
                         c_hat_chunks.append(c_hat_step[active_b])
                         z_star_chunks.append(z_star_step[active_b])
@@ -1234,25 +1360,30 @@ class DCPAModel(nn.Module):
                     if hip_enabled:
                         f_out_flat = torch.cat(f_out_chunks, dim=0)[inv_perm]
                         delta_syn_flat = torch.cat(delta_syn_chunks, dim=0)[inv_perm]
-                        z_star_flat = None
+                        z_star_flat = torch.cat(z_star_chunks, dim=0)[inv_perm]
+                        c_fused_flat = torch.cat(c_fused_chunks, dim=0)[inv_perm]
                     else:
                         c_hat_all_ord = torch.cat(c_hat_chunks, dim=0)
                         c_hat_flat = c_hat_all_ord[inv_perm]
                         z_star_flat = torch.cat(z_star_chunks, dim=0)[inv_perm]
                         g_ctx_flat = torch.cat(g_ctx_chunks, dim=0)[inv_perm]
-                        f_out_all_flat, _ = self.hippocampus.read_expression(
-                            z_out=c_hat_flat,
-                            l_reg=l_reg_seg,
-                            fast_state=None,
-                            enabled=False,
-                        )
-                        delta_syn_all_flat = self.pmd.compute_streaming_delta_syn(
-                            g_ctx=g_ctx_flat,
-                            z_star=c_hat_flat,
-                            l_reg=l_reg_seg,
-                        )
-                        f_out_flat = f_out_all_flat.to(sgsc_out.f_stem.dtype)
-                        delta_syn_flat = delta_syn_all_flat.to(sgsc_out.f_stem.dtype)
+                        if use_cq:
+                            f_out_flat = torch.cat(f_out_chunks, dim=0)[inv_perm]
+                            delta_syn_flat = torch.cat(delta_syn_chunks, dim=0)[inv_perm]
+                        else:
+                            f_out_all_flat, _ = self.hippocampus.read_expression(
+                                z_out=c_hat_flat,
+                                l_reg=l_reg_seg,
+                                fast_state=None,
+                                enabled=False,
+                            )
+                            delta_syn_all_flat = self.pmd.compute_streaming_delta_syn(
+                                g_ctx=g_ctx_flat,
+                                z_star=c_hat_flat,
+                                l_reg=l_reg_seg,
+                            )
+                            f_out_flat = f_out_all_flat.to(sgsc_out.f_stem.dtype)
+                            delta_syn_flat = delta_syn_all_flat.to(sgsc_out.f_stem.dtype)
                         with fp32_island(device):
                             c_target_all = sgsc_out.c_slow.detach().float()[order]
                             c_pred_all = c_hat_all_ord.float()
@@ -1327,9 +1458,11 @@ class DCPAModel(nn.Module):
             denom = max(total_valid_steps, 1)
             lam_pc = 1.0 if lambda_pc_override is None else float(lambda_pc_override)
             lam_act = self.cfg.lambda_act if lambda_act_override is None else float(lambda_act_override)
-            # Lightweight scale-invariant stem-alignment anchor (Stages B/C):
-            # keeps w_lex_slow(z_star) calibrated to Stage-1 f_stem space for Broca CQ & Stage D
-            # hippocampal expression without leaking a single bit of c_slow[m] into causal L_lang!
+            # Lightweight scale-invariant stem-alignment anchor (Stages B/C) and generative W_gen anchor:
+            # keeps w_lex_slow(z_star) calibrated to Stage-1 f_stem space in Stages B/C, AND keeps
+            # W_gen calibrated to reconstruct c_slow / c_fused from z_star across Stages B/C & D/SFT
+            # (stop-grad on BOTH targets & z_star -> trains ONLY W_gen so AdamW weight_decay never collapses it!).
+            bcg_mod = getattr(self.bcg_pc, "_orig_mod", self.bcg_pc)
             if (not hip_enabled) and m_total > 0 and z_star_flat is not None:
                 f_z_align, _ = self.hippocampus.read_expression(
                     z_out=z_star_flat,
@@ -1344,16 +1477,21 @@ class DCPAModel(nn.Module):
                             f_z_align.float(), sgsc_out.f_stem.detach().float(), dim=-1, eps=1e-6
                         )
                     ).mean()
-                    # Keep generative decoder W_gen calibrated to reconstruct c_slow from z_star
-                    # (stop-grad on BOTH c_slow and z_star -> trains ONLY W_gen so AdamW weight_decay
-                    # never shrinks W_gen toward 0 and locks pondering into 0/8 binary mode!).
-                    bcg_mod = getattr(self.bcg_pc, "_orig_mod", self.bcg_pc)
+            if m_total > 0 and z_star_flat is not None and (
+                (not hip_enabled) or (self.training and bcg_mod.w_gen.weight.requires_grad)
+            ):
+                with fp32_island(device):
+                    c_align_target = (
+                        c_fused_flat.detach().float()
+                        if (hip_enabled and c_fused_flat is not None)
+                        else sgsc_out.c_slow.detach().float()
+                    )
                     c_gen_pred = F.linear(
                         z_star_flat.detach().float(),
                         bcg_mod.w_gen.weight.float(),
                         bcg_mod.w_gen.bias.float() if bcg_mod.w_gen.bias is not None else None,
                     )
-                    loss_gen_align = 0.05 * (sgsc_out.c_slow.detach().float() - c_gen_pred).pow(2).mean()
+                    loss_gen_align = 0.05 * (c_align_target - c_gen_pred).pow(2).mean()
             with fp32_island(device):
                 raw_pc_nll = pc_nll_sum / denom
                 loss_pc_raw = float(raw_pc_nll.detach().item())
@@ -1387,43 +1525,9 @@ class DCPAModel(nn.Module):
             if beta_count > 0:
                 mean_beta_val = beta_sum / beta_count
 
-            # Mode 2 (Stage C/D Broca CQ graph linearization) vs Mode 1 (Streaming Reconstruction)
-            if use_broca_cq and stage in ("C", "D"):
-                q_init = torch.sigmoid(g_state.salience.float())
-                q_cur = q_init
-                a_prev = torch.zeros((V, self.cfg.k_slots, self.cfg.d_r), device=device, dtype=g_state.edges.dtype)
-                cq_f_out = f_out_flat.clone()
-                cq_delta_syn = delta_syn_flat.clone()
-                seg_counts_i64 = seg_counts.to(torch.int64)
-                cq_win_len = seg_counts_i64.clamp_max(self.cfg.k_slots)
-                cq_tail_start = (seg_counts_i64 - cq_win_len).clamp_min(0)
-                for n_step in range(min(self.cfg.k_slots, m_max)):
-                    cq_out = self.pmd.broca_cq_step(
-                        graph=g_state,
-                        q_prev=q_cur,
-                        q_init=q_init,
-                        a_prev=a_prev,
-                        l_reg=l_reg,
-                    )
-                    q_cur = cq_out.q_next
-                    a_prev = cq_out.a_prev_next
-                    active_b = torch.nonzero(n_step < cq_win_len, as_tuple=False).squeeze(-1)
-                    if active_b.numel() > 0:
-                        f_cq_all, _ = self.hippocampus.read_expression(
-                            z_out=cq_out.z_out,
-                            l_reg=l_reg,
-                            fast_state=f_state if hip_enabled else None,
-                            enabled=hip_enabled,
-                        )
-                        f_cq = f_cq_all[active_b]
-                        flat_idx = seg_offsets[active_b].to(torch.int64) + cq_tail_start[active_b] + n_step
-                        cq_f_out[flat_idx] = f_cq.to(cq_f_out.dtype)
-                        cq_delta_syn[flat_idx] = cq_out.delta_syn[active_b].to(cq_delta_syn.dtype)
-                f_decode = cq_f_out
-                d_decode = cq_delta_syn
-            else:
-                f_decode = f_out_flat
-                d_decode = delta_syn_flat
+            # Decoding features are already strictly causal from Mode 1 or rolling causal Mode 2 (Broca CQ)
+            f_decode = f_out_flat
+            d_decode = delta_syn_flat
 
             pmd_out = self.pmd.decode_teacher_forced(
                 target_bytes=raw_bytes,

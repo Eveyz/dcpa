@@ -319,6 +319,129 @@ pub struct DcpaWeights {
     pub pmd_w_drain_b: f32,
 }
 
+#[cfg(test)]
+impl DcpaWeights {
+    pub fn dummy_for_test(cfg: DcpaConfig) -> Self {
+        let fill = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i + seed) % 11) as f32 - 5.0) * 0.04)
+                .collect()
+        };
+        let d_s = cfg.d_s;
+        let d = cfg.d_concept;
+        let k = cfg.k_slots;
+        let d_r = cfg.d_r;
+        let d_m = cfg.d_merge;
+        let d_h = cfg.d_h;
+        let d_l = cfg.d_l;
+        let eh = cfg.expert_hidden;
+        let mut experts = Vec::with_capacity(cfg.num_experts);
+        for e in 0..cfg.num_experts {
+            experts.push(ExpertWeights {
+                w_gate1: ExpertMatrix::F32(fill(eh * d, e + 1)),
+                w_up1: ExpertMatrix::F32(fill(eh * d, e + 2)),
+                w_down1: ExpertMatrix::F32(fill(d * eh, e + 3)),
+                w_gate2: ExpertMatrix::F32(fill(eh * d, e + 4)),
+                w_up2: ExpertMatrix::F32(fill(eh * d, e + 5)),
+                w_down2: ExpertMatrix::F32(fill(d * eh, e + 6)),
+            });
+        }
+        Self {
+            sgsc_embed: fill(256 * d_s, 11),
+            sgsc_w_out: fill(256 * d_s, 13),
+            sgsc_h0: fill(d_s, 17),
+            sgsc_w_alpha: fill(d_s * d_s, 19),
+            sgsc_b_alpha: fill(d_s, 23),
+            sgsc_w_u: fill(d_s * d_s, 29),
+            sgsc_theta_raw: 0.5,
+            sgsc_w_q: fill(d_s * d_s, 31),
+            sgsc_w_k: fill(d_s * d_s, 37),
+            sgsc_w_f: fill(d_s * d_s, 41),
+            sgsc_norm_f: alloc::vec![1.0f32; d_s],
+            sgsc_w_res: fill(d * d_s, 43),
+            sgsc_w_sem: fill(d * d_s, 47),
+            sgsc_norm_c: alloc::vec![1.0f32; d],
+            bcg_s0: fill(k * d, 53),
+            bcg_a0: fill(k * k * d_r, 59),
+            bcg_omega0: alloc::vec![0.0f32; k],
+            bcg_c0: fill(d, 61),
+            bcg_w_e: fill(d * d_r, 67),
+            bcg_f_pred_1_w: fill(d * d, 71),
+            bcg_f_pred_1_b: fill(d, 73),
+            bcg_f_pred_2_w: fill(d * d, 79),
+            bcg_f_pred_2_b: fill(d, 83),
+            bcg_f_prec_1_w: fill(d * d, 89),
+            bcg_f_prec_1_b: fill(d, 97),
+            bcg_f_prec_2_w: fill(d * d, 101),
+            bcg_f_prec_2_b: fill(d, 103),
+            bcg_w_fast: fill(d * d, 107),
+            bcg_w_gen: fill(d * d, 109),
+            bcg_ca_wq: fill(d * d, 113),
+            bcg_ca_wk: fill(d * d, 127),
+            bcg_ca_wv: fill(d * d, 131),
+            bcg_ca_wo: fill(d * d, 137),
+            bcg_moe_router: fill(cfg.num_experts * d, 139),
+            bcg_experts: experts,
+            bcg_norm_ponder: alloc::vec![1.0f32; d],
+            bcg_u_src: fill(d_r * d, 149),
+            bcg_u_dst: fill(d_r * d, 151),
+            bcg_w_l: fill(d_m * d, 157),
+            bcg_w_r: fill(d_m * d, 163),
+            bcg_w_edge_score: fill(d_m * d_r, 167),
+            bcg_w_merge: fill(d_m, 173),
+            bcg_w_g_w: fill(d * (2 * d + d_r), 179),
+            bcg_w_g_b: fill(d, 181),
+            bcg_w_comp_w: fill(d * 2 * d, 191),
+            bcg_w_comp_b: fill(d, 193),
+            bcg_norm_merge: alloc::vec![1.0f32; d],
+            bcg_w_omega: fill(d, 197),
+            bcg_kappa_omega: 0.5,
+            hip_r_lex: fill(d_h * d_s, 199),
+            hip_r_sem: fill(d_h * d, 211),
+            hip_alpha_1: 1.0,
+            hip_alpha_2: 1.0,
+            hip_theta_i: 2.0,
+            hip_theta_n: 1.0,
+            hip_alpha_q: 1.0,
+            hip_gamma_e: 0.5,
+            hip_theta_q: 0.5,
+            hip_alpha_out: 1.0,
+            hip_theta_out: 0.5,
+            hip_f_prec_cort_w: fill(d * d, 223),
+            hip_f_prec_cort_b: fill(d, 227),
+            hip_w_lex_slow: fill(d_s * d, 229),
+            hip_w_lang_lex: fill(d * d_l, 233),
+            pmd_lang_embed: fill(cfg.num_lang_domains * (d_l / 2), 239),
+            pmd_style_embed: fill(cfg.num_style_domains * (d_l / 2), 241),
+            pmd_norm_lang: alloc::vec![1.0f32; d_l / 2],
+            pmd_norm_style: alloc::vec![1.0f32; d_l / 2],
+            pmd_w_ord: fill(d_r * d_l, 251),
+            pmd_w_coh: fill(d_r * d_l, 257),
+            pmd_w_syn_w: fill(d_s * (d_r + d_l), 263),
+            pmd_w_syn_b: fill(d_s, 269),
+            pmd_u_syn: fill(d_s * d, 271),
+            pmd_w_ctx_role: fill(d_r * d, 277),
+            pmd_u_demod: fill(d_s * d_s, 281),
+            pmd_w_chi_w: fill(3 * d_s, 283),
+            pmd_w_chi_b: 1.0,
+            pmd_w_act_w: fill(3 * (d_s + d_l), 293),
+            pmd_w_act_b: alloc::vec![-1.5, -1.5, 2.0],
+            pmd_w_tag_w: fill(4 * d_s, 307),
+            pmd_w_tag_b: fill(4, 311),
+            pmd_w_st: fill(d_s * 8, 313),
+            pmd_m0: fill(d_s, 317),
+            pmd_w_alpha_mot_w: fill(d_s * d_s, 331),
+            pmd_w_alpha_mot_b: fill(d_s, 337),
+            pmd_w_m: fill(d_s * d_s, 347),
+            pmd_w_e_init_w: fill(2 * d_s + d_l, 349),
+            pmd_w_e_init_b: 2.5,
+            pmd_w_drain_w: fill(2 * d_s, 353),
+            pmd_w_drain_b: -0.5,
+            cfg,
+        }
+    }
+}
+
 #[cfg(feature = "std")]
 fn take_vec(map: &mut BTreeMap<String, RawTensor>, k: &str) -> Result<Vec<f32>, String> {
     map.remove(k)

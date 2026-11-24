@@ -174,9 +174,10 @@ for name in names:
         raise SystemExit(f"ERROR: Forbidden artifact leaked into bundle: {name}")
 
 required = [
-    "configs/dcpa_48m_train.yaml",
-    "configs/dcpa_210m_moe.yaml",
-    "configs/dcpa_210m_v2_cognitive.yaml",
+    "configs/v1/dcpa_48m_train.yaml",
+    "configs/v1/dcpa_210m_moe.yaml",
+    "configs/v2/dcpa_48m_v2_cognitive.yaml",
+    "configs/v2/dcpa_210m_v2_cognitive.yaml",
     "utils/device.py",
     "utils/chat_protocol.py",
     "data/build_corpus.py",

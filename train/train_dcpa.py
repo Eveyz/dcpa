@@ -97,6 +97,7 @@ from utils.distributed import (
     cleanup_distributed_context,
     dist_barrier,
     init_distributed_context,
+    maybe_relaunch_distributed,
     sync_bool_any,
     sync_tensor_avg_,
 )
@@ -808,26 +809,31 @@ def run_training(
                 ),
                 flush=True,
             )
-        # Hardware detection & auto grad-accum sharding (Iron Law #1 + Deliverable 1)
+        # Hardware detection & auto grad-accum sharding (1 GPU <-> N GPUs unified!)
+        yaml_per_gpu_bytes = hw_cfg.get("per_gpu_tokens_bytes_per_step")
         yaml_target_bytes = hw_cfg.get("target_tokens_bytes_per_step")
         cuda_target_active = (
             device_str == "cuda"
             or device_str.startswith("cuda:")
             or (device_str == "auto" and torch.cuda.is_available())
         )
-        explicit_target_bytes = (
-            int(target_tokens_bytes_per_step)
-            if target_tokens_bytes_per_step is not None
-            else (
-                int(yaml_target_bytes)
-                if (
-                    yaml_target_bytes is not None
-                    and int(yaml_target_bytes) != DEFAULT_PROD_STEP_BYTES
-                    and cuda_target_active
-                )
-                else None
+        eff_fixed_global = bool(fixed_global_batch or hw_cfg.get("fixed_global_batch", False))
+        explicit_target_bytes: Optional[int]
+        if target_tokens_bytes_per_step is not None:
+            explicit_target_bytes = int(target_tokens_bytes_per_step)
+        elif yaml_per_gpu_bytes is not None and cuda_target_active and not eff_fixed_global:
+            explicit_target_bytes = (
+                int(yaml_per_gpu_bytes) if int(yaml_per_gpu_bytes) != DEFAULT_PROD_STEP_BYTES else None
             )
-        )
+        elif (
+            yaml_target_bytes is not None
+            and int(yaml_target_bytes) != DEFAULT_PROD_STEP_BYTES
+            and cuda_target_active
+        ):
+            explicit_target_bytes = int(yaml_target_bytes)
+        else:
+            explicit_target_bytes = None
+
         profile = detect_hardware_profile(
             preferred=device_str,
             deterministic=deterministic,
@@ -847,14 +853,23 @@ def run_training(
             if target_tokens_bytes_per_step is not None
             else int(profile.target_tokens_bytes_per_step)
         )
-        eff_fixed_global = bool(fixed_global_batch or hw_cfg.get("fixed_global_batch", False))
         if dist_ctx.is_distributed:
-            if eff_fixed_global or eff_target_bytes >= int(profile.micro_batch_bytes) * dist_ctx.world_size:
+            if (
+                eff_fixed_global
+                or (
+                    target_tokens_bytes_per_step is not None
+                    and eff_target_bytes >= int(profile.micro_batch_bytes) * dist_ctx.world_size
+                )
+                or (
+                    yaml_per_gpu_bytes is None
+                    and eff_target_bytes >= int(profile.micro_batch_bytes) * dist_ctx.world_size
+                )
+            ):
                 # Partition target global byte budget evenly across ranks (zero GPU starvation when >= W * micro!)
                 per_rank_target = max(64, math.ceil(eff_target_bytes / dist_ctx.world_size))
             else:
-                # Never starve GPUs when running a single-GPU config under torchrun: saturate each GPU!
-                per_rank_target = max(int(profile.micro_batch_bytes), math.ceil(eff_target_bytes / dist_ctx.world_size))
+                # Per-GPU throughput scaling: each GPU runs its full per-GPU step budget (131 KB x W GPUs!)
+                per_rank_target = max(int(profile.micro_batch_bytes), eff_target_bytes)
         else:
             per_rank_target = eff_target_bytes
 
@@ -868,11 +883,23 @@ def run_training(
         per_rank_step_bytes = eff_micro_bytes * grad_accum_steps
         actual_step_bytes = per_rank_step_bytes * dist_ctx.world_size
 
-        # Optional sqrt-batch LR scaling when multi-GPU auto-expands global batch beyond YAML target
+        # Bidirectional sqrt-batch LR scaling across 1..N GPUs relative to `lr_reference_bytes`
         eff_auto_lr = bool(auto_lr_scale and hw_cfg.get("auto_lr_scale_multi_gpu", True) and not eff_fixed_global)
+        lr_ref_cfg = opt_cfg.get("lr_reference_bytes")
+        lr_ref_bytes = (
+            int(lr_ref_cfg)
+            if (lr_ref_cfg is not None and device.type == "cuda" and target_tokens_bytes_per_step is None)
+            else int(eff_target_bytes)
+        )
         lr_batch_scale = 1.0
-        if dist_ctx.is_distributed and eff_auto_lr and actual_step_bytes > eff_target_bytes:
-            lr_batch_scale = min(2.5, math.sqrt(float(actual_step_bytes) / float(max(eff_target_bytes, 1))))
+        if eff_auto_lr and lr_ref_bytes > 0 and (
+            (dist_ctx.is_distributed and actual_step_bytes != lr_ref_bytes)
+            or (lr_ref_cfg is not None and device.type == "cuda" and actual_step_bytes != lr_ref_bytes)
+        ):
+            lr_batch_scale = min(
+                2.5,
+                max(0.45, math.sqrt(float(actual_step_bytes) / float(max(lr_ref_bytes, 1)))),
+            )
             scaled_groups: dict[str, dict[str, Any]] = {}
             base_groups = dict(opt_cfg.get("groups", {}))
             for g_name, g_vals in base_groups.items():
@@ -1645,6 +1672,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--resume", type=str, default="auto")
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument(
+        "--gpus",
+        type=str,
+        default="auto",
+        help="GPU count: 'auto' (all visible GPUs; 1 process if <=1 GPU), '1' (force single-GPU), or N (e.g. 2, 4, 8).",
+    )
+    ap.add_argument(
+        "--gpu-ids",
+        type=str,
+        default=None,
+        help="Optional comma-separated physical GPU IDs (e.g. '2' for single GPU #2, or '0,2' for 2 GPUs).",
+    )
+    ap.add_argument(
         "--compile-mode",
         choices=["none", "auto", "reduce-overhead"],
         default=None,
@@ -1660,6 +1699,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    spawn_rc = maybe_relaunch_distributed(
+        __file__,
+        sys.argv[1:],
+        gpus=args.gpus,
+        gpu_ids=args.gpu_ids,
+        device=args.device,
+    )
+    if spawn_rc is not None:
+        sys.exit(spawn_rc)
+
     bounds = _parse_int_tuple(args.stage_boundaries, ()) if args.stage_boundaries else None
     m_steps = _parse_int_tuple(args.milestone_steps, MILESTONE_STEPS) if args.milestone_steps else None
     try:

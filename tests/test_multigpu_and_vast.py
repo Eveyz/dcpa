@@ -575,3 +575,169 @@ def test_cap_instruct_and_js_reasoning_offline_builders_and_sidecar_mask(tmp_pat
         assert bool(lmask.any().item()), "Sidecar .loss_mask.bin masked out all Assistant bytes!"
     finally:
         ds_cap.close()
+
+
+def test_unified_cli_single_to_multi_to_single_gpu_switch(tmp_path: Path) -> None:
+    """End-to-end test of seamless `--gpus 1 <-> --gpus 2` switching using the SAME command,
+    SAME `configs/dcpa_unified.yaml`, and SAME checkpoint directory (zero manual `torchrun`).
+    """
+    data_dir = tmp_path / "data"
+    _write_synthetic_multitier_corpus(data_dir)
+    sft_dir = tmp_path / "sft_data"
+    build_stage5_sft_corpus(out_dir=sft_dir, smoke_quota=True, offline=True, seed=123)
+
+    nvme_dir = tmp_path / "nvme"
+    ckpt_dir = tmp_path / "ckpts"
+    logs_dir = tmp_path / "logs"
+    export_dir = tmp_path / "export"
+
+    base_env = os.environ.copy()
+    for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "LOCAL_RANK", "WORLD_SIZE", "DCPA_DIST_WORKER"):
+        base_env.pop(k, None)
+    base_env["PYTHONPATH"] = f"{REPO_ROOT}:{TRAIN_PY}"
+
+    common_args = [
+        sys.executable,
+        str(REPO_ROOT / "train" / "train_dcpa.py"),
+        "--config",
+        str(REPO_ROOT / "configs" / "dcpa_unified.yaml"),
+        "--preset",
+        "micro",
+        "--device",
+        "cpu",
+        "--compile-mode",
+        "none",
+        "--stage-boundaries",
+        "0,2,4,6,8",
+        "--target-tokens-bytes-per-step",
+        "256",
+        "--micro-batch-bytes",
+        "256",
+        "--data-dir",
+        str(data_dir),
+        "--local-cache-dir",
+        str(nvme_dir),
+        "--ckpt-dir",
+        str(ckpt_dir),
+        "--logs-dir",
+        str(logs_dir),
+        "--export-dir",
+        str(export_dir),
+        "--save-every-steps",
+        "3",
+        "--probe-every-steps",
+        "100",
+        "--console-every-steps",
+        "2",
+    ]
+
+    # Phase 1: Single-process (`--gpus 1`) up to step 3
+    r1 = subprocess.run(
+        [*common_args, "--gpus", "1", "--total-steps", "3", "--resume", "none", "--no-export"],
+        cwd=str(REPO_ROOT),
+        env=base_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "[Launcher]" not in r1.stdout
+    ckpt_s3 = torch.load(ckpt_dir / "last_healthy.pt", map_location="cpu", weights_only=False)
+    assert int(ckpt_s3["step"]) == 3
+    phys_s3 = int(ckpt_s3["dataloader_cursor"]["phys_offset"])
+
+    # Phase 2: Switch directly to 2-process Multi-GPU (`--gpus 2`) -> auto-spawns torchrun & resumes step 3..6!
+    r2 = subprocess.run(
+        [*common_args, "--gpus", "2", "--total-steps", "6", "--resume", "auto", "--no-export"],
+        cwd=str(REPO_ROOT),
+        env=base_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "[Launcher] Multi-process mode: spawning 2 workers" in r2.stdout
+    ckpt_s6 = torch.load(ckpt_dir / "last_healthy.pt", map_location="cpu", weights_only=False)
+    assert int(ckpt_s6["step"]) == 6
+    phys_s6 = int(ckpt_s6["dataloader_cursor"]["phys_offset"])
+    assert phys_s6 >= phys_s3 + 3 * 2, f"Expected monotonic 2-worker phys_offset advance: {phys_s3} -> {phys_s6}"
+
+    # Phase 3: Switch BACK to Single-process (`--gpus 1`) -> resumes step 6..8 & exports safetensors!
+    r3 = subprocess.run(
+        [*common_args, "--gpus", "1", "--total-steps", "8", "--resume", "auto"],
+        cwd=str(REPO_ROOT),
+        env=base_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "[Launcher]" not in r3.stdout
+    assert (export_dir / "dcpa_final.safetensors").is_file()
+
+    # Phase 4: Stage 5 SFT auto-spawning 2 workers via `--gpus 2` (zero manual torchrun!)
+    sft_export = tmp_path / "sft_export"
+    r4 = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "train" / "train_stage5_sft.py"),
+            "--gpus",
+            "2",
+            "--device",
+            "cpu",
+            "--compile-mode",
+            "none",
+            "--weights",
+            str(export_dir / "dcpa_final.safetensors"),
+            "--config",
+            str(export_dir / "config.json"),
+            "--data-dir",
+            str(sft_dir),
+            "--export-dir",
+            str(sft_export),
+            "--total-steps",
+            "2",
+            "--target-tokens-bytes-per-step",
+            "512",
+            "--micro-batch-bytes",
+            "256",
+            "--max-doc-bytes",
+            "512",
+            "--log-every",
+            "1",
+        ],
+        cwd=str(REPO_ROOT),
+        env=base_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "[Launcher] Multi-process mode: spawning 2 workers" in r4.stdout
+    assert (sft_export / "dcpa_chat_sft.safetensors").is_file()
+
+    # Phase 5: Unified `scripts/train.sh` dry-run for both `--gpus=1` and `--gpus=4 --gpu-ids=0,1,2,3`
+    dry_1 = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "train.sh"), "--gpus=1", "--dry-run", f"--nvme-dir={nvme_dir}"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "Single-GPU / Single-Process" in dry_1.stdout
+    assert "--gpus 1" in dry_1.stdout
+    assert "dcpa_unified.yaml" in dry_1.stdout
+
+    dry_4 = subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "scripts" / "train.sh"),
+            "--gpus=4",
+            "--gpu-ids=0,1,2,3",
+            "--dry-run",
+            f"--nvme-dir={nvme_dir}",
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "Multi-GPU (4 GPUs)" in dry_4.stdout
+    assert "--gpus 4 --gpu-ids 0,1,2,3" in dry_4.stdout
+    assert "--preset moe_2_6b" in dry_4.stdout

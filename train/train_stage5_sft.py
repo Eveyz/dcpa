@@ -63,6 +63,7 @@ from utils.distributed import (
     cleanup_distributed_context,
     dist_barrier,
     init_distributed_context,
+    maybe_relaunch_distributed,
     sync_bool_any,
     sync_tensor_avg_,
 )
@@ -292,6 +293,7 @@ def run_stage5_sft(
     warmup_steps: Optional[int] = None,
     target_tokens_bytes_per_step: int = 65536,
     micro_batch_bytes: Optional[int] = None,
+    fixed_global_batch: bool = False,
     max_doc_bytes: int = 2048,
     eot_weight: float = 2.0,
     tool_ctrl_weight: float = 2.5,
@@ -324,7 +326,15 @@ def run_stage5_sft(
     use_bf16 = bool(profile.use_bf16 and not deterministic)
 
     if dist_ctx.is_distributed:
-        per_rank_target = max(128, math.ceil(int(target_tokens_bytes_per_step) / dist_ctx.world_size))
+        if (
+            fixed_global_batch
+            or int(target_tokens_bytes_per_step) >= 65536 * dist_ctx.world_size
+            or int(target_tokens_bytes_per_step) < 65536
+        ):
+            per_rank_target = max(128, math.ceil(int(target_tokens_bytes_per_step) / dist_ctx.world_size))
+        else:
+            # Default 64 KB/GPU per-rank scaling across N GPUs without starving GPUs!
+            per_rank_target = int(target_tokens_bytes_per_step)
     else:
         per_rank_target = max(128, int(target_tokens_bytes_per_step))
 
@@ -577,12 +587,39 @@ def main() -> None:
     ap.add_argument("--warmup-steps", type=int, default=None)
     ap.add_argument("--target-tokens-bytes-per-step", type=int, default=65536)
     ap.add_argument("--micro-batch-bytes", type=int, default=None)
+    ap.add_argument(
+        "--fixed-global-batch",
+        action="store_true",
+        help="Keep exact global step bytes across ranks instead of scaling 64 KB per GPU.",
+    )
     ap.add_argument("--max-doc-bytes", type=int, default=2048)
     ap.add_argument("--device", type=str, default="auto")
+    ap.add_argument(
+        "--gpus",
+        type=str,
+        default="auto",
+        help="GPU count: 'auto' (all visible GPUs; 1 process if <=1 GPU), '1' (force single-GPU), or N (e.g. 2, 4, 8).",
+    )
+    ap.add_argument(
+        "--gpu-ids",
+        type=str,
+        default=None,
+        help="Optional comma-separated physical GPU IDs (e.g. '2' or '0,2').",
+    )
     ap.add_argument("--compile-mode", choices=["none", "auto", "reduce-overhead"], default="auto")
     ap.add_argument("--seed", type=int, default=202605)
     ap.add_argument("--log-every", type=int, default=50)
     args = ap.parse_args()
+
+    spawn_rc = maybe_relaunch_distributed(
+        __file__,
+        sys.argv[1:],
+        gpus=args.gpus,
+        gpu_ids=args.gpu_ids,
+        device=args.device,
+    )
+    if spawn_rc is not None:
+        sys.exit(spawn_rc)
 
     run_stage5_sft(
         weights_path=args.weights,
@@ -595,6 +632,7 @@ def main() -> None:
         warmup_steps=args.warmup_steps,
         target_tokens_bytes_per_step=args.target_tokens_bytes_per_step,
         micro_batch_bytes=args.micro_batch_bytes,
+        fixed_global_batch=args.fixed_global_batch,
         max_doc_bytes=args.max_doc_bytes,
         device_str=args.device,
         compile_mode=args.compile_mode,

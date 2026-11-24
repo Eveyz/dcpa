@@ -135,10 +135,58 @@ presets:
     tau_halt: 0.22
     lambda_act: 0.01
     lambda_moe_bal: 0.01
+  standard_152m:
+    d_s: 192
+    d_concept: 768
+    k_slots: 8
+    d_r: 32
+    d_merge: 256
+    d_h: 4096
+    s_active: 32
+    d_l: 64
+    num_experts: 16
+    top_k_experts: 2
+    expert_hidden: 1920
+    l_max: 8
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
+    lambda_moe_bal: 0.01
+  proto_48m:
+    d_s: 128
+    d_concept: 512
+    k_slots: 8
+    d_r: 32
+    d_merge: 192
+    d_h: 2048
+    s_active: 32
+    d_l: 64
+    num_experts: 8
+    top_k_experts: 2
+    expert_hidden: 1024
+    l_max: 8
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
+    lambda_moe_bal: 0.01
+  micro:
+    d_s: 64
+    d_concept: 128
+    k_slots: 8
+    d_r: 32
+    d_merge: 64
+    d_h: 512
+    s_active: 16
+    d_l: 64
+    num_experts: 4
+    top_k_experts: 2
+    expert_hidden: 192
+    l_max: 4
 
 hardware:
-  target_tokens_bytes_per_step: 524288     # 512 KB/step global = 131,072 B/GPU x 4x A100 (grad_accum=1)
-  fixed_global_batch: false                # Auto-expands if launched on 8x A100 without starving GPUs
+  per_gpu_tokens_bytes_per_step: 131072    # 128 KB/GPU -> 128 KB on 1 GPU, 256 KB on 2 GPUs, 512 KB on 4 GPUs!
+  target_tokens_bytes_per_step: 524288     # Nominal 4x A100 global budget when --fixed-global-batch is requested
+  fixed_global_batch: false                # Seamlessly scales 1..8 GPUs without forcing 4x grad_accum on 1 GPU
   auto_lr_scale_multi_gpu: true
   bf16_grad_comm: true
   length_bucketing: true
@@ -157,6 +205,7 @@ optimizer:
   betas: [0.9, 0.95]
   eps: 1.0e-8
   grad_clip_norm: 1.0
+  lr_reference_bytes: 524288               # Bidirectional sqrt(B/512KB) scaling: 1 GPU -> 1.9e-4, 4 GPUs -> 3.8e-4, 8 GPUs -> 5.37e-4
   groups:
     group_matrix_decay:
       lr: 3.8e-4                           # Spectral-safe sqrt-batch + width-scaled LR for d_concept=2048 @ 512 KB/step

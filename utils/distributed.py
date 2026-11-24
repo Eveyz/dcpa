@@ -20,11 +20,195 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 import os
+from pathlib import Path
+import signal
+import socket
+import subprocess
+import sys
+import time
 from typing import Mapping, Optional, Sequence
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+
+def resolve_requested_gpu_plan(
+    gpus: str | int = "auto",
+    gpu_ids: Optional[str] = None,
+    device: str = "auto",
+) -> tuple[int, Optional[str]]:
+    """Resolve `(num_processes, cuda_visible_devices_override)` from `--gpus` and `--gpu-ids`.
+
+    Supports seamless switching between single-GPU and multi-GPU with zero code/config edits:
+      - `gpus="auto"` / `"all"`: uses all visible CUDA GPUs (`>=2` -> multi-GPU, `0/1` -> single process).
+      - `gpus="1"` (or `1`): forces zero-overhead single-GPU / single-process execution even on 4x/8x GPU nodes.
+      - `gpus="4"` (or `N > 1`): launches `N`-process distributed training (`nccl` on CUDA, `gloo` if `--device cpu`).
+      - `gpu_ids="0,2"` or `"3"`: restricts `CUDA_VISIBLE_DEVICES` before CUDA initialization.
+    """
+    selected_ids: Optional[list[str]] = None
+    if gpu_ids is not None and str(gpu_ids).strip():
+        selected_ids = [tok.strip() for tok in str(gpu_ids).split(",") if tok.strip()]
+        if not selected_ids:
+            raise ValueError(f"Invalid empty --gpu-ids={gpu_ids!r}")
+
+    spec = str(gpus).strip().lower() if gpus is not None else "auto"
+    dev_norm = (device or "auto").strip().lower()
+
+    if spec in ("auto", "all", ""):
+        if dev_norm in ("cpu", "mps"):
+            return 1, (",".join(selected_ids[:1]) if selected_ids else None)
+        if selected_ids is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(selected_ids)
+            return len(selected_ids), ",".join(selected_ids)
+        avail = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        return max(1, int(avail)), None
+
+    try:
+        n_req = int(spec)
+    except ValueError as exc:
+        raise ValueError(
+            f"Unsupported --gpus={gpus!r}; expected 'auto', 'all', '1', or a positive integer (e.g. 2, 4, 8)."
+        ) from exc
+
+    if n_req < 1:
+        raise ValueError(f"--gpus must be >= 1, got {n_req}")
+
+    if selected_ids is not None:
+        if n_req > len(selected_ids):
+            raise ValueError(
+                f"Requested --gpus={n_req}, but --gpu-ids={gpu_ids!r} only lists {len(selected_ids)} device(s)."
+            )
+        chosen_csv = ",".join(selected_ids[:n_req])
+        os.environ["CUDA_VISIBLE_DEVICES"] = chosen_csv
+        return n_req, chosen_csv
+
+    if dev_norm not in ("cpu", "mps"):
+        if n_req == 1:
+            # On multi-GPU hosts, pin single-GPU runs to the first visible GPU if CUDA_VISIBLE_DEVICES wasn't set
+            existing_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if existing_cvd is not None and existing_cvd.strip():
+                first_gpu = existing_cvd.split(",")[0].strip()
+                os.environ["CUDA_VISIBLE_DEVICES"] = first_gpu
+                return 1, first_gpu
+            return 1, None
+
+        # Multi-GPU requested without explicit --device cpu
+        avail = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if avail < n_req:
+            raise RuntimeError(
+                f"Requested --gpus={n_req}, but only {avail} CUDA GPU(s) are available "
+                f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}). "
+                f"Use `--gpus 1` for single-GPU/MPS/CPU, or pass `--device cpu --gpus {n_req}` for CPU gloo testing."
+            )
+
+    return n_req, None
+
+
+def maybe_relaunch_distributed(
+    script_path: str | Path,
+    argv: Optional[Sequence[str]] = None,
+    *,
+    gpus: str | int = "auto",
+    gpu_ids: Optional[str] = None,
+    device: str = "auto",
+) -> Optional[int]:
+    """Self-spawn `torch.distributed.run` when `N > 1` GPUs are requested outside `torchrun`.
+
+    Returns:
+      - `None` if execution should continue in-process (either `num_procs == 1` or already inside `torchrun`).
+      - Integer exit code from `torch.distributed.run` if a multi-process job was spawned and completed.
+    """
+    env_world = int(os.environ.get("WORLD_SIZE", "1") or "1")
+    if env_world > 1 or os.environ.get("DCPA_DIST_WORKER") == "1" or "LOCAL_RANK" in os.environ:
+        return None
+
+    num_procs, cvd_override = resolve_requested_gpu_plan(gpus=gpus, gpu_ids=gpu_ids, device=device)
+    if num_procs <= 1:
+        return None
+
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    base_env = os.environ.copy()
+    base_env["DCPA_DIST_WORKER"] = "1"
+    if cvd_override is not None:
+        base_env["CUDA_VISIBLE_DEVICES"] = cvd_override
+
+    # Inject high-throughput multi-GPU NCCL / allocator defaults without overriding explicit user env vars
+    base_env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    base_env.setdefault("NCCL_P2P_LEVEL", "NVL")
+    base_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    base_env.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "8")
+    base_env.setdefault("OMP_NUM_THREADS", "4")
+    base_env.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    repo_root = str(Path(script_path).resolve().parents[1])
+    train_py = str(Path(repo_root) / "dcpa-train-py")
+    existing_py = base_env.get("PYTHONPATH", "")
+    py_parts = [repo_root, train_py] + ([existing_py] if existing_py else [])
+    base_env["PYTHONPATH"] = os.pathsep.join(py_parts)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        master_port = int(sock.getsockname()[1])
+
+    base_env["MASTER_ADDR"] = "127.0.0.1"
+    base_env["MASTER_PORT"] = str(master_port)
+    base_env["WORLD_SIZE"] = str(num_procs)
+
+    cvd_desc = base_env.get("CUDA_VISIBLE_DEVICES", "all")
+    print(
+        f"[Launcher] Multi-process mode: spawning {num_procs} workers "
+        f"(master=127.0.0.1:{master_port}, device={device}, CUDA_VISIBLE_DEVICES={cvd_desc})",
+        flush=True,
+    )
+
+    resolved_script = str(Path(script_path).resolve())
+    procs: list[subprocess.Popen[bytes]] = []
+    try:
+        for rank in range(num_procs):
+            rk_env = base_env.copy()
+            rk_env["RANK"] = str(rank)
+            rk_env["LOCAL_RANK"] = str(rank)
+            procs.append(subprocess.Popen([sys.executable, resolved_script, *raw_args], env=rk_env))
+
+        first_nonzero_rc: Optional[int] = None
+        while True:
+            alive = 0
+            for p in procs:
+                rc = p.poll()
+                if rc is None:
+                    alive += 1
+                elif rc != 0 and first_nonzero_rc is None:
+                    first_nonzero_rc = int(rc)
+            if first_nonzero_rc is not None:
+                # Immediately terminate sibling ranks so no orphan GPU process hangs on a barrier
+                for p in procs:
+                    if p.poll() is None:
+                        p.terminate()
+                break
+            if alive == 0:
+                break
+            time.sleep(0.05)
+
+        deadline = time.monotonic() + 5.0
+        for p in procs:
+            rem = max(0.1, deadline - time.monotonic())
+            try:
+                p.wait(timeout=rem)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+        return first_nonzero_rc if first_nonzero_rc is not None else 0
+    except KeyboardInterrupt:
+        for p in procs:
+            if p.poll() is None:
+                p.send_signal(signal.SIGINT)
+        for p in procs:
+            try:
+                p.wait(timeout=15.0)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        return 130
 
 
 @dataclass(frozen=True)

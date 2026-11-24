@@ -441,7 +441,8 @@ def capture_rng_state() -> dict[str, Any]:
             local_rk = int(os.environ["LOCAL_RANK"])
             state["cuda_rng_state_all"] = [torch.cuda.get_rng_state(local_rk).clone()]
         else:
-            state["cuda_rng_state_all"] = [s.clone() for s in torch.cuda.get_rng_state_all()]
+            cur_dev = torch.cuda.current_device()
+            state["cuda_rng_state_all"] = [torch.cuda.get_rng_state(cur_dev).clone()]
     if is_mps_available() and hasattr(torch, "mps") and hasattr(torch.mps, "get_rng_state"):
         try:
             state["mps_rng_state"] = torch.mps.get_rng_state().clone()
@@ -478,10 +479,7 @@ def restore_rng_state(rng_state: Optional[dict[str, Any]]) -> None:
                 src_idx = local_rk if local_rk < len(normalized) else 0
                 torch.cuda.set_rng_state(normalized[src_idx], device=local_rk)
             else:
-                dev_count = torch.cuda.device_count()
-                if len(normalized) == dev_count:
-                    torch.cuda.set_rng_state_all(normalized)
-                elif len(normalized) > 0:
+                if len(normalized) > 0:
                     cur_dev = torch.cuda.current_device()
                     torch.cuda.set_rng_state(normalized[0], device=cur_dev)
         except Exception:

@@ -34,6 +34,7 @@ BACKUP_DIR=""
 FROM_ARCHIVE=""
 PACK_ARCHIVE=""
 NGPU=""
+GPU_IDS=""
 TOTAL_STEPS=""
 SFT_STEPS="10000"
 SKIP_DATA=0
@@ -55,6 +56,8 @@ for arg in "$@"; do
     --from-archive=*) FROM_ARCHIVE="${arg#*=}" ;;
     --pack-archive=*) PACK_ARCHIVE="${arg#*=}" ;;
     --gpus=*) NGPU="${arg#*=}" ;;
+    --gpu-ids=*) GPU_IDS="${arg#*=}" ;;
+    --single-gpu|--1gpu) NGPU="1" ;;
     --total-steps=*) TOTAL_STEPS="${arg#*=}" ;;
     --sft-steps=*) SFT_STEPS="${arg#*=}" ;;
     --resume=*) RESUME_MODE="${arg#*=}" ;;
@@ -149,6 +152,7 @@ PREP_CMD=(
 [[ -n "${FROM_ARCHIVE}" ]] && PREP_CMD+=("--from-archive" "${FROM_ARCHIVE}")
 [[ -n "${PACK_ARCHIVE}" ]] && PREP_CMD+=("--pack-archive" "${PACK_ARCHIVE}")
 
+[[ -n "${GPU_IDS}" ]] && export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 if [[ "${NGPU}" -gt 1 ]]; then
   LAUNCHER=("${PYTHON_BIN}" "-m" "torch.distributed.run" "--standalone" "--nnodes=1" "--nproc_per_node=${NGPU}")
 else

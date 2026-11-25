@@ -32,6 +32,44 @@ class ConceptGraphState:
     edges: torch.Tensor     # [B, K, K, d_r]
     salience: torch.Tensor  # [B, K] float32
     slot0_pinned: Optional[torch.Tensor] = None  # [B] float32 (0.0 or 1.0, Slot-0 Thesis Pinning)
+    phase: Optional[torch.Tensor] = None         # [B, K] float32 Slot Temporal Phase / logical age
+
+
+@dataclass
+class ClauseAccumulatorState:
+    """Strictly O(1) online stabilized surprisal-weighted proposition accumulator + argmax-ACh tag."""
+
+    num: torch.Tensor       # [B, D] float32 weighted sum of z_0 * exp(surp - max_s)
+    den: torch.Tensor       # [B] float32 sum of exp(surp - max_s)
+    max_surp: torch.Tensor  # [B] float32 running max surprisal stabilizer
+    sum_surp: torch.Tensor  # [B] float32 running sum of surprisal (for mean clause surprisal)
+    count: torch.Tensor     # [B] int32 number of concepts accumulated in current clause
+    best_ach: torch.Tensor  # [B] float32 max ACh seen in current clause (Commandment #8)
+    best_idx: torch.Tensor  # [B, s] int64 sparse DG key of highest-ACh concept in clause
+    best_val: torch.Tensor  # [B, s] float32 unit-norm sparse values of highest-ACh concept
+    best_f: torch.Tensor    # [B, d_s] stem vector of highest-ACh concept
+
+    @classmethod
+    def zeros(
+        cls,
+        batch_size: int,
+        d_concept: int,
+        s_active: int,
+        d_s: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> "ClauseAccumulatorState":
+        return cls(
+            num=torch.zeros((batch_size, d_concept), device=device, dtype=torch.float32),
+            den=torch.zeros((batch_size,), device=device, dtype=torch.float32),
+            max_surp=torch.full((batch_size,), -1.0e9, device=device, dtype=torch.float32),
+            sum_surp=torch.zeros((batch_size,), device=device, dtype=torch.float32),
+            count=torch.zeros((batch_size,), device=device, dtype=torch.int32),
+            best_ach=torch.full((batch_size,), -1.0, device=device, dtype=torch.float32),
+            best_idx=torch.zeros((batch_size, s_active), device=device, dtype=torch.int64),
+            best_val=torch.zeros((batch_size, s_active), device=device, dtype=torch.float32),
+            best_f=torch.zeros((batch_size, d_s), device=device, dtype=dtype),
+        )
 
 
 class _DampedBoundedCarry(torch.autograd.Function):
@@ -517,7 +555,12 @@ class SparseMicroMoE(nn.Module):
             return x, torch.zeros((), device=x.device, dtype=torch.float32)
         # Pre-RMSNorm input to router + Layer-1 SwiGLU so deep pondering recurrence cannot diverge
         x = (x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)).to(x.dtype)
-        logits = self.router(x).float()  # [N, E]
+        if not self.training and x.dtype == torch.float32 and not static_shape:
+            logits = torch.bmm(
+                x.unsqueeze(1), self.router.weight.float().t().unsqueeze(0).expand(x.shape[0], -1, -1)
+            ).squeeze(1)
+        else:
+            logits = self.router(x).float()  # [N, E]
         router_probs = F.softmax(logits, dim=-1)  # [N, E] fp32
         top_vals, top_idx = torch.topk(logits, k=self.top_k, dim=-1)  # [N, top_k]
         gates_f32 = F.softmax(top_vals, dim=-1)  # [N, top_k] fp32
@@ -606,6 +649,21 @@ class SparseMicroMoE(nn.Module):
             y_all = self._experts_4bmm_impl(x_e, w_gu1, w_d1, w_gu2, w_d2)
             out = torch.einsum("ne,end->nd", gate_full, y_all.float()).to(x.dtype)
             return out, aux_bal
+
+        if not self.training and x.dtype == torch.float32:
+            N, D = x.shape
+            out_f = torch.zeros((N, D), device=x.device, dtype=torch.float32)
+            w_gu1_t, w_d1_t, w_gu2_t, w_d2_t = self._resolve_packed_weights(torch.float32, packed_weights)
+            x_b1 = x.float().unsqueeze(1)  # [N, 1, D] — strictly row-independent GEMV per token!
+            for k_i in range(self.top_k):
+                e_ids = top_idx[:, k_i]
+                g1, u1 = torch.bmm(x_b1, w_gu1_t[e_ids]).squeeze(1).chunk(2, dim=-1)
+                x1 = x + torch.bmm((F.silu(g1) * u1).unsqueeze(1), w_d1_t[e_ids]).squeeze(1)
+                x_n2 = x1 * torch.rsqrt(x1.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+                g2, u2 = torch.bmm(x_n2.unsqueeze(1), w_gu2_t[e_ids]).squeeze(1).chunk(2, dim=-1)
+                yk = x1 + torch.bmm((F.silu(g2) * u2).unsqueeze(1), w_d2_t[e_ids]).squeeze(1)
+                out_f = out_f + gates_f32[:, k_i : k_i + 1] * yk
+            return out_f.to(x.dtype), aux_bal
 
         out = torch.zeros_like(x)
         for e_id in range(self.num_experts):
@@ -716,9 +774,12 @@ class BCGPC(nn.Module):
         self.w_comp = nn.Linear(2 * D, D, bias=True)
         self.norm_merge = RMSNorm(D, eps=cfg.eps)
 
-        # 5. Slot salience conservation projection
+        # 5. Slot salience conservation + Log-Space Contractive Gate + Slot Temporal Phase (DCPA-Turbo)
         self.w_omega = nn.Linear(D, 1, bias=False)
         self.kappa_omega = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+        self.w_lambda = nn.Linear(D, K, bias=True)
+        self.w_slot_phase = nn.Linear(16, D, bias=False)
+        self.norm_clause = RMSNorm(D, eps=cfg.eps)
         self._static_kernel_mode: bool = False
         self._compiled_pre_ponder: Optional[Callable[..., Any]] = None
         self._compiled_ponder_router: Optional[Callable[..., Any]] = None
@@ -727,6 +788,7 @@ class BCGPC(nn.Module):
         self._compiled_ponder_update: Optional[Callable[..., Any]] = None
         self._compiled_post_merge: Optional[Callable[..., Any]] = None
         self._compiled_chunk_fn: Optional[Callable[..., Any]] = None
+        self._compiled_clause_chunk_fn: Optional[Callable[..., Any]] = None
 
         self._init_weights()
 
@@ -735,8 +797,10 @@ class BCGPC(nn.Module):
         self._static_kernel_mode = bool(enabled)
 
     def enable_compiled_chunk_kernel(self, **compile_kwargs: Any) -> None:
-        """Compile multi-step `K_chunk` BCG-PC kernel into a single static Inductor graph."""
-        self._compiled_chunk_fn = torch.compile(self._forward_chunk_impl, **compile_kwargs)
+        """Compile multi-step `K_chunk` Turbo clause-chunk kernel into a static Inductor graph."""
+        compiled_fn = torch.compile(self._forward_clause_chunk_impl, **compile_kwargs)
+        self._compiled_chunk_fn = compiled_fn
+        self._compiled_clause_chunk_fn = compiled_fn
 
     def enable_compiled_subkernels(self, **compile_kwargs: Any) -> None:
         """Compile static-shape pre-ponder, active-compacted ponder/MoE, and post-merge sub-kernels."""
@@ -756,6 +820,7 @@ class BCGPC(nn.Module):
         self._compiled_ponder_update = None
         self._compiled_post_merge = None
         self._compiled_chunk_fn = None
+        self._compiled_clause_chunk_fn = None
 
     def _init_weights(self) -> None:
         # Initialize f_prec bias so Softplus(bias) ~ 1.0 and w_gen near identity so pondering
@@ -763,6 +828,9 @@ class BCGPC(nn.Module):
         nn.init.constant_(self.f_prec_2.bias, 0.5413)
         nn.init.eye_(self.w_gen.weight)
         nn.init.xavier_uniform_(self.w_fast.weight)
+        nn.init.normal_(self.w_lambda.weight, std=0.02)
+        nn.init.constant_(self.w_lambda.bias, 2.0)  # initial Lambda ~ 0.988 in [0.92, 0.998]
+        nn.init.normal_(self.w_slot_phase.weight, std=0.02)
 
     def init_state(self, batch_size: int, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> ConceptGraphState:
         dev = device if device is not None else self.s0.device
@@ -774,22 +842,52 @@ class BCGPC(nn.Module):
         edges = a0_src.to(device=dev, dtype=dt).unsqueeze(0).expand(batch_size, -1, -1, -1).clone()
         salience = w0_src.float().to(device=dev).unsqueeze(0).expand(batch_size, -1).clone()
         slot0_pinned = torch.zeros((batch_size,), device=dev, dtype=torch.float32)
-        return ConceptGraphState(slots=slots, edges=edges, salience=salience, slot0_pinned=slot0_pinned)
+        phase = torch.zeros((batch_size, self.cfg.k_slots), device=dev, dtype=torch.float32)
+        return ConceptGraphState(
+            slots=slots,
+            edges=edges,
+            salience=salience,
+            slot0_pinned=slot0_pinned,
+            phase=phase,
+        )
+
+    def _slot_phase_embed(self, phase: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Encode per-slot logical age `phase [B, K]` into `D`-dim temporal bias `[B, K, D]`."""
+        with fp32_island(phase.device):
+            idx = torch.arange(8, device=phase.device, dtype=torch.float32)
+            freqs = torch.pow(128.0, -idx / 8.0)
+            ang = phase.float().unsqueeze(-1) * freqs
+            feat16 = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)  # [B, K, 16]
+        return self.w_slot_phase(feat16.to(dtype))
 
     def _message_pass_with_eproj(
-        self, slots: torch.Tensor, e_proj: torch.Tensor, salience: torch.Tensor
+        self,
+        slots: torch.Tensor,
+        e_proj: torch.Tensor,
+        salience: torch.Tensor,
+        phase: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         w_attn = F.softmax(salience.float(), dim=-1)  # [B, K] fp32
-        weighted_s = slots.to(e_proj.dtype) * w_attn.unsqueeze(-1).to(e_proj.dtype)  # [B, K, D]
+        if phase is not None:
+            s_phased = slots + self._slot_phase_embed(phase, slots.dtype)
+        else:
+            s_phased = slots
+        weighted_s = s_phased.to(e_proj.dtype) * w_attn.unsqueeze(-1).to(e_proj.dtype)  # [B, K, D]
         agg = torch.einsum("bijd,bjd->bid", e_proj, weighted_s)
-        s_bar = slots + agg.to(slots.dtype)
+        s_bar = s_phased + agg.to(slots.dtype)
         g_ctx = torch.einsum("bk,bkd->bd", w_attn.to(s_bar.dtype), s_bar)
         return s_bar, g_ctx
 
-    def message_pass(self, slots: torch.Tensor, edges: torch.Tensor, salience: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def message_pass(
+        self,
+        slots: torch.Tensor,
+        edges: torch.Tensor,
+        salience: torch.Tensor,
+        phase: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute edge-aggregated node states S_bar [B, K, D] and context readout g [B, D]."""
         e_proj = torch.tanh(self.w_e(edges))  # [B, K, K, D], bounded in (-1, 1) for stable multi-step recurrence
-        return self._message_pass_with_eproj(slots, e_proj, salience)
+        return self._message_pass_with_eproj(slots, e_proj, salience, phase=phase)
 
     def update_c0_from_slots(self, s_new: torch.Tensor, active_mask: torch.Tensor) -> None:
         """Update neutral concept center c_0 via EMA strictly over active docs (safe outside activation checkpointing)."""
@@ -852,7 +950,28 @@ class BCGPC(nn.Module):
                 eps_a = eps_a.detach() + 0.5 * (eps_a - eps_a.detach())
             s_bar_a = s_bar_prev[act_idx]
 
-            r_a = self.cross_attn(z_a, s_bar_a)
+            if not self.training and z_a.dtype == torch.float32:
+                na = int(z_a.shape[0])
+                ka = int(s_bar_a.shape[1])
+                d_m = int(z_a.shape[1])
+                q_a = torch.bmm(
+                    z_a.unsqueeze(1), self.cross_attn.w_q.weight.float().t().unsqueeze(0).expand(na, -1, -1)
+                ).squeeze(1)
+                sb_flat = s_bar_a.reshape(na * ka, 1, d_m)
+                k_a = torch.bmm(
+                    sb_flat, self.cross_attn.w_k.weight.float().t().unsqueeze(0).expand(na * ka, -1, -1)
+                ).reshape(na, ka, d_m)
+                v_a = torch.bmm(
+                    sb_flat, self.cross_attn.w_v.weight.float().t().unsqueeze(0).expand(na * ka, -1, -1)
+                ).reshape(na, ka, d_m)
+                sc_a = torch.bmm(q_a.unsqueeze(1), k_a.transpose(1, 2)).squeeze(1) * self.cross_attn.scale
+                at_a = F.softmax(sc_a, dim=-1)
+                ctx_a = torch.bmm(at_a.unsqueeze(1), v_a).squeeze(1)
+                r_a = torch.bmm(
+                    ctx_a.unsqueeze(1), self.cross_attn.w_o.weight.float().t().unsqueeze(0).expand(na, -1, -1)
+                ).squeeze(1)
+            else:
+                r_a = self.cross_attn(z_a, s_bar_a)
             delta_a, bal_l = self.moe(eps_a + r_a, static_shape=False)
             moe_bal_sum = moe_bal_sum + bal_l
             moe_bal_count = moe_bal_count + 1.0
@@ -863,8 +982,15 @@ class BCGPC(nn.Module):
             z_next[act_idx] = z_next_a
             z_cur = z_next
 
+            if not self.training and z_next_a.dtype == torch.float32:
+                gen_a = torch.bmm(
+                    z_next_a.unsqueeze(1),
+                    self.w_gen.weight.float().t().unsqueeze(0).expand(z_next_a.shape[0], -1, -1),
+                ).squeeze(1)
+            else:
+                gen_a = self.w_gen(z_next_a).float()
             eps_next_a = (
-                pi_eff[act_idx] * (c_fused[act_idx].float() - self.w_gen(z_next_a).float())
+                pi_eff[act_idx] * (c_fused[act_idx].float() - gen_a)
             ).to(orig_dtype)
             eps_next = eps_cur.clone()
             eps_next[act_idx] = eps_next_a
@@ -885,6 +1011,7 @@ class BCGPC(nn.Module):
         c_fused: torch.Tensor,
         prec_bu: torch.Tensor,
         ach: torch.Tensor,
+        phase: Optional[torch.Tensor] = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -899,7 +1026,7 @@ class BCGPC(nn.Module):
     ]:
         """Static-shape pre-ponder graph readout, prior/precision prediction, and Bayesian fusion."""
         orig_dtype = c_fused.dtype
-        s_bar_prev, g_ctx = self.message_pass(slots, edges, salience)
+        s_bar_prev, g_ctx = self.message_pass(slots, edges, salience, phase=phase)
         c_hat = self.f_pred_2(F.silu(self.f_pred_1(g_ctx)))  # [B, D]
         pi_raw = F.softplus(self.f_prec_2(F.silu(self.f_prec_1(g_ctx))).float()) + 1e-4  # [B, D] fp32
         pi_m = 2.0 * torch.tanh(pi_raw * 0.5)
@@ -911,18 +1038,13 @@ class BCGPC(nn.Module):
         pi_m_sg = pi_m.detach()
         pi_eff = pi_m_sg * (1.0 - ach_f32).unsqueeze(-1)
 
-        eps_0_surp = (pi_eff * (c_fused.float() - c_hat.float())).to(orig_dtype)
-        surprisal_0 = torch.sqrt(eps_0_surp.float().pow(2).mean(dim=-1) + 1e-8)  # [B] fp32
+        eps_0 = (pi_eff * (c_fused.float() - c_hat.float())).to(orig_dtype)
+        surprisal_0 = torch.sqrt(eps_0.float().pow(2).mean(dim=-1) + 1e-8)  # [B] fp32
 
-        # Bayesian precision fusion + fast shortcut projected onto unit-RMS concept manifold:
-        #   - Detaching c_hat on the slot-write path eliminates the unnormalized slots -> g_ctx ->
-        #     f_pred -> w_fast -> z_0 recurrent Jacobian feedback loop across long documents.
-        #   - Applying self.norm_ponder guarantees z_0 lives on the exact same unit-RMS sphere
-        #     whether Pondering skips (L_m=0) or iterates (L_m=1..8), matching dcpa-core-rs.
-        c_hat_z = c_hat.detach()
-        eps_0 = (pi_eff * (c_fused.float() - c_hat_z.float())).to(orig_dtype)
+        # End-to-end differentiable Bayesian precision fusion + fast shortcut onto unit-RMS sphere
+        # (Log-Space Contractive Gate Lambda_m in [0.92, 0.998] bounds recurrent slot Jacobian cleanly).
         z_0 = (
-            (pi_m_sg * c_hat_z.float() + prec_bu_f32 * c_fused.float())
+            (pi_m_sg * c_hat.float() + prec_bu_f32 * c_fused.float())
             / (pi_m_sg + prec_bu_f32 + self.cfg.eps)
         ).to(orig_dtype)
         z_0 = self.norm_ponder(
@@ -930,6 +1052,97 @@ class BCGPC(nn.Module):
         )
         k_prev, v_prev = self.cross_attn.project_kv(s_bar_prev)
         return s_bar_prev, g_ctx, c_hat, pi_m, pi_eff, surprisal_0, eps_0, z_0, k_prev, v_prev
+
+    def ponder_parallel(
+        self,
+        z_0: torch.Tensor,
+        eps_0: torch.Tensor,
+        surprisal_0: torch.Tensor,
+        s_bar_prev: torch.Tensor,
+        c_fused: torch.Tensor,
+        pi_eff: torch.Tensor,
+        active_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Full-batch parallel System-2 Pondering across all `[M_total, D]` segments simultaneously!
+
+        Compacts ONLY surprised concepts (`surp_cur > tau_skip/tau_halt`) into a single dense
+        `[M_surprised, D]` Tensor-Core matrix per step (`<= L_max` steps, exiting immediately once
+        `M_surprised == 0`), turning 3,400+ tiny sequential MoE calls into 2-4 large batched GEMMs!
+        """
+        M, D = z_0.shape
+        dev = z_0.device
+        orig_dtype = z_0.dtype
+        if M == 0:
+            return (
+                z_0,
+                torch.zeros((0,), device=dev, dtype=torch.float32),
+                torch.zeros((), device=dev, dtype=torch.float32),
+            )
+
+        am = torch.ones((M,), device=dev, dtype=torch.bool) if active_mask is None else active_mask.bool()
+        if not self.training and dev.type == "cpu":
+            return self._ponder_loop_sparse(z_0, eps_0, surprisal_0, s_bar_prev, c_fused, pi_eff, am)
+
+        packed_w = self.moe.pack_weights(dtype=orig_dtype)
+        k_prev, v_prev = self.cross_attn.project_kv(s_bar_prev)
+        router_fn = self._compiled_ponder_router if self._compiled_ponder_router is not None else self._ponder_router_impl
+        update_fn = self._compiled_ponder_update if self._compiled_ponder_update is not None else self._ponder_update_impl
+
+        z_cur = z_0
+        eps_cur = eps_0
+        surp_cur = surprisal_0
+        active = am
+        ponder_steps = torch.zeros((M,), device=dev, dtype=torch.float32)
+        moe_bal_sum = torch.zeros((), device=dev, dtype=torch.float32)
+        moe_bal_count = torch.zeros((), device=dev, dtype=torch.float32)
+
+        for l_idx in range(self.cfg.l_max):
+            thresh = self.cfg.tau_skip if l_idx == 0 else self.cfg.tau_halt
+            prev_active_f = active.float()
+            still_surprised = surp_cur > thresh
+            active = active & still_surprised
+
+            soft_act = torch.sigmoid((surp_cur - thresh) / 0.25) * prev_active_f
+            hard_act = active.float()
+            ste_act = (hard_act - soft_act).detach() + soft_act
+            ponder_steps = ponder_steps + ste_act
+
+            act_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
+            n_act = int(act_idx.numel())
+            if n_act == 0:
+                break
+
+            z_act = z_cur[act_idx]
+            eps_act = eps_cur[act_idx]
+            router_in = router_fn(z_act, eps_act, k_prev[act_idx], v_prev[act_idx])
+            delta_act, bal_l = self.moe.forward_compacted_bmm(
+                router_in,
+                n_valid=n_act,
+                sample_mask=None,
+                packed_weights=packed_w,
+                compiled_experts_fn=self._compiled_experts_bmm,
+                compiled_grouped_mm_fn=self._compiled_experts_grouped_mm,
+            )
+            moe_bal_sum = moe_bal_sum + bal_l
+            moe_bal_count = moe_bal_count + 1.0
+
+            z_next_a, eps_next_a, surp_next_a = update_fn(
+                z_act, delta_act, c_fused[act_idx], pi_eff[act_idx]
+            )
+            z_next = z_cur.clone()
+            z_next[act_idx] = z_next_a
+            z_cur = z_next
+
+            eps_next = eps_cur.clone()
+            eps_next[act_idx] = eps_next_a
+            eps_cur = eps_next
+
+            surp_next = surp_cur.clone()
+            surp_next[act_idx] = surp_next_a
+            surp_cur = surp_next
+
+        moe_bal_loss = moe_bal_sum / moe_bal_count.clamp_min(1.0)
+        return z_cur, ponder_steps, moe_bal_loss
 
     def _ponder_router_impl(
         self,
@@ -955,7 +1168,7 @@ class BCGPC(nn.Module):
         surp_next = torch.sqrt(eps_next.float().pow(2).mean(dim=-1) + 1e-8)
         return z_next, eps_next, surp_next
 
-    def _post_ponder_merge_impl(
+    def _post_ponder_merge_with_phase(
         self,
         slots: torch.Tensor,
         edges: torch.Tensor,
@@ -971,6 +1184,7 @@ class BCGPC(nn.Module):
         gumbel_u: Optional[torch.Tensor] = None,
         compute_s_bar_post: bool = True,
         check_pin: bool = True,
+        phase: Optional[torch.Tensor] = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -982,13 +1196,27 @@ class BCGPC(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
     ]:
-        """Static-shape candidate slot expansion, 72-pair Gumbel-STE merge, LogSumExp salience, and Slot-0 latch."""
+        """Log-Space Contractive Gate `Lambda_m in [0.92, 0.998]`, 72-pair Gumbel-STE merge, phase age, & Slot-0 latch."""
         B = z_star.shape[0]
         K = self.cfg.k_slots
+        slot0_bool = self.slot0_onehot > 0.5  # [K]
+        already_pinned_b = pinned_cur > 0.5  # [B]
+
+        # Log-Space Contractive Gate Lambda_m in [0.920, 0.998] (replaces artificial 0.5/.detach() BPTT hacks!)
+        with fp32_island(z_star.device):
+            gamma_m = 0.002 + 0.081 * torch.sigmoid(-self.w_lambda(z_star.float()))  # [B, K]
+            lam_slots = torch.exp(-gamma_m)                                          # [B, K]
+            lam_slots = torch.where(
+                already_pinned_b.view(B, 1) & slot0_bool.view(1, K),
+                torch.ones_like(lam_slots),
+                lam_slots,
+            )
+            slots_contracted = (slots.float() * lam_slots.unsqueeze(-1)).to(slots.dtype)
 
         # 3. Candidate slot expansion (K -> K+1)
-        s_tilde = torch.cat([slots, z_star.unsqueeze(1)], dim=1)  # [B, K+1, D]
+        s_tilde = torch.cat([slots_contracted, z_star.unsqueeze(1)], dim=1)  # [B, K+1, D]
         src_all = self.u_src(s_tilde)  # [B, K+1, d_r]
         dst_all = self.u_dst(s_tilde)  # [B, K+1, d_r]
 
@@ -997,19 +1225,15 @@ class BCGPC(nn.Module):
         top_part = torch.cat([edges, new_col.unsqueeze(2)], dim=2)  # [B, K, K+1, d_r]
         a_tilde = torch.cat([top_part, new_row.unsqueeze(1)], dim=1)  # [B, K+1, K+1, d_r]
 
-        # 4. K+1 -> K Syntactic Merge Bottleneck over all P = K*(K+1) = 72 ordered pairs
+        # 4. End-to-end differentiable K+1 -> K Syntactic Merge Bottleneck over P = 72 ordered pairs
         pi_idx = self.pair_i  # [72]
         pj_idx = self.pair_j  # [72]
         pu_idx = self.pair_u  # [72]
 
         a_ij = a_tilde[:, pi_idx, pj_idx, :]  # [B, 72, d_r]
-
-        # Decouple discrete 72-pair merge router inputs from the recurrent slot/edge carrier Jacobian
-        s_tilde_score = s_tilde.detach()
-        a_ij_score = a_ij.detach()
-        wl_all = self.w_l(s_tilde_score)  # [B, K+1, d_m]
-        wr_all = self.w_r(s_tilde_score)  # [B, K+1, d_m]
-        h_merge = torch.tanh(wl_all[:, pi_idx, :] + wr_all[:, pj_idx, :] + self.w_edge_score(a_ij_score))
+        wl_all = self.w_l(s_tilde)            # [B, K+1, d_m]
+        wr_all = self.w_r(s_tilde)            # [B, K+1, d_m]
+        h_merge = torch.tanh(wl_all[:, pi_idx, :] + wr_all[:, pj_idx, :] + self.w_edge_score(a_ij))
         m_score = self.w_merge(h_merge).squeeze(-1).float()  # [B, 72] fp32
 
         # Precision Island #3 (Red Line #1) + Branchless Slot-0 Pinning Mask (Spec 2 / Red Line #3)
@@ -1043,11 +1267,12 @@ class BCGPC(nn.Module):
                 win_idx = m_score_f.argmax(dim=-1)  # [B]
                 alpha = F.one_hot(win_idx, num_classes=m_score_f.shape[-1]).float()
 
-            # Single einsum contraction with prebuilt [72, K, K+1] perm_bank strictly in fp32
             p_mat = torch.einsum("bp,pka->bka", alpha, self.perm_bank.float())  # [B, K, K+1] fp32
 
         win_i = pi_idx[win_idx]  # [B]
         win_j = pj_idx[win_idx]  # [B]
+        win_u = pu_idx[win_idx]  # [B]
+        win_v = self.pair_v[win_idx]  # [B]
 
         p_mat_s = p_mat.to(s_tilde.dtype)
         p_mat_a = p_mat.to(a_tilde.dtype)
@@ -1067,19 +1292,16 @@ class BCGPC(nn.Module):
             slot_corr = win_u_oh.unsqueeze(-1) * corr_win.unsqueeze(1)  # [B, K, D]
             s_cand_new = (torch.einsum("bka,bad->bkd", p_mat_s, s_tilde) + slot_corr).to(slots.dtype)
         else:
-            win_u = pu_idx[win_idx]  # [B]
-            win_v = self.pair_v[win_idx]  # [B]
             k_ids = torch.arange(K, device=z_star.device).unsqueeze(0)  # [1, K]
             is_u = (k_ids == win_u.unsqueeze(1)).unsqueeze(-1)  # [B, K, 1]
             is_v = (k_ids == win_v.unsqueeze(1)).unsqueeze(-1)  # [B, K, 1]
-            s_cand_new = torch.where(is_u, s_merged_win.to(slots.dtype).unsqueeze(1), slots)
+            s_cand_new = torch.where(is_u, s_merged_win.to(slots.dtype).unsqueeze(1), slots_contracted)
             s_cand_new = torch.where(is_v, z_star.to(slots.dtype).unsqueeze(1), s_cand_new)
 
         a_tmp = torch.einsum("bka,bacr->bkcr", p_mat_a, a_tilde)
         a_cand_new = torch.einsum("blc,bkcr->bklr", p_mat_a, a_tmp).to(edges.dtype).contiguous()
 
-        slot0_bool = self.slot0_onehot > 0.5  # [K]
-        already_pinned_b = pinned_cur > 0.5  # [B]
+        phase_in = torch.zeros((B, K), device=z_star.device, dtype=torch.float32) if phase is None else phase.float()
         with fp32_island(z_star.device):
             omega_old_decayed = salience.float() - self.cfg.delta_decay  # [B, K]
             omega_cand = (
@@ -1102,6 +1324,20 @@ class BCGPC(nn.Module):
                 omega_cand_new,
             )
 
+            # Slot Temporal Phase update (`phase [B, K]`)
+            phase_old = phase_in + 1.0
+            phase_tilde = torch.cat([phase_old, torch.zeros((B, 1), device=z_star.device, dtype=torch.float32)], dim=1)
+            k_ids_p = torch.arange(K, device=z_star.device).unsqueeze(0)
+            p_merged = torch.minimum(phase_tilde[b_arange, win_i], phase_tilde[b_arange, win_j])
+            phase_cand_new = torch.where(k_ids_p == win_u.unsqueeze(1), p_merged.unsqueeze(1), phase_old)
+            phase_cand_new = torch.where(
+                k_ids_p == win_v.unsqueeze(1), torch.zeros_like(phase_cand_new), phase_cand_new
+            )
+            phase_cand_new = torch.where(
+                already_pinned_b.view(B, 1) & slot0_bool.view(1, K), phase_in, phase_cand_new
+            )
+
+        # Bit-exact 0.0 ULP preservation of pinned Slot-0!
         s_cand_new = torch.where(already_pinned_b.view(B, 1, 1) & slot0_bool.view(1, K, 1), slots, s_cand_new)
 
         am_s = active_mask.view(B, 1, 1)
@@ -1110,10 +1346,11 @@ class BCGPC(nn.Module):
         s_new = torch.where(am_s, s_cand_new, slots)
         a_new = torch.where(am_e, a_cand_new, edges)
         omega_new = torch.where(am_w, omega_cand_new, salience.float())
+        phase_new = torch.where(am_w, phase_cand_new, phase_in)
 
         if check_pin:
             e_proj_post = torch.tanh(self.w_e(a_new))  # [B, K, K, D]
-            _, g_post = self._message_pass_with_eproj(s_new, e_proj_post, omega_new)
+            _, g_post = self._message_pass_with_eproj(s_new, e_proj_post, omega_new, phase=phase_new)
             do_pin = active_mask.bool() & (trig_cur > 0.5) & (pinned_cur < 0.5)  # [B]
             g_post_f = g_post.float()
             thesis_vec = (
@@ -1123,17 +1360,18 @@ class BCGPC(nn.Module):
             do_pin_w = do_pin.view(B, 1) & slot0_bool.view(1, K)
             s_new = torch.where(do_pin_s, thesis_vec.unsqueeze(1).expand(-1, K, -1), s_new)
             omega_new = torch.where(do_pin_w, torch.maximum(omega_new, torch.full_like(omega_new, 2.0)), omega_new)
+            phase_new = torch.where(do_pin_w, torch.zeros_like(phase_new), phase_new)
             slot0_pinned_next = torch.where(do_pin, torch.ones_like(pinned_cur), pinned_cur)
 
             if compute_s_bar_post:
-                s_bar_post, _ = self._message_pass_with_eproj(s_new, e_proj_post, omega_new)
+                s_bar_post, _ = self._message_pass_with_eproj(s_new, e_proj_post, omega_new, phase=phase_new)
             else:
                 s_bar_post = s_new
         else:
             slot0_pinned_next = pinned_cur
             if compute_s_bar_post:
                 e_proj_post = torch.tanh(self.w_e(a_new))  # [B, K, K, D]
-                s_bar_post, _ = self._message_pass_with_eproj(s_new, e_proj_post, omega_new)
+                s_bar_post, _ = self._message_pass_with_eproj(s_new, e_proj_post, omega_new, phase=phase_new)
             else:
                 s_bar_post = s_new
         return (
@@ -1147,6 +1385,307 @@ class BCGPC(nn.Module):
             merge_probs,
             alpha,
             slot0_pinned_next,
+            phase_new,
+        )
+
+    def _post_ponder_merge_impl(
+        self,
+        slots: torch.Tensor,
+        edges: torch.Tensor,
+        salience: torch.Tensor,
+        z_star: torch.Tensor,
+        surprisal_0: torch.Tensor,
+        tau_m: torch.Tensor,
+        active_mask: torch.Tensor,
+        merge_uniform_mix: torch.Tensor,
+        pinned_cur: torch.Tensor,
+        trig_cur: torch.Tensor,
+        use_gumbel: bool,
+        gumbel_u: Optional[torch.Tensor] = None,
+        compute_s_bar_post: bool = True,
+        check_pin: bool = True,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """10-tuple wrapper around `_post_ponder_merge_with_phase` preserving compiled kernel signatures."""
+        return self._post_ponder_merge_with_phase(
+            slots,
+            edges,
+            salience,
+            z_star,
+            surprisal_0,
+            tau_m,
+            active_mask,
+            merge_uniform_mix,
+            pinned_cur,
+            trig_cur,
+            use_gumbel,
+            gumbel_u=gumbel_u,
+            compute_s_bar_post=compute_s_bar_post,
+            check_pin=check_pin,
+            phase=None,
+        )[:10]
+
+    def forward_graph_step_no_ponder(
+        self,
+        slots: torch.Tensor,
+        edges: torch.Tensor,
+        salience: torch.Tensor,
+        phase: torch.Tensor,
+        c_fused: torch.Tensor,
+        prec_bu: torch.Tensor,
+        ach: torch.Tensor,
+        tau_m: torch.Tensor,
+        active_mask: torch.Tensor,
+        merge_uniform_mix: torch.Tensor,
+        slot0_pinned: torch.Tensor,
+        pin_trigger: torch.Tensor,
+        use_gumbel: bool = True,
+        gumbel_u: Optional[torch.Tensor] = None,
+        compute_s_bar_post: bool = True,
+        check_pin: bool = True,
+    ) -> tuple[torch.Tensor, ...]:
+        """Zero-MoE lightweight contractive graph step (`0.36 GFLOPs/step`) for DCPA-Turbo Step 3!
+
+        Computes prior prediction `(c_hat, pi_m)`, fast Bayesian fusion `z_0`, and `72`-pair
+        Gumbel-STE + Log-Space Contractive Gate `Lambda_m` + `phase` update, while deferring
+        System-2 Pondering MoE to `ponder_parallel` (`[M_total, D]`)!
+        """
+        s_bar_prev, g_ctx, c_hat, pi_m, pi_eff, surprisal_0, eps_0, z_0, _, _ = self._pre_ponder_impl(
+            slots, edges, salience, c_fused, prec_bu, ach, phase=phase
+        )
+        (
+            s_new,
+            a_new,
+            omega_new,
+            s_bar_post,
+            win_idx,
+            win_i,
+            win_j,
+            merge_probs,
+            alpha,
+            slot0_pinned_next,
+            phase_new,
+        ) = self._post_ponder_merge_with_phase(
+            slots,
+            edges,
+            salience,
+            z_0,
+            surprisal_0,
+            tau_m,
+            active_mask,
+            merge_uniform_mix,
+            slot0_pinned.float(),
+            pin_trigger.float(),
+            use_gumbel,
+            gumbel_u=gumbel_u,
+            compute_s_bar_post=compute_s_bar_post,
+            check_pin=check_pin,
+            phase=phase,
+        )
+        return (
+            z_0,
+            g_ctx,
+            c_hat,
+            pi_m,
+            pi_eff,
+            surprisal_0,
+            eps_0,
+            s_bar_prev,
+            s_new,
+            a_new,
+            omega_new,
+            phase_new,
+            s_bar_post,
+            win_idx,
+            win_i,
+            win_j,
+            merge_probs,
+            alpha,
+            slot0_pinned_next,
+        )
+
+    def _forward_clause_chunk_impl(
+        self,
+        slots: torch.Tensor,
+        edges: torch.Tensor,
+        salience: torch.Tensor,
+        phase: torch.Tensor,
+        slot0_pinned: torch.Tensor,
+        c_fused_seq: torch.Tensor,
+        prec_bu_seq: torch.Tensor,
+        ach_seq: torch.Tensor,
+        active_mask_seq: torch.Tensor,
+        trig_seq: torch.Tensor,
+        unpin_seq: torch.Tensor,
+        tau_m: torch.Tensor,
+        mix_t: torch.Tensor,
+        gumbel_u_seq: Optional[torch.Tensor] = None,
+        use_gumbel: bool = True,
+        check_pin: bool = True,
+    ) -> tuple[torch.Tensor, ...]:
+        """Multi-step (`S = clause_chunk_size`, e.g. 16) zero-MoE contractive graph chunk kernel."""
+        S = c_fused_seq.shape[0]
+        B = slots.shape[0]
+        K = self.cfg.k_slots
+
+        cur_slots = slots
+        cur_edges = edges
+        cur_sal = salience
+        cur_phase = phase
+        cur_pin = slot0_pinned.float()
+
+        z0_l, g_l, chat_l, pi_l, pieff_l, surp_l, eps_l, sbar_prev_l = [], [], [], [], [], [], [], []
+        mp_l, alpha_l, c0_l = [], [], []
+        pre_s_l, pre_e_l, pre_w_l, pre_p_l = [], [], [], []
+
+        for k in range(S):
+            eff_pin = torch.where(unpin_seq[k], torch.zeros_like(cur_pin), cur_pin)
+            eff_phase = torch.where(unpin_seq[k].view(B, 1), torch.zeros_like(cur_phase), cur_phase)
+
+            pre_s_l.append(cur_slots)
+            pre_e_l.append(cur_edges)
+            pre_w_l.append(cur_sal)
+            pre_p_l.append(eff_phase)
+
+            am_k = active_mask_seq[k]
+            gu_k = gumbel_u_seq[k] if gumbel_u_seq is not None else None
+            (
+                z_0,
+                g_ctx,
+                c_hat,
+                pi_m,
+                pi_eff,
+                surp_0,
+                eps_0,
+                s_bar_prev,
+                s_next,
+                a_next,
+                omega_next,
+                phase_next,
+                _s_bar_post,
+                _win_idx,
+                _win_i,
+                _win_j,
+                mp_k,
+                alpha_k,
+                pin_next,
+            ) = self.forward_graph_step_no_ponder(
+                cur_slots,
+                cur_edges,
+                cur_sal,
+                eff_phase,
+                c_fused_seq[k],
+                prec_bu_seq[k],
+                ach_seq[k],
+                tau_m,
+                am_k,
+                mix_t,
+                eff_pin,
+                trig_seq[k],
+                use_gumbel=use_gumbel,
+                gumbel_u=gu_k,
+                compute_s_bar_post=False,
+                check_pin=check_pin,
+            )
+            cur_slots = s_next
+            cur_edges = a_next
+            cur_sal = omega_next
+            cur_phase = phase_next
+            cur_pin = pin_next
+
+            am_f = am_k.float().view(B, 1, 1)
+            denom_c0 = (am_f.sum() * float(K)).clamp_min(1.0)
+            c0_l.append((s_next.detach().float() * am_f).sum(dim=(0, 1)) / denom_c0)
+
+            z0_l.append(z_0)
+            g_l.append(g_ctx)
+            chat_l.append(c_hat)
+            pi_l.append(pi_m)
+            pieff_l.append(pi_eff)
+            surp_l.append(surp_0)
+            eps_l.append(eps_0)
+            sbar_prev_l.append(s_bar_prev)
+            mp_l.append(mp_k)
+            alpha_l.append(alpha_k)
+
+        return (
+            torch.stack(z0_l, dim=0),
+            torch.stack(g_l, dim=0),
+            torch.stack(chat_l, dim=0),
+            torch.stack(pi_l, dim=0),
+            torch.stack(pieff_l, dim=0),
+            torch.stack(surp_l, dim=0),
+            torch.stack(eps_l, dim=0),
+            torch.stack(sbar_prev_l, dim=0),
+            torch.stack(mp_l, dim=0),
+            torch.stack(alpha_l, dim=0),
+            cur_slots,
+            cur_edges,
+            cur_sal,
+            cur_phase,
+            cur_pin,
+            torch.stack(c0_l, dim=0),
+            torch.stack(pre_s_l, dim=0),
+            torch.stack(pre_e_l, dim=0),
+            torch.stack(pre_w_l, dim=0),
+            torch.stack(pre_p_l, dim=0),
+        )
+
+    def forward_clause_chunk(
+        self,
+        slots: torch.Tensor,
+        edges: torch.Tensor,
+        salience: torch.Tensor,
+        phase: torch.Tensor,
+        slot0_pinned: torch.Tensor,
+        c_fused_seq: torch.Tensor,
+        prec_bu_seq: torch.Tensor,
+        ach_seq: torch.Tensor,
+        active_mask_seq: torch.Tensor,
+        trig_seq: torch.Tensor,
+        unpin_seq: torch.Tensor,
+        tau_m: torch.Tensor,
+        mix_t: torch.Tensor,
+        gumbel_u_seq: Optional[torch.Tensor] = None,
+        use_gumbel: bool = True,
+        check_pin: bool = True,
+    ) -> tuple[torch.Tensor, ...]:
+        fn = (
+            self._compiled_chunk_fn
+            if self._compiled_chunk_fn is not None
+            else (
+                self._compiled_clause_chunk_fn
+                if self._compiled_clause_chunk_fn is not None
+                else self._forward_clause_chunk_impl
+            )
+        )
+        return fn(
+            slots,
+            edges,
+            salience,
+            phase,
+            slot0_pinned,
+            c_fused_seq,
+            prec_bu_seq,
+            ach_seq,
+            active_mask_seq,
+            trig_seq,
+            unpin_seq,
+            tau_m,
+            mix_t,
+            gumbel_u_seq,
+            use_gumbel,
+            check_pin,
         )
 
     def forward_fast_dispatch(
@@ -1773,13 +2312,18 @@ class BCGPC(nn.Module):
         )
         tau_t = torch.tensor(float(tau_m), device=dev, dtype=torch.float32)
         mix_t = torch.tensor(float(merge_uniform_mix), device=dev, dtype=torch.float32)
+        phase_in = (
+            torch.zeros((B, self.cfg.k_slots), device=dev, dtype=torch.float32)
+            if state.phase is None
+            else state.phase.to(device=dev, dtype=torch.float32)
+        )
+        s_bar_prev, g_ctx, c_hat, pi_m, pi_eff, surprisal_0, eps_0, z_cur, _, _ = self._pre_ponder_impl(
+            state.slots, state.edges, state.salience, c_fused, prec_bu, ach, phase=phase_in
+        )
+        z_star, ponder_steps, moe_bal_loss = self.ponder_parallel(
+            z_cur, eps_0, surprisal_0, s_bar_prev, c_fused, pi_eff, active_mask=am
+        )
         (
-            z_star,
-            g_ctx,
-            c_hat,
-            pi_m,
-            surprisal_0,
-            ponder_steps,
             s_new,
             a_new,
             omega_new,
@@ -1790,23 +2334,26 @@ class BCGPC(nn.Module):
             merge_probs,
             alpha,
             slot0_pinned_next,
-            moe_bal_loss,
-        ) = self.forward(
-            slots=state.slots,
-            edges=state.edges,
-            salience=state.salience,
-            c_fused=c_fused,
-            prec_bu=prec_bu,
-            ach=ach,
-            tau_m=tau_t,
-            active_mask=am,
-            merge_uniform_mix=mix_t,
-            slot0_pinned=pinned_in,
-            pin_trigger=trig_in,
-            use_gumbel=use_gumbel,
-            update_c0_ema=update_c0_ema,
+            phase_new,
+        ) = self._post_ponder_merge_with_phase(
+            state.slots,
+            state.edges,
+            state.salience,
+            z_star,
+            surprisal_0,
+            tau_t,
+            am,
+            mix_t,
+            pinned_in,
+            trig_in,
+            use_gumbel,
+            gumbel_u=None,
+            compute_s_bar_post=True,
             check_pin=(pin_trigger is not None),
+            phase=phase_in,
         )
+        if self.training and update_c0_ema:
+            self.update_c0_from_slots(s_new, am)
         return BCGPCStepOutput(
             z_star=z_star,
             g_ctx=g_ctx,
@@ -1819,6 +2366,7 @@ class BCGPC(nn.Module):
                 edges=a_new,
                 salience=omega_new,
                 slot0_pinned=slot0_pinned_next,
+                phase=phase_new,
             ),
             s_bar_post=s_bar_post,
             win_pair_idx=win_idx,

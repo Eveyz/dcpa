@@ -18,7 +18,7 @@ fi
 BUNDLE_PATH="${REPO_ROOT}/dcpa_colab_bundle.zip"
 NOTEBOOK_PATH="${REPO_ROOT}/notebooks/Colab_DCPA_Train.ipynb"
 SPARK_NOTEBOOK_PATH="${REPO_ROOT}/notebooks/DGX_Spark_DCPA_Train.ipynb"
-MAX_BYTES=768000  # 750 KB ceiling covering v2 cognitive modules
+MAX_BYTES=921600  # 900 KB ceiling covering DCPA-Turbo cortical + wandb + git-sync modules
 
 echo "[1/3] Validating Notebooks (JSON schema + ast.parse across all code cells)..."
 "${PYTHON_BIN}" - "${NOTEBOOK_PATH}" "${SPARK_NOTEBOOK_PATH}" <<'PYEOF'
@@ -181,6 +181,8 @@ required = [
     "configs/v2/dcpa_210m_v2_cognitive.yaml",
     "utils/device.py",
     "utils/chat_protocol.py",
+    "utils/wandb_tracker.py",
+    "scripts/colab_git_sync.py",
     "data/build_corpus.py",
     "data/cognitive_v2_sources.py",
     "data/build_sft_stage5.py",
@@ -212,6 +214,7 @@ required = [
     "notebooks/Colab_DCPA_Train.ipynb",
     "notebooks/DGX_Spark_DCPA_Train.ipynb",
     "dcpa-train-py/dcpa/compile_utils.py",
+    "dcpa-train-py/dcpa/modules/cortical.py",
     "dcpa-train-py/dcpa/model.py",
 ]
 missing = [r for r in required if r not in names]

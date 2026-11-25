@@ -18,7 +18,7 @@ pub mod weights;
 
 pub use config::DcpaConfig;
 pub use engine::{ByteIngestTrace, ConceptStepTrace, DcpaEngine};
-pub use state::{BrainSnapshot, FastWeightPrecision, HippocampusFastWeights, MotorCheckpoint};
+pub use state::{BrainSnapshot, CorticalState, FastWeightPrecision, HippocampusFastWeights, MotorCheckpoint};
 pub use weights::DcpaWeights;
 
 #[cfg(test)]
@@ -119,6 +119,14 @@ mod tests {
             tau_halt: 0.22,
             ponder_eta: 0.5,
             lambda_moe_bal: 0.01,
+            window_size: 16,
+            clause_chunk_size: 4,
+            n_enc_layers: 1,
+            n_dec_layers: 1,
+            n_heads: 4,
+            cort_expert_hidden: 64,
+            shared_expert_hidden: 64,
+            rope_theta_concept: 10000.0,
             lif_lambda: 0.85,
             lif_beta1: 1.0,
             lif_beta2: 0.5,

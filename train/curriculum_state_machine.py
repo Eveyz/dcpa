@@ -140,7 +140,7 @@ def classify_parameter(name: str, param: nn.Parameter) -> tuple[str, str]:
         owner = "hippocampus_gates"
     elif name in HIPPOCAMPUS_ADAPTER_NAMES:
         owner = "hippocampus_adapter"
-    elif name.startswith("bcg_pc.") or name.startswith("hippocampus."):
+    elif name.startswith("bcg_pc.") or name.startswith("cortical.") or name.startswith("hippocampus."):
         owner = "bcg_pc"
     elif name.startswith("pmd.w_ord.") or name.startswith("pmd.w_coh."):
         owner = "broca_cq"
@@ -164,7 +164,7 @@ def classify_parameter(name: str, param: nn.Parameter) -> tuple[str, str]:
         or name.endswith(".bias")
         or "embed" in name
         or "norm" in name
-        or name in ("sgsc.h0", "pmd.m0", "bcg_pc.s0", "bcg_pc.a0", "bcg_pc.omega0")
+        or name in ("sgsc.h0", "pmd.m0", "bcg_pc.s0", "bcg_pc.a0", "bcg_pc.omega0", "cortical.bos_concept")
     ):
         tier = "group_norm_embed_nodecay"
     else:

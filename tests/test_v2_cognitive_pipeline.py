@@ -359,7 +359,9 @@ def test_v2_cognitive_48m_config_profile_and_launcher(tmp_path: Path) -> None:
     assert cfg.num_style_domains == 5
     assert cfg.num_experts == 16
     assert cfg.top_k_experts == 2
-    assert cfg.expert_hidden == 896
+    assert cfg.expert_hidden == 384
+    assert cfg.cort_expert_hidden == 192
+    assert cfg.window_size == 128
     assert cfg.householder_max_writes == 64
     assert abs(cfg.householder_write_threshold - 0.08) < 1e-6
 
@@ -367,7 +369,7 @@ def test_v2_cognitive_48m_config_profile_and_launcher(tmp_path: Path) -> None:
         model = DCPAModel(cfg)
         counts = model.count_parameters()
     assert 47_000_000 <= counts["total"] <= 51_000_000
-    assert 10_000_000 <= counts["active_per_step"] <= 12_000_000
+    assert 14_000_000 <= counts["active_per_step"] <= 17_500_000
 
     csm = CurriculumController(raw_yaml.get("curriculum", {}))
     assert csm.boundaries == (0, 7200, 25200, 46800, 60000)

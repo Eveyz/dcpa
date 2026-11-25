@@ -281,6 +281,155 @@ class CompactHouseholderState:
         assert out is not None
         return out
 
+    def read_c_from_l_multi(self, psi_idx: torch.Tensor, psi_val: torch.Tensor) -> torch.Tensor:
+        """Batched K-slot read `M^{C<-L} @ psi` for `psi_idx/val [B, K, s]` -> `[B, K, D]` float32."""
+        B, K, s = psi_idx.shape
+        if self._m_c_base is None and not self.c_from_l_traces:
+            return torch.zeros((B, K, self.d_concept), device=psi_idx.device, dtype=torch.float32)
+
+        out: Optional[torch.Tensor] = None
+        if self._m_c_base is not None:
+            base_decay = self.gamma_hip ** (self.step_count - self._base_step_c)
+            flat_idx = psi_idx.reshape(B, K * s).unsqueeze(-1).expand(-1, -1, self.d_concept)
+            cols = self._m_c_base.gather(1, flat_idx).view(B, K, s, self.d_concept)
+            out = torch.einsum("bks,bksd->bkd", psi_val.float(), cols) * base_decay
+
+        if self.c_from_l_traces:
+            k_idx = torch.stack([t[0] for t in self.c_from_l_traces], dim=1)   # [B, W, s]
+            k_val = torch.stack([t[1] for t in self.c_from_l_traces], dim=1)   # [B, W, s]
+            deltas = torch.stack([t[2] for t in self.c_from_l_traces], dim=1)  # [B, W, D]
+            decays = torch.tensor(
+                [self.gamma_hip ** (self.step_count - t[3]) for t in self.c_from_l_traces],
+                device=psi_idx.device,
+                dtype=torch.float32,
+            ).view(1, 1, -1)  # [1, 1, W]
+            # [B, 1, W, s, 1] == [B, K, 1, 1, s] -> [B, K, W, s, s]
+            matches = k_idx.unsqueeze(1).unsqueeze(-1) == psi_idx.unsqueeze(2).unsqueeze(-2)
+            prod = (k_val.float().unsqueeze(1).unsqueeze(-1) * psi_val.float().unsqueeze(2).unsqueeze(-2)) * matches.float()
+            dots = prod.sum(dim=(-1, -2)) * decays  # [B, K, W]
+            recent = torch.einsum("bkw,bwd->bkd", dots, deltas)
+            out = recent if out is None else (out + recent)
+
+        assert out is not None
+        return out
+
+    def read_l_from_c_multi(self, phi_idx: torch.Tensor, phi_val: torch.Tensor) -> torch.Tensor:
+        """Batched K-slot read `M^{L<-C} @ phi` for `phi_idx/val [B, K, s]` -> `[B, K, d_s]` float32."""
+        B, K, s = phi_idx.shape
+        if self._m_l_base is None and not self.l_from_c_traces:
+            return torch.zeros((B, K, self.d_s), device=phi_idx.device, dtype=torch.float32)
+
+        out: Optional[torch.Tensor] = None
+        if self._m_l_base is not None:
+            base_decay = self.gamma_hip ** (self.step_count - self._base_step_l)
+            flat_idx = phi_idx.reshape(B, K * s).unsqueeze(-1).expand(-1, -1, self.d_s)
+            cols = self._m_l_base.gather(1, flat_idx).view(B, K, s, self.d_s)
+            out = torch.einsum("bks,bksd->bkd", phi_val.float(), cols) * base_decay
+
+        if self.l_from_c_traces:
+            k_idx = torch.stack([t[0] for t in self.l_from_c_traces], dim=1)
+            k_val = torch.stack([t[1] for t in self.l_from_c_traces], dim=1)
+            deltas = torch.stack([t[2] for t in self.l_from_c_traces], dim=1)
+            decays = torch.tensor(
+                [self.gamma_hip ** (self.step_count - t[3]) for t in self.l_from_c_traces],
+                device=phi_idx.device,
+                dtype=torch.float32,
+            ).view(1, 1, -1)
+            matches = k_idx.unsqueeze(1).unsqueeze(-1) == phi_idx.unsqueeze(2).unsqueeze(-2)
+            prod = (k_val.float().unsqueeze(1).unsqueeze(-1) * phi_val.float().unsqueeze(2).unsqueeze(-2)) * matches.float()
+            dots = prod.sum(dim=(-1, -2)) * decays  # [B, K, W]
+            recent = torch.einsum("bkw,bwd->bkd", dots, deltas)
+            out = recent if out is None else (out + recent)
+
+        assert out is not None
+        return out
+
+    def write_slots_wy_parallel(
+        self,
+        beta: torch.Tensor,
+        e_idx: torch.Tensor,
+        e_val: torch.Tensor,
+        s_bar: torch.Tensor,
+        phi_idx: torch.Tensor,
+        phi_val: torch.Tensor,
+        f_tilde: torch.Tensor,
+        write_threshold: float = 0.0,
+        active_slots: Optional[list[int]] = None,
+    ) -> None:
+        """Exact `O(log2 K)` nilpotent WY lower-triangular parallel Householder Gated Delta across `K` slots!
+
+        Algebraically exact (`< 1e-6` fp32) to sequential `for slot_i in range(K): write_slot(...)`:
+          `(I + N) @ Delta = diag(beta) @ (V - M_pre @ K_mat)`, where `N = strictLower(diag(beta) @ Gram)`
+        satisfies `N^K == 0` identically, so `(I + N)^{-1} = (I - N)(I + N^2)(I + N^4)...` in `log2(K)` `bmm`s!
+        """
+        B, K, s = e_idx.shape
+        slots_to_push = list(range(K)) if active_slots is None else active_slots
+        if not slots_to_push:
+            return
+
+        with fp32_island(beta.device):
+            active_mask = (beta.detach().float() > float(write_threshold)).float()  # [B, K]
+            beta_f = beta.float() * active_mask                                     # [B, K]
+            eye_k = torch.eye(K, device=beta.device, dtype=torch.float32).unsqueeze(0).expand(B, -1, -1)
+
+            def _nilpotent_wy_solve(n_strict_lower: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+                neg_n = -n_strict_lower
+                inv_l = eye_k + neg_n
+                cur_pow = neg_n
+                p_step = 1
+                while p_step * 2 < K:
+                    cur_pow = torch.bmm(cur_pow, cur_pow)
+                    inv_l = torch.bmm(inv_l, eye_k + cur_pow)
+                    p_step *= 2
+                return torch.bmm(inv_l, rhs)
+
+            # 1. Comprehension WY solve: M^{C<-L}
+            old_c = self.read_c_from_l_multi(e_idx, e_val)  # [B, K, D]
+            rhs_c = beta_f.unsqueeze(-1) * (s_bar.float() - old_c)  # [B, K, D]
+            match_c = e_idx.unsqueeze(2).unsqueeze(4) == e_idx.unsqueeze(1).unsqueeze(3)  # [B, K, K, s, s]
+            gram_c = ((e_val.float().unsqueeze(2).unsqueeze(4) * e_val.float().unsqueeze(1).unsqueeze(3)) * match_c.float()).sum(
+                dim=(-1, -2)
+            )  # [B, K, K]
+            n_c = torch.tril(beta_f.unsqueeze(-1) * gram_c, diagonal=-1)
+            deltas_c = _nilpotent_wy_solve(n_c, rhs_c)  # [B, K, D]
+
+            # 2. Expression WY solve: M^{L<-C}
+            old_l = self.read_l_from_c_multi(phi_idx, phi_val)  # [B, K, d_s]
+            rhs_l = beta_f.unsqueeze(-1) * (f_tilde.float() - old_l)  # [B, K, d_s]
+            match_l = phi_idx.unsqueeze(2).unsqueeze(4) == phi_idx.unsqueeze(1).unsqueeze(3)
+            gram_l = ((phi_val.float().unsqueeze(2).unsqueeze(4) * phi_val.float().unsqueeze(1).unsqueeze(3)) * match_l.float()).sum(
+                dim=(-1, -2)
+            )
+            n_l = torch.tril(beta_f.unsqueeze(-1) * gram_l, diagonal=-1)
+            deltas_l = _nilpotent_wy_solve(n_l, rhs_l)  # [B, K, d_s]
+
+            for slot_i in slots_to_push:
+                self.c_from_l_traces.append(
+                    (e_idx[:, slot_i].detach(), e_val[:, slot_i].detach().float(), deltas_c[:, slot_i], self.step_count)
+                )
+                if len(self.c_from_l_traces) > self.w_max:
+                    self._fold_oldest_c_trace()
+                self.l_from_c_traces.append(
+                    (phi_idx[:, slot_i].detach(), phi_val[:, slot_i].detach().float(), deltas_l[:, slot_i], self.step_count)
+                )
+                if len(self.l_from_c_traces) > self.w_max:
+                    self._fold_oldest_l_trace()
+
+            # 3. Exact commutative log-retention familiarity update across all K slots in ONE scatter_add!
+            active_e = (e_val.float() > 0).float()  # [B, K, s]
+            retain_e = (1.0 - beta_f.unsqueeze(-1) * active_e).clamp(1.0e-12, 1.0)
+            log_ret_e = torch.zeros_like(self.u_lex).scatter_add(
+                1, e_idx.reshape(B, K * s), torch.log(retain_e).reshape(B, K * s)
+            )
+            self.u_lex = (1.0 - (1.0 - self.u_lex) * torch.exp(log_ret_e)).clamp(0.0, 1.0)
+
+            active_p = (phi_val.float() > 0).float()
+            retain_p = (1.0 - beta_f.unsqueeze(-1) * active_p).clamp(1.0e-12, 1.0)
+            log_ret_p = torch.zeros_like(self.u_sem).scatter_add(
+                1, phi_idx.reshape(B, K * s), torch.log(retain_p).reshape(B, K * s)
+            )
+            self.u_sem = (1.0 - (1.0 - self.u_sem) * torch.exp(log_ret_p)).clamp(0.0, 1.0)
+
     def write_slot(
         self,
         beta: torch.Tensor,
@@ -768,7 +917,37 @@ class HippocampusDualMemory(nn.Module):
             # Stage 4 training (`thresh <= 0.0`): zero GPU->CPU sync vectorized write across all K slots!
             # Stage 5 SFT / eval (`thresh > 0.0`): single `[K]` max-beta check protects `w_max` ring buffer
             # from zero-delta dummy evictions without per-slot `.item()` stalls.
-            if float(thresh) <= 0.0:
+            if isinstance(fast_state, CompactHouseholderState):
+                if float(thresh) <= 0.0:
+                    phi_idx_all, phi_val_all = self.dg_sem(s_bar_post)  # [B, K, s]
+                    fast_state.write_slots_wy_parallel(
+                        beta=beta,
+                        e_idx=elig.e_idx,
+                        e_val=elig.e_val,
+                        s_bar=s_bar_post,
+                        phi_idx=phi_idx_all,
+                        phi_val=phi_val_all,
+                        f_tilde=elig.f_tilde,
+                        write_threshold=float(thresh),
+                        active_slots=None,
+                    )
+                else:
+                    slot_max_betas = beta.detach().amax(dim=0).to("cpu").tolist()
+                    active_slots = [si for si, mb in enumerate(slot_max_betas) if float(mb) > float(thresh)]
+                    if active_slots:
+                        phi_idx_all, phi_val_all = self.dg_sem(s_bar_post)  # [B, K, s]
+                        fast_state.write_slots_wy_parallel(
+                            beta=beta,
+                            e_idx=elig.e_idx,
+                            e_val=elig.e_val,
+                            s_bar=s_bar_post,
+                            phi_idx=phi_idx_all,
+                            phi_val=phi_val_all,
+                            f_tilde=elig.f_tilde,
+                            write_threshold=float(thresh),
+                            active_slots=active_slots,
+                        )
+            elif float(thresh) <= 0.0:
                 phi_idx_all, phi_val_all = self.dg_sem(s_bar_post)  # [B, K, s]
                 for slot_i in range(K):
                     fast_state.write_slot(

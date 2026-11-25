@@ -17,6 +17,7 @@ data/corpus/
 data/smoke_corpus/
 data/stage*/
 artifacts/
+wandb/
 dcpa_colab_bundle.zip
 *.safetensors
 *.bin

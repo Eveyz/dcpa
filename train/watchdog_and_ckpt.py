@@ -578,8 +578,9 @@ class CheckpointManager:
         config_dict: Mapping[str, Any],
         hardware_tier: str,
         rng_state: Optional[dict[str, Any]] = None,
+        wandb_run_id: Optional[str] = None,
     ) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "step": int(step),
             "stage_id": int(stage_id),
             "model_state_dict": get_clean_state_dict(model),
@@ -593,6 +594,9 @@ class CheckpointManager:
             "hardware_tier": str(hardware_tier),
             "saved_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+        if wandb_run_id:
+            payload["wandb_run_id"] = str(wandb_run_id)
+        return payload
 
     def save_healthy(self, payload: Mapping[str, Any]) -> Path:
         path = atomic_torch_save(payload, self.last_healthy_path)

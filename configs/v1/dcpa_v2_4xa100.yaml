@@ -31,8 +31,15 @@ model:
   num_style_domains: 5
   num_experts: 64
   top_k_experts: 2
-  expert_hidden: 3264
-  l_max: 12
+  expert_hidden: 1280
+  l_max: 6
+  window_size: 128
+  clause_chunk_size: 16
+  n_enc_layers: 2
+  n_dec_layers: 2
+  n_heads: 16
+  cort_expert_hidden: 960
+  shared_expert_hidden: 2048
   tau_skip: 0.32
   tau_halt: 0.22
   ponder_eta: 0.5
@@ -49,70 +56,32 @@ model:
   householder_max_writes: 32
   householder_write_threshold: 0.05
 
+wandb:
+  enabled: false
+  project: dcpa-turbo
+  mode: online
+
 presets:
   moe_3_5b:
-    d_s: 384
-    d_concept: 2048
-    k_slots: 8
-    d_r: 64
-    d_merge: 512
-    d_h: 8192
-    s_active: 64
-    d_l: 64
-    num_experts: 64
-    top_k_experts: 2
-    expert_hidden: 4352
-    l_max: 12
     tau_skip: 0.32
     tau_halt: 0.22
     lambda_act: 0.01
     lambda_moe_bal: 0.01
   moe_2_6b:
-    d_s: 384
-    d_concept: 2048
-    k_slots: 8
-    d_r: 64
-    d_merge: 512
-    d_h: 8192
-    s_active: 48
-    d_l: 64
-    num_experts: 64
-    top_k_experts: 2
-    expert_hidden: 3264
-    l_max: 12
     tau_skip: 0.32
     tau_halt: 0.22
     lambda_act: 0.01
     lambda_moe_bal: 0.01
   moe_1_8b:
-    d_s: 384
-    d_concept: 1536
-    k_slots: 8
-    d_r: 64
-    d_merge: 512
-    d_h: 8192
-    s_active: 48
-    d_l: 64
-    num_experts: 64
-    top_k_experts: 2
-    expert_hidden: 2944
-    l_max: 10
     tau_skip: 0.32
     tau_halt: 0.22
     lambda_act: 0.01
     lambda_moe_bal: 0.01
   moe_650m:
-    d_s: 256
-    d_concept: 1024
-    k_slots: 8
-    d_r: 32
-    d_merge: 384
-    d_h: 4096
-    s_active: 32
-    d_l: 64
-    num_experts: 32
-    top_k_experts: 2
-    expert_hidden: 3200
+    tau_skip: 0.32
+    tau_halt: 0.22
+    lambda_act: 0.01
+    lambda_moe_bal: 0.01
     l_max: 8
     tau_skip: 0.32
     tau_halt: 0.22

@@ -24,8 +24,15 @@ model:
   num_style_domains: 5
   num_experts: 8
   top_k_experts: 2
-  expert_hidden: 1728
-  l_max: 8
+  expert_hidden: 640
+  l_max: 4
+  window_size: 128
+  clause_chunk_size: 16
+  n_enc_layers: 2
+  n_dec_layers: 2
+  n_heads: 8
+  cort_expert_hidden: 384
+  shared_expert_hidden: 512
   tau_skip: 0.32
   tau_halt: 0.22
   ponder_eta: 0.5
@@ -42,71 +49,29 @@ model:
   householder_max_writes: 32
   householder_write_threshold: 0.05
 
-# Named model presets selectable via `--preset`
+wandb:
+  enabled: false
+  project: dcpa-turbo
+  mode: online
+
+# Named model presets selectable via `--preset` (authoritative dimensions from `DCPAConfig`)
 presets:
   proto_48m:
-    d_s: 192
-    d_concept: 512
-    k_slots: 8
-    d_r: 32
-    d_merge: 256
-    d_h: 4096
-    s_active: 32
-    d_l: 64
-    num_experts: 8
-    top_k_experts: 2
-    expert_hidden: 1728
-    l_max: 8
     tau_skip: 0.32
     tau_halt: 0.22
     lambda_act: 0.01
     lambda_moe_bal: 0.01
   standard_152m:
-    d_s: 192
-    d_concept: 768
-    k_slots: 8
-    d_r: 32
-    d_merge: 256
-    d_h: 4096
-    s_active: 32
-    d_l: 64
-    num_experts: 16
-    top_k_experts: 2
-    expert_hidden: 1920
-    l_max: 8
     tau_skip: 0.32
     tau_halt: 0.22
     lambda_act: 0.01
     lambda_moe_bal: 0.01
   moe_210m:
-    d_s: 192
-    d_concept: 768
-    k_slots: 8
-    d_r: 32
-    d_merge: 256
-    d_h: 4096
-    s_active: 32
-    d_l: 64
-    num_experts: 32
-    top_k_experts: 2
-    expert_hidden: 1344
-    l_max: 8
     tau_skip: 0.32
     tau_halt: 0.22
     lambda_act: 0.01
     lambda_moe_bal: 0.01
   micro:
-    d_s: 64
-    d_concept: 128
-    k_slots: 8
-    d_r: 32
-    d_merge: 64
-    d_h: 512
-    s_active: 16
-    d_l: 64
-    num_experts: 4
-    top_k_experts: 2
-    expert_hidden: 192
     l_max: 4
 
 # Constant-Byte-Budget & 4-tier hardware auto grad-accum sharding contract

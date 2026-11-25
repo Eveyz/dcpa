@@ -201,7 +201,7 @@ def apply_stage5_surgical_freeze(model: DCPAModel) -> dict[str, Any]:
         active_elems += param.numel()
 
         no_decay = param.ndim < 2 or pname.endswith(".bias") or "embed" in pname or "norm" in pname
-        if pname.startswith("bcg_pc."):
+        if pname.startswith("bcg_pc.") or pname.startswith("cortical."):
             (bcg_nodecay if no_decay else bcg_decay).append(param)
         else:
             # PMD all params + w_sem, w_lex_slow, w_lang_lex + shared embed/w_out + theta_out/alpha_out
@@ -309,6 +309,21 @@ def resolve_stage5_yaml_defaults(train_config_path: Optional[str | Path]) -> dic
     return dict(s5) if isinstance(s5, dict) else {}
 
 
+def _resolve_stage5_wandb_yaml(train_config_path: Optional[str | Path]) -> dict[str, Any]:
+    if not train_config_path:
+        return {}
+    p = Path(train_config_path)
+    if not p.is_file():
+        return {}
+    try:
+        import yaml  # type: ignore
+    except ImportError:
+        return {}
+    raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    wb = raw.get("wandb")
+    return dict(wb) if isinstance(wb, dict) else {}
+
+
 def run_stage5_sft(
     *,
     weights_path: str | Path,
@@ -332,6 +347,13 @@ def run_stage5_sft(
     deterministic: bool = False,
     seed: int = 202605,
     log_every: int = 50,
+    use_wandb: Optional[bool] = None,
+    wandb_project: Optional[str] = None,
+    wandb_entity: Optional[str] = None,
+    wandb_run_name: Optional[str] = None,
+    wandb_mode: Optional[str] = None,
+    wandb_tags: Optional[str] = None,
+    wandb_log_every: Optional[int] = None,
     step_hook: Optional[Callable[[int, DCPAModel, dict[str, float]], None]] = None,
 ) -> Stage5SFTSummary:
     """Run Stage 5 surgical pragmatic + capability SFT and export `dcpa_chat_sft.safetensors`."""
@@ -501,6 +523,38 @@ def run_stage5_sft(
     eot_grad_norm_max = 0.0
     t_start = time.perf_counter()
 
+    from utils.wandb_tracker import WandbTracker, resolve_wandb_settings
+
+    wb_settings = resolve_wandb_settings(
+        yaml_wandb_cfg=_resolve_stage5_wandb_yaml(train_config_path),
+        cli_enabled=use_wandb,
+        cli_project=wandb_project,
+        cli_entity=wandb_entity,
+        cli_run_name=wandb_run_name,
+        cli_mode=wandb_mode,
+        cli_tags=wandb_tags,
+        cli_log_every=wandb_log_every,
+    )
+    wb_tracker = WandbTracker(
+        enabled=bool(wb_settings["enabled"]),
+        is_primary=is_primary,
+        project=str(wb_settings["project"]),
+        entity=wb_settings["entity"],
+        run_name=wb_settings["run_name"] or f"dcpa-turbo-sft-{model.cfg.d_concept}d",
+        mode=str(wb_settings["mode"]),
+        tags=[*wb_settings["tags"], "stage5_sft"],
+        log_every_steps=int(wb_settings["log_every_steps"]),
+        logs_dir=Path(export_dir).parent / "logs",
+        config_payload={
+            "stage": "Stage5_SFT",
+            "total_steps": total_steps,
+            "global_step_bytes": global_step_bytes,
+            "active_params": int(freeze_info["active_params"]),
+            "model": model.cfg.to_dict(),
+        },
+    )
+    wb_tracker.start(resume_step=0)
+
     try:
         model.train()
         for step_idx in range(total_steps):
@@ -605,6 +659,19 @@ def run_stage5_sft(
             if step_hook is not None:
                 step_hook(completed, model, last_metrics)
 
+            elapsed_step = max(time.perf_counter() - t_start, 1e-6)
+            kb_s_step = (completed * global_step_bytes) / (elapsed_step * 1024.0)
+            if wb_tracker.should_log_step(completed, total_steps=total_steps):
+                wb_tracker.log_sft_step(
+                    step=completed,
+                    metrics=last_metrics,
+                    lr=float(optimizer.param_groups[-1]["lr"]),
+                    kb_per_sec=kb_s_step,
+                    peak_mem_gb=get_peak_memory_gb(device),
+                    eot_grad_norm_max=eot_grad_norm_max,
+                    total_steps=total_steps,
+                )
+
             if is_primary and (completed == 1 or completed == total_steps or (log_every > 0 and completed % log_every == 0)):
                 elapsed = max(time.perf_counter() - t_start, 1e-6)
                 kb_s = (completed * global_step_bytes) / (elapsed * 1024.0)
@@ -651,6 +718,7 @@ def run_stage5_sft(
             eot_grad_norm_max=eot_grad_norm_max,
         )
     finally:
+        wb_tracker.finish(summary_extra={"sft/val_bpc": val_bpc if "val_bpc" in locals() else None})
         for ds in train_datasets:
             ds.close()
         if val_ds is not None:
@@ -694,6 +762,14 @@ def main() -> None:
     ap.add_argument("--compile-mode", choices=["none", "auto", "reduce-overhead"], default="auto")
     ap.add_argument("--seed", type=int, default=202605)
     ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument("--wandb", dest="use_wandb", action="store_true", default=None, help="Enable W&B telemetry.")
+    ap.add_argument("--no-wandb", dest="use_wandb", action="store_false", help="Disable W&B telemetry.")
+    ap.add_argument("--wandb-project", type=str, default=None)
+    ap.add_argument("--wandb-entity", type=str, default=None)
+    ap.add_argument("--wandb-run-name", type=str, default=None)
+    ap.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default=None)
+    ap.add_argument("--wandb-tags", type=str, default=None)
+    ap.add_argument("--wandb-log-every", type=int, default=None)
     args = ap.parse_args()
 
     spawn_rc = maybe_relaunch_distributed(
@@ -725,6 +801,13 @@ def main() -> None:
         compile_mode=args.compile_mode,
         seed=args.seed,
         log_every=args.log_every,
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.wandb_run_name,
+        wandb_mode=args.wandb_mode,
+        wandb_tags=args.wandb_tags,
+        wandb_log_every=args.wandb_log_every,
     )
 
 

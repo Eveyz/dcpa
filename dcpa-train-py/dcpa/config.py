@@ -54,12 +54,22 @@ class DCPAConfig:
     # Sparse micro-experts & adaptive pondering
     num_experts: int = 16
     top_k_experts: int = 2
-    expert_hidden: int = 1152
-    l_max: int = 8
+    expert_hidden: int = 768
+    l_max: int = 4
     tau_skip: float = 0.65
     tau_halt: float = 0.35
     ponder_eta: float = 0.5
     lambda_moe_bal: float = 0.01
+
+    # DCPA-Turbo Parallel Cortical Sandwich & Clause-Chunk Graph parameters
+    window_size: int = 128
+    clause_chunk_size: int = 16
+    n_enc_layers: int = 2
+    n_dec_layers: int = 2
+    n_heads: int = 8
+    cort_expert_hidden: int = 384
+    shared_expert_hidden: int = 512
+    rope_theta_concept: float = 10000.0
 
     # SGSC LIF spike gate & segment bounds
     lif_lambda: float = 0.85
@@ -128,6 +138,20 @@ class DCPAConfig:
             raise ValueError("PMD differentiable pushdown stack must be 16x4 (128B in bf16).")
         if self.d_l != 64:
             raise ValueError("Language/register control dimension d_l must be 64.")
+        if self.window_size < 4:
+            raise ValueError(f"window_size must be >= 4, got {self.window_size}")
+        if self.clause_chunk_size < 1:
+            raise ValueError(f"clause_chunk_size must be >= 1, got {self.clause_chunk_size}")
+        # Ensure d_head = d_concept // n_heads is divisible by 8 for 2D Concept-RoPE
+        if self.d_concept % self.n_heads != 0 or (self.d_concept // self.n_heads) % 8 != 0:
+            for cand_h in (16, 12, 8, 4, 2, 1):
+                if self.d_concept % cand_h == 0 and (self.d_concept // cand_h) % 8 == 0:
+                    self.n_heads = cand_h
+                    break
+            else:
+                raise ValueError(
+                    f"Cannot partition d_concept={self.d_concept} into n_heads={self.n_heads} with d_head % 8 == 0."
+                )
 
     @property
     def num_merge_pairs(self) -> int:
@@ -135,12 +159,31 @@ class DCPAConfig:
 
     @classmethod
     def base(cls) -> DCPAConfig:
-        """DCPA-Base (~95M slow weights, standard engineering blueprint reference)."""
-        return cls()
+        """DCPA-Turbo Base (~96M slow weights, standard engineering blueprint reference)."""
+        return cls(
+            d_s=192,
+            d_concept=768,
+            k_slots=8,
+            d_r=32,
+            d_merge=256,
+            d_h=4096,
+            s_active=32,
+            num_experts=16,
+            top_k_experts=2,
+            expert_hidden=448,
+            l_max=4,
+            window_size=128,
+            clause_chunk_size=16,
+            n_enc_layers=2,
+            n_dec_layers=2,
+            n_heads=8,
+            cort_expert_hidden=256,
+            shared_expert_hidden=512,
+        )
 
     @classmethod
     def standard_152m(cls) -> DCPAConfig:
-        """DCPA-152M Standard Preset (~152.0M slow weights, ~22M active per step)."""
+        """DCPA-Turbo 152M Standard Preset (~152M slow weights, full-batch parallel MoE)."""
         return cls(
             d_s=192,
             d_concept=768,
@@ -152,8 +195,15 @@ class DCPAConfig:
             d_l=64,
             num_experts=16,
             top_k_experts=2,
-            expert_hidden=1920,
-            l_max=8,
+            expert_hidden=768,
+            l_max=4,
+            window_size=128,
+            clause_chunk_size=16,
+            n_enc_layers=2,
+            n_dec_layers=2,
+            n_heads=8,
+            cort_expert_hidden=448,
+            shared_expert_hidden=768,
             tau_skip=0.32,
             tau_halt=0.22,
             lambda_act=0.01,
@@ -161,7 +211,7 @@ class DCPAConfig:
 
     @classmethod
     def moe_210m(cls) -> DCPAConfig:
-        """DCPA-210M Sparse Micro-MoE Preset (32 experts Top-2 active, ~210M total / ~22-24M active)."""
+        """DCPA-Turbo 210M Sparse MoE Preset (32 experts Top-2 + Shared Expert, ~212M total)."""
         return cls(
             d_s=192,
             d_concept=768,
@@ -173,8 +223,15 @@ class DCPAConfig:
             d_l=64,
             num_experts=32,
             top_k_experts=2,
-            expert_hidden=1344,
-            l_max=8,
+            expert_hidden=512,
+            l_max=4,
+            window_size=128,
+            clause_chunk_size=16,
+            n_enc_layers=2,
+            n_dec_layers=2,
+            n_heads=8,
+            cort_expert_hidden=384,
+            shared_expert_hidden=768,
             tau_skip=0.32,
             tau_halt=0.22,
             lambda_moe_bal=0.01,
@@ -190,7 +247,7 @@ class DCPAConfig:
 
     @classmethod
     def moe_650m(cls) -> DCPAConfig:
-        """DCPA-650M Sparse MoE Preset (32 experts Top-2 active, ~653M total / ~63M active)."""
+        """DCPA-Turbo 650M Sparse MoE Preset (32 experts Top-2 + Shared Expert, ~652M total)."""
         return cls(
             d_s=256,
             d_concept=1024,
@@ -202,8 +259,15 @@ class DCPAConfig:
             d_l=64,
             num_experts=32,
             top_k_experts=2,
-            expert_hidden=3200,
-            l_max=8,
+            expert_hidden=1280,
+            l_max=4,
+            window_size=128,
+            clause_chunk_size=16,
+            n_enc_layers=2,
+            n_dec_layers=2,
+            n_heads=8,
+            cort_expert_hidden=896,
+            shared_expert_hidden=1024,
             tau_skip=0.32,
             tau_halt=0.22,
             lambda_moe_bal=0.01,
@@ -219,7 +283,7 @@ class DCPAConfig:
 
     @classmethod
     def moe_1_8b(cls) -> DCPAConfig:
-        """DCPA v2-Pro 1.8B Sparse MoE Preset (64 experts Top-2 active, ~1.79B total / ~145M active)."""
+        """DCPA-Turbo 1.8B Sparse MoE Preset (64 experts Top-2 + Shared Expert, ~1.80B total)."""
         return cls(
             d_s=384,
             d_concept=1536,
@@ -231,8 +295,15 @@ class DCPAConfig:
             d_l=64,
             num_experts=64,
             top_k_experts=2,
-            expert_hidden=2944,
-            l_max=10,
+            expert_hidden=1152,
+            l_max=6,
+            window_size=128,
+            clause_chunk_size=16,
+            n_enc_layers=2,
+            n_dec_layers=2,
+            n_heads=12,
+            cort_expert_hidden=896,
+            shared_expert_hidden=1536,
             tau_skip=0.32,
             tau_halt=0.22,
             lambda_moe_bal=0.01,
@@ -248,7 +319,7 @@ class DCPAConfig:
 
     @classmethod
     def moe_2_6b(cls) -> DCPAConfig:
-        """DCPA v2-Max 2.6B Sparse MoE Preset (64 experts Top-2 active, ~2.66B total / ~195M active)."""
+        """DCPA-Turbo 2.6B Sparse MoE Preset (64 experts Top-2 + Shared Expert, ~2.64B total)."""
         return cls(
             d_s=384,
             d_concept=2048,
@@ -260,8 +331,15 @@ class DCPAConfig:
             d_l=64,
             num_experts=64,
             top_k_experts=2,
-            expert_hidden=3264,
-            l_max=12,
+            expert_hidden=1280,
+            l_max=6,
+            window_size=128,
+            clause_chunk_size=16,
+            n_enc_layers=2,
+            n_dec_layers=2,
+            n_heads=16,
+            cort_expert_hidden=960,
+            shared_expert_hidden=2048,
             tau_skip=0.32,
             tau_halt=0.22,
             lambda_moe_bal=0.01,
@@ -277,7 +355,7 @@ class DCPAConfig:
 
     @classmethod
     def moe_3_5b(cls) -> DCPAConfig:
-        """DCPA v2-Ultra 3.5B Sparse MoE Preset (64 experts Top-2 active, ~3.51B total / ~248M active)."""
+        """DCPA-Turbo 3.5B Sparse MoE Preset (64 experts Top-2 + Shared Expert, ~3.50B total)."""
         return cls(
             d_s=384,
             d_concept=2048,
@@ -289,8 +367,15 @@ class DCPAConfig:
             d_l=64,
             num_experts=64,
             top_k_experts=2,
-            expert_hidden=4352,
-            l_max=12,
+            expert_hidden=1728,
+            l_max=6,
+            window_size=128,
+            clause_chunk_size=16,
+            n_enc_layers=2,
+            n_dec_layers=2,
+            n_heads=16,
+            cort_expert_hidden=1280,
+            shared_expert_hidden=2048,
             tau_skip=0.32,
             tau_halt=0.22,
             lambda_moe_bal=0.01,
@@ -306,7 +391,7 @@ class DCPAConfig:
 
     @classmethod
     def proto_48m(cls) -> DCPAConfig:
-        """DCPA-48M Prototype Preset (~47.6M slow weights: d_s=192, D=512, K=8, d_h=4096, s=32)."""
+        """DCPA-Turbo 48M Prototype Preset (~48.4M slow weights: d_s=192, D=512, K=8, W=128)."""
         return cls(
             d_s=192,
             d_concept=512,
@@ -318,8 +403,15 @@ class DCPAConfig:
             d_l=64,
             num_experts=8,
             top_k_experts=2,
-            expert_hidden=1728,
-            l_max=8,
+            expert_hidden=640,
+            l_max=4,
+            window_size=128,
+            clause_chunk_size=16,
+            n_enc_layers=2,
+            n_dec_layers=2,
+            n_heads=8,
+            cort_expert_hidden=384,
+            shared_expert_hidden=512,
             tau_skip=0.32,
             tau_halt=0.22,
             lambda_moe_bal=0.01,
@@ -335,7 +427,7 @@ class DCPAConfig:
 
     @classmethod
     def tiny(cls) -> DCPAConfig:
-        """DCPA-Tiny (~48M slow weights, ~14M active per step)."""
+        """DCPA-Turbo Tiny (~36M slow weights, fast parity & CPU verification)."""
         return cls(
             d_s=128,
             d_concept=512,
@@ -346,15 +438,22 @@ class DCPAConfig:
             s_active=24,
             num_experts=8,
             top_k_experts=2,
-            expert_hidden=768,
+            expert_hidden=512,
             l_max=4,
+            window_size=32,
+            clause_chunk_size=4,
+            n_enc_layers=1,
+            n_dec_layers=1,
+            n_heads=8,
+            cort_expert_hidden=256,
+            shared_expert_hidden=384,
             lr_micro=8e-4,
             lr_concept=4e-4,
         )
 
     @classmethod
     def micro(cls) -> DCPAConfig:
-        """DCPA-Micro for rapid local testing and gate verification (all invariants preserved)."""
+        """DCPA-Turbo Micro for rapid local testing and gate verification (all invariants preserved)."""
         return cls(
             d_s=64,
             d_concept=128,
@@ -365,8 +464,15 @@ class DCPAConfig:
             s_active=16,
             num_experts=4,
             top_k_experts=2,
-            expert_hidden=192,
+            expert_hidden=128,
             l_max=4,
+            window_size=32,
+            clause_chunk_size=4,
+            n_enc_layers=1,
+            n_dec_layers=1,
+            n_heads=4,
+            cort_expert_hidden=96,
+            shared_expert_hidden=128,
             lr_micro=1e-3,
             lr_concept=5e-4,
         )

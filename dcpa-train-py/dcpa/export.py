@@ -22,7 +22,9 @@ from safetensors.torch import save_file
 
 from dcpa.compile_utils import get_clean_state_dict
 from dcpa.model import DCPAModel
+from dcpa.modules.cortical import CorticalCarryState
 from dcpa.modules.hippocampus import EligibilityState
+from dcpa.ops.rope import compute_segment_scope_depths
 
 
 def extract_flat_state_dict(model: DCPAModel, dtype: torch.dtype = torch.float32) -> dict[str, torch.Tensor]:
@@ -48,7 +50,7 @@ def extract_flat_state_dict(model: DCPAModel, dtype: torch.dtype = torch.float32
     for name, tensor in get_clean_state_dict(model).items():
         if name in skip_keys:
             continue
-        # Unpack native 3D stacked MoE weights into flat per-expert Rust/safetensors keys
+        # Unpack native 3D stacked BCG-PC Pondering MoE weights into flat per-expert Rust/safetensors keys
         if name in ("bcg_pc.moe.w_gu1", "bcg_pc.moe.w_d1", "bcg_pc.moe.w_gu2", "bcg_pc.moe.w_d2"):
             t_cpu = tensor.detach().to(device="cpu", dtype=dtype).contiguous()
             n_exp = int(t_cpu.shape[0])
@@ -68,6 +70,21 @@ def extract_flat_state_dict(model: DCPAModel, dtype: torch.dtype = torch.float32
             else:
                 for e in range(n_exp):
                     tensors[f"bcg_pc.moe.experts.{e}.w_down2.weight"] = t_cpu[e].contiguous()
+            continue
+        # Unpack native 3D stacked Cortical Sandwich MoE weights into flat per-expert Rust/safetensors keys
+        if name.endswith(".moe.w_gu") or name.endswith(".moe.w_d"):
+            t_cpu = tensor.detach().to(device="cpu", dtype=dtype).contiguous()
+            n_exp = int(t_cpu.shape[0])
+            if name.endswith(".moe.w_gu"):
+                pref = name[: -len("w_gu")]
+                h = int(t_cpu.shape[1]) // 2
+                for e in range(n_exp):
+                    tensors[f"{pref}experts.{e}.w_gate.weight"] = t_cpu[e, :h].contiguous()
+                    tensors[f"{pref}experts.{e}.w_up.weight"] = t_cpu[e, h:].contiguous()
+            else:
+                pref = name[: -len("w_d")]
+                for e in range(n_exp):
+                    tensors[f"{pref}experts.{e}.w_down.weight"] = t_cpu[e].contiguous()
             continue
         t = tensor.detach().to(device="cpu", dtype=dtype).contiguous()
         if name == "sgsc.theta_raw":
@@ -105,17 +122,27 @@ def export_model_and_golden(
     lang_t = torch.tensor([lang_id], dtype=torch.long)
 
     with torch.no_grad():
-        # Module 1: SGSC
+        # Module 1: SGSC + causal segment scope depths
         sgsc_out = model_cpu.sgsc(raw_bytes, tau_s=0.35)
         m_total = sgsc_out.f_stem.shape[0]
         l_reg = model_cpu.pmd.get_lang_vec(lang_t)  # [1, 64]
+        seg_doc_start = torch.zeros((m_total,), dtype=torch.bool)
+        if m_total > 0:
+            seg_doc_start[0] = True
+        seg_start_depth, seg_end_depth, final_ast = compute_segment_scope_depths(
+            raw_bytes, sgsc_out.cu_seqlens, seg_doc_start
+        )
 
-        # Initialize single-session working states
+        # Initialize single-session O(1) working states
+        cortical_state = model_cpu.cortical.init_carry_state(1, device=torch.device("cpu"), dtype=torch.float32)
         graph_state = model_cpu.bcg_pc.init_state(1, device=torch.device("cpu"), dtype=torch.float32)
         fast_state = model_cpu.hippocampus.init_fast_state(1, mode="column_major", storage_dtype=torch.float32)
-        elig_state = EligibilityState.zeros(1, model_cpu.cfg.k_slots, model_cpu.cfg.s_active, model_cpu.cfg.d_s, torch.device("cpu"), torch.float32)
+        elig_state = EligibilityState.zeros(
+            1, model_cpu.cfg.k_slots, model_cpu.cfg.s_active, model_cpu.cfg.d_s, torch.device("cpu"), torch.float32
+        )
 
         # Step through all M_total segments identically to Rust streaming engine
+        all_h_enc = []
         all_c_fused = []
         all_prec_bu = []
         all_ach = []
@@ -128,10 +155,18 @@ def export_model_and_golden(
             c_m = sgsc_out.c_slow[m : m + 1]
             sn_m = sgsc_out.sem_norm[m : m + 1]
             mi_m = sgsc_out.mean_info[m : m + 1]
+            end_dep_m = seg_end_depth[m : m + 1]
+
+            h_enc_m, cortical_state = model_cpu.cortical.encode_step_streaming(
+                c_slow_step=c_m,
+                f_stem_step=f_m,
+                seg_end_depth=end_dep_m,
+                carry=cortical_state,
+            )
 
             hip_r = model_cpu.hippocampus.read_comprehension(
                 f_stem=f_m,
-                c_slow=c_m,
+                c_slow=h_enc_m,
                 sem_norm=sn_m,
                 mean_info=mi_m,
                 fast_state=fast_state,
@@ -147,6 +182,16 @@ def export_model_and_golden(
                 update_c0_ema=False,
             )
             graph_state = bcg_o.state
+            cortical_state = CorticalCarryState(
+                ring_kv=cortical_state.ring_kv,
+                ring_pos=cortical_state.ring_pos,
+                ring_depth=cortical_state.ring_depth,
+                ring_valid=cortical_state.ring_valid,
+                doc_pos=cortical_state.doc_pos,
+                ast_depth=cortical_state.ast_depth,
+                prev_z_ref=bcg_o.z_star.detach().clone(),
+                has_prev_seg=torch.ones_like(cortical_state.has_prev_seg),
+            )
             elig_state = model_cpu.hippocampus.inherit_eligibility_on_merge(
                 elig=elig_state,
                 cand_idx=hip_r.psi_idx,
@@ -165,12 +210,33 @@ def export_model_and_golden(
                 write_threshold=0.0,
             )
 
+            all_h_enc.append(h_enc_m[0])
             all_c_fused.append(hip_r.c_fused[0])
             all_prec_bu.append(hip_r.prec_bu[0])
             all_ach.append(hip_r.ach_signal[0])
             all_z_star.append(bcg_o.z_star[0])
             all_g_ctx.append(bcg_o.g_ctx[0])
             all_win_pair.append(bcg_o.win_pair_idx[0])
+
+        cortical_state = CorticalCarryState(
+            ring_kv=cortical_state.ring_kv,
+            ring_pos=cortical_state.ring_pos,
+            ring_depth=cortical_state.ring_depth,
+            ring_valid=cortical_state.ring_valid,
+            doc_pos=cortical_state.doc_pos,
+            ast_depth=final_ast.clamp(0, 31),
+            prev_z_ref=cortical_state.prev_z_ref,
+            has_prev_seg=cortical_state.has_prev_seg,
+        )
+        assert graph_state.phase is not None
+        z_dec_next, copy_stem_next = model_cpu.cortical.decode_step_streaming(
+            l_reg=l_reg,
+            carry=cortical_state,
+            slots=graph_state.slots,
+            edges=graph_state.edges,
+            salience=graph_state.salience,
+            phase=graph_state.phase,
+        )
 
         # Also test explicit single-step Hippocampus retrieval on segment 0 after all writes
         psi0_idx, psi0_val = model_cpu.hippocampus.dg_lex(sgsc_out.f_stem[0:1])
@@ -230,6 +296,9 @@ def export_model_and_golden(
         "sgsc.f_stem": sgsc_out.f_stem.float().contiguous(),
         "sgsc.c_slow": sgsc_out.c_slow.float().contiguous(),
         "sgsc.mean_info": sgsc_out.mean_info.float().contiguous(),
+        "cortical.h_enc": torch.stack(all_h_enc, dim=0).float().contiguous(),
+        "cortical.z_dec": z_dec_next[0].float().contiguous(),
+        "cortical.copy_stem": copy_stem_next[0].float().contiguous(),
         "hip.c_fused": torch.stack(all_c_fused, dim=0).float().contiguous(),
         "hip.prec_bu": torch.stack(all_prec_bu, dim=0).float().contiguous(),
         "hip.ach": torch.stack(all_ach, dim=0).float().contiguous(),
@@ -240,6 +309,7 @@ def export_model_and_golden(
         "bcg.final_slots": graph_state.slots[0].float().contiguous(),
         "bcg.final_edges": graph_state.edges[0].float().contiguous(),
         "bcg.final_salience": graph_state.salience[0].float().contiguous(),
+        "bcg.final_phase": graph_state.phase[0].float().contiguous(),
         "bcg.win_pair": torch.stack(all_win_pair, dim=0).to(torch.int64).contiguous(),
         "pmd.cq_z_out": cq_out.z_out[0].float().contiguous(),
         "pmd.cq_delta_syn": cq_out.delta_syn[0].float().contiguous(),

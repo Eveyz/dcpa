@@ -102,6 +102,35 @@ def migrate_legacy_moe_state_dict(state_dict: Mapping[str, Any]) -> dict[str, An
                 [torch.cat([g, u], dim=0) for g, u in zip(g2_l, u2_l)], dim=0
             ).contiguous()
             out[f"{pref}w_d2"] = torch.stack(d2_l, dim=0).contiguous()
+    legacy_1blk_prefixes: set[str] = set()
+    for k in list(out.keys()):
+        if k.endswith("experts.0.w_gate.weight"):
+            legacy_1blk_prefixes.add(k[: -len("experts.0.w_gate.weight")])
+
+    for pref in sorted(legacy_1blk_prefixes):
+        if f"{pref}w_gu" in out:
+            continue
+        n_exp = 0
+        while f"{pref}experts.{n_exp}.w_gate.weight" in out:
+            n_exp += 1
+        if n_exp == 0:
+            continue
+        g_l, u_l, d_l = [], [], []
+        ok = True
+        for e in range(n_exp):
+            ep = f"{pref}experts.{e}."
+            ks = (f"{ep}w_gate.weight", f"{ep}w_up.weight", f"{ep}w_down.weight")
+            if not all(k in out for k in ks):
+                ok = False
+                break
+            g_l.append(out.pop(ks[0]))
+            u_l.append(out.pop(ks[1]))
+            d_l.append(out.pop(ks[2]))
+        if ok:
+            out[f"{pref}w_gu"] = torch.stack(
+                [torch.cat([g, u], dim=0) for g, u in zip(g_l, u_l)], dim=0
+            ).contiguous()
+            out[f"{pref}w_d"] = torch.stack(d_l, dim=0).contiguous()
     return out
 
 

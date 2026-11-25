@@ -1,4 +1,4 @@
-//! Pure static Rust safetensors parser & flat-named slow weight container.
+//! Pure static Rust safetensors parser & flat-named slow weight container for DCPA-Turbo.
 //!
 //! Zero Python, zero LibTorch, zero external ML runtime dependencies!
 //! Parses the standard safetensors binary layout:
@@ -8,10 +8,10 @@
 use alloc::collections::BTreeMap;
 #[cfg(feature = "std")]
 use alloc::format;
-#[cfg(feature = "std")]
-use alloc::string::ToString;
 use alloc::string::String;
 #[cfg(feature = "std")]
+use alloc::string::ToString;
+#[cfg(any(feature = "std", test))]
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -216,7 +216,73 @@ impl ExpertWeights {
     }
 }
 
-/// All read-only slow weights and frozen orthogonal buffers of DCPA.
+pub struct CorticalRoutedExpert {
+    pub w_gate: ExpertMatrix, // [cort_expert_hidden, D]
+    pub w_up: ExpertMatrix,   // [cort_expert_hidden, D]
+    pub w_down: ExpertMatrix, // [D, cort_expert_hidden]
+}
+
+impl CorticalRoutedExpert {
+    pub fn pack_bf16(&mut self) {
+        self.w_gate.pack_bf16();
+        self.w_up.pack_bf16();
+        self.w_down.pack_bf16();
+    }
+}
+
+pub struct CorticalMoEWeights {
+    pub norm: Vec<f32>,               // [D]
+    pub shared_w_gu: ExpertMatrix,    // [2 * shared_expert_hidden, D]
+    pub shared_w_d: ExpertMatrix,     // [D, shared_expert_hidden]
+    pub router: Vec<f32>,             // [num_experts, D]
+    pub experts: Vec<CorticalRoutedExpert>,
+}
+
+impl CorticalMoEWeights {
+    pub fn pack_bf16(&mut self) {
+        self.shared_w_gu.pack_bf16();
+        self.shared_w_d.pack_bf16();
+        for exp in &mut self.experts {
+            exp.pack_bf16();
+        }
+    }
+}
+
+pub struct CorticalEncoderLayerWeights {
+    pub norm_attn: Vec<f32>, // [D]
+    pub w_q: Vec<f32>,       // [D, D]
+    pub w_uk: Vec<f32>,      // [D, d_s]
+    pub w_uv: Vec<f32>,      // [D, d_s]
+    pub w_o: Vec<f32>,       // [D, D]
+    pub moe: CorticalMoEWeights,
+}
+
+impl CorticalEncoderLayerWeights {
+    pub fn pack_bf16(&mut self) {
+        self.moe.pack_bf16();
+    }
+}
+
+pub struct CorticalDecoderLayerWeights {
+    pub norm_attn: Vec<f32>, // [D]
+    pub w_q: Vec<f32>,       // [D, D]
+    pub w_uk: Vec<f32>,      // [D, d_s]
+    pub w_uv: Vec<f32>,      // [D, d_s]
+    pub w_edge_in: Vec<f32>, // [D, d_r]
+    pub w_phase: Vec<f32>,   // [D, 32]
+    pub w_gk: Vec<f32>,      // [D, D]
+    pub w_gv: Vec<f32>,      // [D, D]
+    pub w_o: Vec<f32>,       // [D, D]
+    pub moe: CorticalMoEWeights,
+}
+
+impl CorticalDecoderLayerWeights {
+    pub fn pack_bf16(&mut self) {
+        self.moe.pack_bf16();
+    }
+}
+
+/// All read-only slow weights and frozen orthogonal buffers of DCPA-Turbo.
 pub struct DcpaWeights {
     pub cfg: DcpaConfig,
 
@@ -235,6 +301,17 @@ pub struct DcpaWeights {
     pub sgsc_w_res: Vec<f32>,      // [D, d_s]
     pub sgsc_w_sem: Vec<f32>,      // [D, d_s]
     pub sgsc_norm_c: Vec<f32>,     // [D]
+
+    // Module 1.5 / 3.5: Parallel Cortical Sandwich (`CorticalSandwich`)
+    pub cort_w_kv_c: Vec<f32>,       // [d_s, D]
+    pub cort_norm_kv: Vec<f32>,      // [d_s]
+    pub cort_enc_layers: Vec<CorticalEncoderLayerWeights>,
+    pub cort_norm_enc_out: Vec<f32>, // [D]
+    pub cort_bos_concept: Vec<f32>,  // [D]
+    pub cort_w_lang_dec: Vec<f32>,   // [D, d_l]
+    pub cort_dec_layers: Vec<CorticalDecoderLayerWeights>,
+    pub cort_norm_dec_out: Vec<f32>, // [D]
+    pub cort_w_copy_out: Vec<f32>,   // [d_s, d_s]
 
     // Module 2: BCG-PC
     pub bcg_s0: Vec<f32>,          // [K, D]
@@ -272,6 +349,10 @@ pub struct DcpaWeights {
     pub bcg_norm_merge: Vec<f32>,  // [D]
     pub bcg_w_omega: Vec<f32>,     // [D]
     pub bcg_kappa_omega: f32,
+    pub bcg_w_lambda_w: Vec<f32>,     // [K, D]
+    pub bcg_w_lambda_b: Vec<f32>,     // [K]
+    pub bcg_w_slot_phase: Vec<f32>,   // [D, 16]
+    pub bcg_norm_clause: Vec<f32>,    // [D]
 
     // Module 3: Hippocampus frozen projections & slow gates
     pub hip_r_lex: Vec<f32>,       // [d_h, d_s]
@@ -335,6 +416,57 @@ impl DcpaWeights {
         let d_h = cfg.d_h;
         let d_l = cfg.d_l;
         let eh = cfg.expert_hidden;
+        let ch = cfg.cort_expert_hidden;
+        let sh = cfg.shared_expert_hidden;
+
+        let make_cort_moe = |seed_base: usize| -> CorticalMoEWeights {
+            let mut exps = Vec::with_capacity(cfg.num_experts);
+            for e in 0..cfg.num_experts {
+                exps.push(CorticalRoutedExpert {
+                    w_gate: ExpertMatrix::F32(fill(ch * d, seed_base + e * 3 + 1)),
+                    w_up: ExpertMatrix::F32(fill(ch * d, seed_base + e * 3 + 2)),
+                    w_down: ExpertMatrix::F32(fill(d * ch, seed_base + e * 3 + 3)),
+                });
+            }
+            CorticalMoEWeights {
+                norm: vec![1.0f32; d],
+                shared_w_gu: ExpertMatrix::F32(fill(2 * sh * d, seed_base + 501)),
+                shared_w_d: ExpertMatrix::F32(fill(d * sh, seed_base + 503)),
+                router: fill(cfg.num_experts * d, seed_base + 509),
+                experts: exps,
+            }
+        };
+
+        let mut enc_layers = Vec::with_capacity(cfg.n_enc_layers);
+        for l in 0..cfg.n_enc_layers {
+            let sb = 1000 + l * 100;
+            enc_layers.push(CorticalEncoderLayerWeights {
+                norm_attn: vec![1.0f32; d],
+                w_q: fill(d * d, sb + 1),
+                w_uk: fill(d * d_s, sb + 3),
+                w_uv: fill(d * d_s, sb + 5),
+                w_o: fill(d * d, sb + 7),
+                moe: make_cort_moe(sb + 11),
+            });
+        }
+
+        let mut dec_layers = Vec::with_capacity(cfg.n_dec_layers);
+        for l in 0..cfg.n_dec_layers {
+            let sb = 2000 + l * 100;
+            dec_layers.push(CorticalDecoderLayerWeights {
+                norm_attn: vec![1.0f32; d],
+                w_q: fill(d * d, sb + 1),
+                w_uk: fill(d * d_s, sb + 3),
+                w_uv: fill(d * d_s, sb + 5),
+                w_edge_in: fill(d * d_r, sb + 7),
+                w_phase: fill(d * 32, sb + 9),
+                w_gk: fill(d * d, sb + 11),
+                w_gv: fill(d * d, sb + 13),
+                w_o: fill(d * d, sb + 15),
+                moe: make_cort_moe(sb + 21),
+            });
+        }
+
         let mut experts = Vec::with_capacity(cfg.num_experts);
         for e in 0..cfg.num_experts {
             experts.push(ExpertWeights {
@@ -357,13 +489,24 @@ impl DcpaWeights {
             sgsc_w_q: fill(d_s * d_s, 31),
             sgsc_w_k: fill(d_s * d_s, 37),
             sgsc_w_f: fill(d_s * d_s, 41),
-            sgsc_norm_f: alloc::vec![1.0f32; d_s],
+            sgsc_norm_f: vec![1.0f32; d_s],
             sgsc_w_res: fill(d * d_s, 43),
             sgsc_w_sem: fill(d * d_s, 47),
-            sgsc_norm_c: alloc::vec![1.0f32; d],
+            sgsc_norm_c: vec![1.0f32; d],
+
+            cort_w_kv_c: fill(d_s * d, 51),
+            cort_norm_kv: vec![1.0f32; d_s],
+            cort_enc_layers: enc_layers,
+            cort_norm_enc_out: vec![1.0f32; d],
+            cort_bos_concept: fill(d, 55),
+            cort_w_lang_dec: fill(d * d_l, 57),
+            cort_dec_layers: dec_layers,
+            cort_norm_dec_out: vec![1.0f32; d],
+            cort_w_copy_out: vec![0.0f32; d_s * d_s],
+
             bcg_s0: fill(k * d, 53),
             bcg_a0: fill(k * k * d_r, 59),
-            bcg_omega0: alloc::vec![0.0f32; k],
+            bcg_omega0: vec![0.0f32; k],
             bcg_c0: fill(d, 61),
             bcg_w_e: fill(d * d_r, 67),
             bcg_f_pred_1_w: fill(d * d, 71),
@@ -382,7 +525,7 @@ impl DcpaWeights {
             bcg_ca_wo: fill(d * d, 137),
             bcg_moe_router: fill(cfg.num_experts * d, 139),
             bcg_experts: experts,
-            bcg_norm_ponder: alloc::vec![1.0f32; d],
+            bcg_norm_ponder: vec![1.0f32; d],
             bcg_u_src: fill(d_r * d, 149),
             bcg_u_dst: fill(d_r * d, 151),
             bcg_w_l: fill(d_m * d, 157),
@@ -393,9 +536,14 @@ impl DcpaWeights {
             bcg_w_g_b: fill(d, 181),
             bcg_w_comp_w: fill(d * 2 * d, 191),
             bcg_w_comp_b: fill(d, 193),
-            bcg_norm_merge: alloc::vec![1.0f32; d],
+            bcg_norm_merge: vec![1.0f32; d],
             bcg_w_omega: fill(d, 197),
             bcg_kappa_omega: 0.5,
+            bcg_w_lambda_w: fill(k * d, 198),
+            bcg_w_lambda_b: vec![2.0f32; k],
+            bcg_w_slot_phase: fill(d * 16, 200),
+            bcg_norm_clause: vec![1.0f32; d],
+
             hip_r_lex: fill(d_h * d_s, 199),
             hip_r_sem: fill(d_h * d, 211),
             hip_alpha_1: 1.0,
@@ -413,8 +561,8 @@ impl DcpaWeights {
             hip_w_lang_lex: fill(d * d_l, 233),
             pmd_lang_embed: fill(cfg.num_lang_domains * (d_l / 2), 239),
             pmd_style_embed: fill(cfg.num_style_domains * (d_l / 2), 241),
-            pmd_norm_lang: alloc::vec![1.0f32; d_l / 2],
-            pmd_norm_style: alloc::vec![1.0f32; d_l / 2],
+            pmd_norm_lang: vec![1.0f32; d_l / 2],
+            pmd_norm_style: vec![1.0f32; d_l / 2],
             pmd_w_ord: fill(d_r * d_l, 251),
             pmd_w_coh: fill(d_r * d_l, 257),
             pmd_w_syn_w: fill(d_s * (d_r + d_l), 263),
@@ -425,7 +573,7 @@ impl DcpaWeights {
             pmd_w_chi_w: fill(3 * d_s, 283),
             pmd_w_chi_b: 1.0,
             pmd_w_act_w: fill(3 * (d_s + d_l), 293),
-            pmd_w_act_b: alloc::vec![-1.5, -1.5, 2.0],
+            pmd_w_act_b: vec![-1.5, -1.5, 2.0],
             pmd_w_tag_w: fill(4 * d_s, 307),
             pmd_w_tag_b: fill(4, 311),
             pmd_w_st: fill(d_s * 8, 313),
@@ -461,10 +609,72 @@ fn take_scalar(map: &mut BTreeMap<String, RawTensor>, k: &str) -> Result<f32, St
 }
 
 #[cfg(feature = "std")]
+fn load_cort_moe(
+    map: &mut BTreeMap<String, RawTensor>,
+    prefix: &str,
+    num_experts: usize,
+) -> Result<CorticalMoEWeights, String> {
+    let mut experts = Vec::with_capacity(num_experts);
+    for e in 0..num_experts {
+        experts.push(CorticalRoutedExpert {
+            w_gate: ExpertMatrix::from_f32_vec(take_vec(
+                map,
+                &format!("{}experts.{}.w_gate.weight", prefix, e),
+            )?),
+            w_up: ExpertMatrix::from_f32_vec(take_vec(
+                map,
+                &format!("{}experts.{}.w_up.weight", prefix, e),
+            )?),
+            w_down: ExpertMatrix::from_f32_vec(take_vec(
+                map,
+                &format!("{}experts.{}.w_down.weight", prefix, e),
+            )?),
+        });
+    }
+    Ok(CorticalMoEWeights {
+        norm: take_vec(map, &format!("{}norm.weight", prefix))?,
+        shared_w_gu: ExpertMatrix::from_f32_vec(take_vec(map, &format!("{}shared_w_gu.weight", prefix))?),
+        shared_w_d: ExpertMatrix::from_f32_vec(take_vec(map, &format!("{}shared_w_d.weight", prefix))?),
+        router: take_vec(map, &format!("{}router.weight", prefix))?,
+        experts,
+    })
+}
+
+#[cfg(feature = "std")]
 impl DcpaWeights {
     pub fn from_safetensors(cfg: DcpaConfig, bytes: &[u8]) -> Result<Self, String> {
         cfg.validate().map_err(|e| e.to_string())?;
         let mut map = parse_safetensors(bytes)?;
+
+        let mut cort_enc_layers = Vec::with_capacity(cfg.n_enc_layers);
+        for i in 0..cfg.n_enc_layers {
+            let p = format!("cortical.enc_layers.{}.", i);
+            cort_enc_layers.push(CorticalEncoderLayerWeights {
+                norm_attn: take_vec(&mut map, &format!("{}norm_attn.weight", p))?,
+                w_q: take_vec(&mut map, &format!("{}w_q.weight", p))?,
+                w_uk: take_vec(&mut map, &format!("{}w_uk.weight", p))?,
+                w_uv: take_vec(&mut map, &format!("{}w_uv.weight", p))?,
+                w_o: take_vec(&mut map, &format!("{}w_o.weight", p))?,
+                moe: load_cort_moe(&mut map, &format!("{}moe.", p), cfg.num_experts)?,
+            });
+        }
+
+        let mut cort_dec_layers = Vec::with_capacity(cfg.n_dec_layers);
+        for i in 0..cfg.n_dec_layers {
+            let p = format!("cortical.dec_layers.{}.", i);
+            cort_dec_layers.push(CorticalDecoderLayerWeights {
+                norm_attn: take_vec(&mut map, &format!("{}norm_attn.weight", p))?,
+                w_q: take_vec(&mut map, &format!("{}w_q.weight", p))?,
+                w_uk: take_vec(&mut map, &format!("{}w_uk.weight", p))?,
+                w_uv: take_vec(&mut map, &format!("{}w_uv.weight", p))?,
+                w_edge_in: take_vec(&mut map, &format!("{}w_edge_in.weight", p))?,
+                w_phase: take_vec(&mut map, &format!("{}w_phase.weight", p))?,
+                w_gk: take_vec(&mut map, &format!("{}w_gk.weight", p))?,
+                w_gv: take_vec(&mut map, &format!("{}w_gv.weight", p))?,
+                w_o: take_vec(&mut map, &format!("{}w_o.weight", p))?,
+                moe: load_cort_moe(&mut map, &format!("{}moe.", p), cfg.num_experts)?,
+            });
+        }
 
         let mut bcg_experts = Vec::with_capacity(cfg.num_experts);
         for e in 0..cfg.num_experts {
@@ -494,6 +704,16 @@ impl DcpaWeights {
             sgsc_w_res: take_vec(&mut map, "sgsc.w_res.weight")?,
             sgsc_w_sem: take_vec(&mut map, "sgsc.w_sem.weight")?,
             sgsc_norm_c: take_vec(&mut map, "sgsc.norm_c.weight")?,
+
+            cort_w_kv_c: take_vec(&mut map, "cortical.w_kv_c.weight")?,
+            cort_norm_kv: take_vec(&mut map, "cortical.norm_kv.weight")?,
+            cort_enc_layers,
+            cort_norm_enc_out: take_vec(&mut map, "cortical.norm_enc_out.weight")?,
+            cort_bos_concept: take_vec(&mut map, "cortical.bos_concept")?,
+            cort_w_lang_dec: take_vec(&mut map, "cortical.w_lang_dec.weight")?,
+            cort_dec_layers,
+            cort_norm_dec_out: take_vec(&mut map, "cortical.norm_dec_out.weight")?,
+            cort_w_copy_out: take_vec(&mut map, "cortical.w_copy_out.weight")?,
 
             bcg_s0: take_vec(&mut map, "bcg_pc.s0")?,
             bcg_a0: take_vec(&mut map, "bcg_pc.a0")?,
@@ -530,6 +750,10 @@ impl DcpaWeights {
             bcg_norm_merge: take_vec(&mut map, "bcg_pc.norm_merge.weight")?,
             bcg_w_omega: take_vec(&mut map, "bcg_pc.w_omega.weight")?,
             bcg_kappa_omega: take_scalar(&mut map, "bcg_pc.kappa_omega")?,
+            bcg_w_lambda_w: take_vec(&mut map, "bcg_pc.w_lambda.weight")?,
+            bcg_w_lambda_b: take_vec(&mut map, "bcg_pc.w_lambda.bias")?,
+            bcg_w_slot_phase: take_vec(&mut map, "bcg_pc.w_slot_phase.weight")?,
+            bcg_norm_clause: take_vec(&mut map, "bcg_pc.norm_clause.weight")?,
 
             hip_r_lex: take_vec(&mut map, "hippocampus.r_lex")?,
             hip_r_sem: take_vec(&mut map, "hippocampus.r_sem")?,
@@ -580,6 +804,12 @@ impl DcpaWeights {
 impl DcpaWeights {
     /// Convert all MoE expert matrices into 64-byte aligned `Bf16` storage (~50% lower slow-weight memory!).
     pub fn pack_experts_bf16(&mut self) {
+        for layer in &mut self.cort_enc_layers {
+            layer.pack_bf16();
+        }
+        for layer in &mut self.cort_dec_layers {
+            layer.pack_bf16();
+        }
         for exp in &mut self.bcg_experts {
             exp.pack_bf16();
         }

@@ -37,8 +37,15 @@ model:
   num_style_domains: 5
   num_experts: 16
   top_k_experts: 2
-  expert_hidden: 896
-  l_max: 8
+  expert_hidden: 384
+  l_max: 4
+  window_size: 128
+  clause_chunk_size: 16
+  n_enc_layers: 2
+  n_dec_layers: 2
+  n_heads: 8
+  cort_expert_hidden: 192
+  shared_expert_hidden: 384
   tau_skip: 0.32
   tau_halt: 0.22
   ponder_eta: 0.5
@@ -67,8 +74,15 @@ presets:
     d_l: 64
     num_experts: 16
     top_k_experts: 2
-    expert_hidden: 896
-    l_max: 8
+    expert_hidden: 384
+    l_max: 4
+    window_size: 128
+    clause_chunk_size: 16
+    n_enc_layers: 2
+    n_dec_layers: 2
+    n_heads: 8
+    cort_expert_hidden: 192
+    shared_expert_hidden: 384
     tau_skip: 0.32
     tau_halt: 0.22
     lambda_act: 0.01
@@ -86,10 +100,22 @@ presets:
     d_l: 64
     num_experts: 4
     top_k_experts: 2
-    expert_hidden: 192
+    expert_hidden: 128
     l_max: 4
+    window_size: 32
+    clause_chunk_size: 4
+    n_enc_layers: 1
+    n_dec_layers: 1
+    n_heads: 4
+    cort_expert_hidden: 96
+    shared_expert_hidden: 128
     householder_max_writes: 32
     householder_write_threshold: 0.08
+
+wandb:
+  enabled: false
+  project: dcpa-turbo
+  mode: online
 
 hardware:
   per_gpu_tokens_bytes_per_step: 131072    # 128 KB/step on 1 GPU -> 7.86 GB stream over 60k steps (~2.7 epochs on ~3.25 GB corpus)

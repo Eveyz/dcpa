@@ -205,9 +205,15 @@ class PMD(nn.Module):
         nn.init.xavier_uniform_(self.w_ctx_role.weight)
         nn.init.eye_(self.u_demod.weight)  # initialize demod close to exact RoPE inverse!
         nn.init.constant_(self.w_chi.bias, 1.0)
-        # Bias stack initially toward hold (index 2)
+        # Bias stack initially toward crisp hold (p_hold ~ 0.978 so tags survive 50+ byte spans at step 0),
+        # keep w_tag in unsaturated tanh regime (gain=0.5 on unit-std byte embeddings), and match w_st(xi_top2)
+        # per-coordinate variance O(1) to unit-std u_prev in `x_in = u_prev + d_drive + w_st(xi_top2)`.
         nn.init.zeros_(self.w_act.weight)
-        self.w_act.bias.data.copy_(torch.tensor([-1.5, -1.5, 2.0]))
+        self.w_act.bias.data.copy_(torch.tensor([-2.0, -2.0, 2.5]))
+        nn.init.xavier_uniform_(self.w_tag.weight, gain=0.5)
+        if self.w_tag.bias is not None:
+            nn.init.zeros_(self.w_tag.bias)
+        nn.init.normal_(self.w_st.weight, std=1.0 / (self.cfg.stack_tag_dim ** 0.5))
         nn.init.xavier_uniform_(self.w_alpha_mot.weight)
         nn.init.constant_(self.w_alpha_mot.bias, 0.5)
         nn.init.xavier_uniform_(self.w_m.weight)
@@ -525,7 +531,14 @@ class PMD(nn.Module):
         seg_id, tau, _, _ = ragged_local_offsets(cu_seqlens, N)
 
         # 1. Holographic RoPE inverse demodulation per byte step -tau
-        demod_seg = self.u_demod(f_out_seg)  # [M_total, d_s]
+        if not self.training and f_out_seg.dtype == torch.float32 and f_out_seg.shape[0] > 0:
+            m_seg = f_out_seg.shape[0]
+            demod_seg = torch.bmm(
+                f_out_seg.unsqueeze(1),
+                self.u_demod.weight.t().unsqueeze(0).expand(m_seg, -1, -1),
+            ).squeeze(1)
+        else:
+            demod_seg = self.u_demod(f_out_seg)  # [M_total, d_s]
         d_stem_flat = apply_holographic_rope(
             demod_seg[seg_id],
             tau,
@@ -598,14 +611,16 @@ class PMD(nn.Module):
         l_reg_seg = l_reg[seg_doc_id]  # [M_total, d_l]
 
         e_in = torch.cat([f_out_seg, delta_syn_seg, l_reg_seg], dim=-1).float()
-        e_init_seg = F.softplus(
-            (e_in * self.w_e_init.weight.float()).sum(dim=-1) + self.w_e_init.bias.float()
-        )  # [M_total] fp32 > 0 (row-independent dot product avoids BLAS sgemv row-offset drift)
+        e_lin = (e_in * self.w_e_init.weight.float()).sum(dim=-1) + self.w_e_init.bias.float()
+        e_init_seg = (
+            F.softplus(e_lin.double()).float() if e_lin.device.type == "cpu" else F.softplus(e_lin)
+        )  # [M_total] fp32 > 0 (fp64 scalar-exact on CPU avoids SIMD-vs-tail 1-ULP shift when M_total changes)
         m_flat = m_seq.reshape(N, d_s).float()
         m_norm = m_flat * torch.rsqrt(m_flat.pow(2).mean(dim=-1, keepdim=True) + self.cfg.eps)
         drain_in = torch.cat([m_norm, d_drive_flat.float()], dim=-1)
-        drain_flat = F.softplus(
-            (drain_in * self.w_drain.weight.float()).sum(dim=-1) + self.w_drain.bias.float()
+        drain_lin = (drain_in * self.w_drain.weight.float()).sum(dim=-1) + self.w_drain.bias.float()
+        drain_flat = (
+            F.softplus(drain_lin.double()).float() if drain_lin.device.type == "cpu" else F.softplus(drain_lin)
         )  # [N] fp32 > 0
         cum_drain = ragged_segment_cumsum(
             drain_flat, cu_seqlens, seg_id, max_seg_len=known_max_seg_len
@@ -692,8 +707,9 @@ class PMD(nn.Module):
         m_f = m_new.float()
         m_norm = m_f * torch.rsqrt(m_f.pow(2).mean(dim=-1, keepdim=True) + self.cfg.eps)
         drain_in = torch.cat([m_norm, d_drive.float()], dim=-1)
-        drain = F.softplus(
-            (drain_in * self.w_drain.weight.float()).sum(dim=-1) + self.w_drain.bias.float()
+        drain_lin = (drain_in * self.w_drain.weight.float()).sum(dim=-1) + self.w_drain.bias.float()
+        drain = (
+            F.softplus(drain_lin.double()).float() if drain_lin.device.type == "cpu" else F.softplus(drain_lin)
         )
         charge_new = charge_prev.float() - drain
         p_end = torch.sigmoid(-charge_new / max(self.cfg.tau_e, 1e-4))
@@ -709,6 +725,5 @@ class PMD(nn.Module):
         l_reg: torch.Tensor,
     ) -> torch.Tensor:
         e_in = torch.cat([f_out, delta_syn, l_reg], dim=-1).float()
-        return F.softplus(
-            (e_in * self.w_e_init.weight.float()).sum(dim=-1) + self.w_e_init.bias.float()
-        )
+        e_lin = (e_in * self.w_e_init.weight.float()).sum(dim=-1) + self.w_e_init.bias.float()
+        return F.softplus(e_lin.double()).float() if e_lin.device.type == "cpu" else F.softplus(e_lin)

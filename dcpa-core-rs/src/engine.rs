@@ -4,15 +4,15 @@
 //! max abs error < 1e-5 in float32 mode) with STRICTLY 0 heap allocations in every hot-path method!
 
 use crate::simd::{
-    apply_holographic_rope_f32, axpy_f32, cosine_sim_f32, dot_f32, expf, l2_norm_f32, linear_f32,
-    logaddexp, logf, rmsnorm_f32, sigmoid, silu, softmax_inplace_f32, softplus, sqrtf, tanhf,
-    unit_rmsnorm_f32,
+    apply_holographic_rope_f32, axpy_f32, cosf, cosine_sim_f32, dot_f32, expf, l2_norm_f32,
+    linear_f32, logaddexp, logf, powf, rmsnorm_f32, sigmoid, silu, sinf, softmax_inplace_f32,
+    softplus, sqrtf, tanhf, unit_rmsnorm_f32,
 };
 use crate::state::{
-    BrainSnapshot, ConceptGraphState, EligibilityTags, FastWeightPrecision, HippocampusFastWeights,
-    MotorCheckpoint, MotorState, ScratchPool, SgscState, MAX_SEG_CAP,
+    BrainSnapshot, ConceptGraphState, CorticalState, EligibilityTags, FastWeightPrecision,
+    HippocampusFastWeights, MotorCheckpoint, MotorState, ScratchPool, SgscState, MAX_SEG_CAP,
 };
-use crate::weights::DcpaWeights;
+use crate::weights::{CorticalMoEWeights, DcpaWeights};
 
 /// Scalar telemetry emitted by a single byte ingestion step (zero heap allocation).
 #[derive(Debug, Clone, Copy)]
@@ -24,6 +24,7 @@ pub struct ByteIngestTrace {
     pub sem_norm: f32,
     pub pin_triggered: bool,
     pub unpin_triggered: bool,
+    pub seg_end_depth: i32,
 }
 
 /// Scalar telemetry emitted by a single concept graph + hippocampus step.
@@ -40,10 +41,11 @@ pub struct ConceptStepTrace {
     pub slot0_pinned: bool,
 }
 
-/// Complete self-contained DCPA streaming runtime (all working memory allocated ONCE on `new`).
+/// Complete self-contained DCPA-Turbo streaming runtime (all working memory allocated ONCE on `new`).
 pub struct DcpaEngine {
     pub weights: DcpaWeights,
     pub sgsc: SgscState,
+    pub cortical: CorticalState,
     pub graph: ConceptGraphState,
     pub elig: EligibilityTags,
     pub fast_mem: HippocampusFastWeights,
@@ -58,6 +60,7 @@ impl DcpaEngine {
         }
         let cfg = weights.cfg.clone();
         let sgsc = SgscState::new(&weights);
+        let cortical = CorticalState::new(&weights);
         let graph = ConceptGraphState::new(&weights);
         let elig = EligibilityTags::new(&cfg);
         let fast_mem = HippocampusFastWeights::new(&cfg, fast_precision);
@@ -66,6 +69,7 @@ impl DcpaEngine {
         Self {
             weights,
             sgsc,
+            cortical,
             graph,
             elig,
             fast_mem,
@@ -76,21 +80,28 @@ impl DcpaEngine {
 
     pub fn reset_session(&mut self) {
         self.sgsc.reset(&self.weights);
+        self.cortical.reset(&self.weights);
         self.graph.reset(&self.weights);
         self.elig.reset();
         self.motor.reset(&self.weights);
     }
 
-    /// Capture O(1) ~22 KB active working memory snapshot into pre-allocated `snap` (0 heap allocs!).
+    /// Capture O(1) active working memory snapshot into pre-allocated `snap` (0 heap allocs!).
     #[inline]
     pub fn capture_snapshot(&self, snap: &mut BrainSnapshot) {
-        snap.capture_from(&self.sgsc, &self.graph, &self.elig, &self.motor);
+        snap.capture_from(&self.sgsc, &self.cortical, &self.graph, &self.elig, &self.motor);
     }
 
-    /// Restore O(1) ~22 KB active working memory snapshot from `snap` (0 heap allocs!).
+    /// Restore O(1) active working memory snapshot from `snap` (0 heap allocs!).
     #[inline]
     pub fn restore_snapshot(&mut self, snap: &BrainSnapshot) {
-        snap.restore_into(&mut self.sgsc, &mut self.graph, &mut self.elig, &mut self.motor);
+        snap.restore_into(
+            &mut self.sgsc,
+            &mut self.cortical,
+            &mut self.graph,
+            &mut self.elig,
+            &mut self.motor,
+        );
     }
 
     /// Top-k partial selection into fixed slices `out_idx[..k]` and `out_val[..k]` (descending),
@@ -234,6 +245,27 @@ impl DcpaEngine {
             self.sgsc.pending_asst_ticks = 0;
         }
 
+        // Strictly causal AST bracket/scope nesting depth matching `rope.py:compute_causal_byte_scope_depth`
+        let post_reset = byte == 0x04
+            || byte == 0x13
+            || byte == 0x1E
+            || (rlen >= 3
+                && self.sgsc.recent_bytes[rlen - 3] == 0x1D
+                && self.sgsc.recent_bytes[rlen - 2] == b'E'
+                && self.sgsc.recent_bytes[rlen - 1] == 0x0A);
+        if post_reset {
+            self.sgsc.raw_ast_depth = 0;
+        } else {
+            let delta = match byte {
+                b'(' | b'[' | b'{' => 1,
+                b')' | b']' | b'}' => -1,
+                _ => 0,
+            };
+            self.sgsc.raw_ast_depth = (self.sgsc.raw_ast_depth + delta).max(0);
+        }
+        let cur_clamped_depth = self.sgsc.raw_ast_depth.clamp(0, 31);
+        self.cortical.ast_depth = cur_clamped_depth;
+
         // 3. Strictly causal UTF-8 codepoint completion tracker
         if byte < 0x80 {
             self.sgsc.utf8_rem = 0;
@@ -268,6 +300,7 @@ impl DcpaEngine {
                 sem_norm: 0.0,
                 pin_triggered: false,
                 unpin_triggered: false,
+                seg_end_depth: cur_clamped_depth,
             };
         }
 
@@ -348,6 +381,7 @@ impl DcpaEngine {
         // Reset LIF accumulator & segment counters
         let pin_triggered = self.sgsc.seg_pin_hit;
         let unpin_triggered = self.sgsc.seg_unpin_hit;
+        self.sgsc.last_seg_end_depth = cur_clamped_depth;
         self.sgsc.v = 0.0;
         self.sgsc.seg_len = 0;
         self.sgsc.seg_info_sum = 0.0;
@@ -362,16 +396,446 @@ impl DcpaEngine {
             sem_norm,
             pin_triggered,
             unpin_triggered,
+            seg_end_depth: cur_clamped_depth,
         }
     }
 
-    /// Helper: Message passing over K=8 concept graph slots -> writes `s_bar [K*D]` and `g_ctx [D]`.
+    /// Dual-coordinate Concept-RoPE (`3/4` relative concept order + `1/4` AST scope depth)
+    /// across all `n_heads` heads of a `[D]` vector. Strictly 0 heap allocations!
+    #[inline]
+    fn apply_concept_rope_2d_heads(
+        x: &[f32],
+        concept_pos: i64,
+        scope_depth: i32,
+        n_heads: usize,
+        theta_base: f32,
+        scope_period: f32,
+        out: &mut [f32],
+    ) {
+        let d = x.len();
+        let d_head = d / n_heads;
+        let half = d_head / 2;
+        let scope_pairs = (half / 4).max(1);
+        let pos_pairs = half - scope_pairs;
+        let pos_dim = (pos_pairs * 2).max(2) as f32;
+
+        let mut cos_a = [0.0f32; 128];
+        let mut sin_a = [0.0f32; 128];
+        let c_pos = concept_pos as f32;
+        let s_dep = scope_depth as f32;
+
+        for i in 0..pos_pairs {
+            let freq = powf(theta_base, -(2.0 * (i as f32)) / pos_dim);
+            let ang = c_pos * freq;
+            cos_a[i] = cosf(ang);
+            sin_a[i] = sinf(ang);
+        }
+        let base_scope_freq = (2.0 * core::f32::consts::PI) / scope_period;
+        for j in 0..scope_pairs {
+            let freq = base_scope_freq * ((j + 1) as f32);
+            let ang = s_dep * freq;
+            cos_a[pos_pairs + j] = cosf(ang);
+            sin_a[pos_pairs + j] = sinf(ang);
+        }
+
+        for h in 0..n_heads {
+            let base = h * d_head;
+            for p in 0..half {
+                let xe = x[base + 2 * p];
+                let xo = x[base + 2 * p + 1];
+                let ca = cos_a[p];
+                let sa = sin_a[p];
+                out[base + 2 * p] = xe * ca - xo * sa;
+                out[base + 2 * p + 1] = xe * sa + xo * ca;
+            }
+        }
+    }
+
+    /// Execute `SharedAndRoutedMoE` (`1 Shared + Top-K Routed SwiGLU`) with 0 heap allocations.
+    #[allow(clippy::too_many_arguments)]
+    fn run_cortical_moe(
+        cfg: &crate::config::DcpaConfig,
+        moe: &CorticalMoEWeights,
+        x_in: &[f32],
+        y_out: &mut [f32],
+        x_norm: &mut [f32],
+        y_shared: &mut [f32],
+        shared_gu: &mut [f32],
+        shared_h: &mut [f32],
+        router_logits: &mut [f32],
+        routed_h1: &mut [f32],
+        routed_h2: &mut [f32],
+        routed_tmp: &mut [f32],
+        routed_out: &mut [f32],
+    ) {
+        let d = cfg.d_concept;
+        let sh = cfg.shared_expert_hidden;
+        let ch = cfg.cort_expert_hidden;
+        let n_exp = cfg.num_experts;
+        let tk = cfg.top_k_experts.min(8).min(n_exp);
+
+        rmsnorm_f32(x_in, &moe.norm, cfg.eps, x_norm);
+
+        // 1. Shared expert branch
+        moe.shared_w_gu.linear_no_bias(x_norm, shared_gu);
+        for j in 0..sh {
+            shared_h[j] = silu(shared_gu[j]) * shared_gu[sh + j];
+        }
+        moe.shared_w_d.linear_no_bias(shared_h, y_shared);
+
+        // 2. Top-K router in float32
+        linear_f32(x_norm, &moe.router, None, &mut router_logits[..n_exp]);
+        let mut top_idx = [0usize; 8];
+        let mut top_val = [f32::NEG_INFINITY; 8];
+        for (ei, &lv) in router_logits[..n_exp].iter().enumerate() {
+            if lv > top_val[tk - 1] {
+                let mut p = tk - 1;
+                while p > 0 && lv > top_val[p - 1] {
+                    top_val[p] = top_val[p - 1];
+                    top_idx[p] = top_idx[p - 1];
+                    p -= 1;
+                }
+                top_val[p] = lv;
+                top_idx[p] = ei;
+            }
+        }
+        softmax_inplace_f32(&mut top_val[..tk]);
+
+        // 3. Routed specialist experts
+        routed_out[..d].fill(0.0);
+        for t_i in 0..tk {
+            let exp = &moe.experts[top_idx[t_i]];
+            exp.w_gate.linear_no_bias(x_norm, routed_h1);
+            exp.w_up.linear_no_bias(x_norm, routed_h2);
+            for j in 0..ch {
+                routed_h1[j] = silu(routed_h1[j]) * routed_h2[j];
+            }
+            exp.w_down.linear_no_bias(routed_h1, routed_tmp);
+            axpy_f32(top_val[t_i], &routed_tmp[..d], &mut routed_out[..d]);
+        }
+
+        for i in 0..d {
+            y_out[i] = x_in[i] + y_shared[i] + routed_out[i];
+        }
+    }
+
+    /// Lower Cortical Sandwich streaming step (`CorticalSandwich.encode_step_streaming`):
+    /// pushes shared `c_kv` into O(1) FIFO ring and writes `h_enc` into `scratch.cort_h_enc`.
+    fn cortical_encode_step_parts(
+        weights: &DcpaWeights,
+        cortical: &mut CorticalState,
+        scratch: &mut ScratchPool,
+        seg_end_depth: i32,
+        unpin_reset: bool,
+    ) {
+        let cfg = &weights.cfg;
+        let d = cfg.d_concept;
+        let d_s = cfg.d_s;
+        let w = cfg.window_size;
+        let n_heads = cfg.n_heads;
+        let dh = d / n_heads;
+        let scale = 1.0 / sqrtf(dh as f32);
+
+        // 1. Shared MLA-latent KV compression: c_kv = RMSNorm(f_stem + w_kv_c(c_slow))
+        linear_f32(&scratch.vec_d_a, &weights.cort_w_kv_c, None, &mut scratch.vec_ds_a);
+        for i in 0..d_s {
+            scratch.vec_ds_a[i] += scratch.vec_ds_e[i];
+        }
+        rmsnorm_f32(&scratch.vec_ds_a, &weights.cort_norm_kv, cfg.eps, &mut scratch.vec_ds_b);
+
+        // 2. O(1) FIFO ring shift & append at index W - 1
+        if w > 1 {
+            cortical.ring_kv.copy_within(d_s..w * d_s, 0);
+            cortical.ring_pos.copy_within(1..w, 0);
+            cortical.ring_depth.copy_within(1..w, 0);
+            cortical.ring_valid.copy_within(1..w, 0);
+        }
+        cortical.ring_kv[(w - 1) * d_s..w * d_s].copy_from_slice(&scratch.vec_ds_b);
+        cortical.ring_pos[w - 1] = cortical.doc_pos;
+        cortical.ring_depth[w - 1] = seg_end_depth;
+        cortical.ring_valid[w - 1] = true;
+        cortical.doc_pos += 1;
+        cortical.ast_depth = if unpin_reset { 0 } else { seg_end_depth };
+
+        // 3. Lower Cortical Encoder layers
+        scratch.cort_x.copy_from_slice(&scratch.vec_d_a);
+        let cur_pos = cortical.ring_pos[w - 1];
+        let cur_dep = cortical.ring_depth[w - 1];
+
+        for layer in &weights.cort_enc_layers {
+            rmsnorm_f32(&scratch.cort_x, &layer.norm_attn, cfg.eps, &mut scratch.cort_tmp);
+            linear_f32(&scratch.cort_tmp, &layer.w_q, None, &mut scratch.cort_q);
+            Self::apply_concept_rope_2d_heads(
+                &scratch.cort_q,
+                cur_pos,
+                cur_dep,
+                n_heads,
+                cfg.rope_theta_concept,
+                cfg.rope_period,
+                &mut scratch.cort_q_rot,
+            );
+
+            for r in 0..w {
+                if cortical.ring_valid[r] {
+                    let kv_r = &cortical.ring_kv[r * d_s..(r + 1) * d_s];
+                    linear_f32(kv_r, &layer.w_uk, None, &mut scratch.cort_tmp);
+                    Self::apply_concept_rope_2d_heads(
+                        &scratch.cort_tmp,
+                        cortical.ring_pos[r],
+                        cortical.ring_depth[r],
+                        n_heads,
+                        cfg.rope_theta_concept,
+                        cfg.rope_period,
+                        &mut scratch.cort_k_ring[r * d..(r + 1) * d],
+                    );
+                    linear_f32(kv_r, &layer.w_uv, None, &mut scratch.cort_v_ring[r * d..(r + 1) * d]);
+                }
+            }
+
+            scratch.cort_tmp.fill(0.0);
+            for h in 0..n_heads {
+                let q_h = &scratch.cort_q_rot[h * dh..(h + 1) * dh];
+                for r in 0..w {
+                    scratch.cort_scores[r] = if cortical.ring_valid[r] {
+                        let k_rh = &scratch.cort_k_ring[r * d + h * dh..r * d + (h + 1) * dh];
+                        dot_f32(q_h, k_rh) * scale
+                    } else {
+                        -1.0e9
+                    };
+                }
+                softmax_inplace_f32(&mut scratch.cort_scores[..w]);
+                let ctx_h = &mut scratch.cort_tmp[h * dh..(h + 1) * dh];
+                for r in 0..w {
+                    if cortical.ring_valid[r] {
+                        let v_rh = &scratch.cort_v_ring[r * d + h * dh..r * d + (h + 1) * dh];
+                        axpy_f32(scratch.cort_scores[r], v_rh, ctx_h);
+                    }
+                }
+            }
+
+            linear_f32(&scratch.cort_tmp, &layer.w_o, None, &mut scratch.cort_tmp2);
+            for i in 0..d {
+                scratch.cort_tmp2[i] += scratch.cort_x[i];
+            }
+            Self::run_cortical_moe(
+                cfg,
+                &layer.moe,
+                &scratch.cort_tmp2,
+                &mut scratch.cort_x,
+                &mut scratch.cort_tmp,
+                &mut scratch.vec_d_e,
+                &mut scratch.cort_shared_gu,
+                &mut scratch.cort_shared_h,
+                &mut scratch.router_logits,
+                &mut scratch.cort_routed_h1,
+                &mut scratch.cort_routed_h2,
+                &mut scratch.vec_d_f,
+                &mut scratch.cort_routed_out,
+            );
+        }
+
+        rmsnorm_f32(&scratch.cort_x, &weights.cort_norm_enc_out, cfg.eps, &mut scratch.cort_h_enc);
+    }
+
+    /// Upper Cortical Sandwich streaming decoder step (`CorticalSandwich.decode_step_streaming`):
+    /// writes `z_dec` into `scratch.cort_z_dec` and `copy_stem` into `scratch.cort_copy_out`.
+    fn cortical_decode_step_parts(
+        weights: &DcpaWeights,
+        cortical: &CorticalState,
+        graph: &ConceptGraphState,
+        scratch: &mut ScratchPool,
+        l_reg: &[f32],
+    ) {
+        let cfg = &weights.cfg;
+        let d = cfg.d_concept;
+        let d_s = cfg.d_s;
+        let d_r = cfg.d_r;
+        let k = cfg.k_slots;
+        let w = cfg.window_size;
+        let n_heads = cfg.n_heads;
+        let dh = d / n_heads;
+        let scale = 1.0 / sqrtf(dh as f32);
+        let inv_h = 1.0 / (n_heads as f32);
+
+        let z_in = if cortical.has_prev_seg {
+            &cortical.prev_z_ref
+        } else {
+            &weights.cort_bos_concept
+        };
+        linear_f32(l_reg, &weights.cort_w_lang_dec, None, &mut scratch.cort_x);
+        for i in 0..d {
+            scratch.cort_x[i] += z_in[i];
+        }
+        scratch.cort_copy_f.fill(0.0);
+
+        let cur_pos = cortical.doc_pos;
+        let cur_start_depth = cortical.ast_depth;
+
+        for layer in &weights.cort_dec_layers {
+            // 1. Enrich K=8 graph slots with incoming relation edges & 32D temporal phase
+            scratch.w_attn[..k].copy_from_slice(&graph.salience[..k]);
+            softmax_inplace_f32(&mut scratch.w_attn[..k]);
+
+            scratch.edge_in_kd[..k * d_r].fill(0.0);
+            for j in 0..k {
+                let dst = &mut scratch.edge_in_kd[j * d_r..(j + 1) * d_r];
+                for i in 0..k {
+                    let e_off = (i * k + j) * d_r;
+                    axpy_f32(scratch.w_attn[i], &graph.edges[e_off..e_off + d_r], dst);
+                }
+            }
+
+            for j in 0..k {
+                scratch.cort_sal_bias[j] = -softplus(-graph.salience[j]);
+                let p = graph.phase[j];
+                for idx in 0..16 {
+                    let freq = powf(256.0, -(idx as f32) / 16.0);
+                    let ang = p * freq;
+                    scratch.phase_feat_32[idx] = sinf(ang);
+                    scratch.phase_feat_32[16 + idx] = cosf(ang);
+                }
+                linear_f32(
+                    &scratch.edge_in_kd[j * d_r..(j + 1) * d_r],
+                    &layer.w_edge_in,
+                    None,
+                    &mut scratch.cort_tmp,
+                );
+                linear_f32(&scratch.phase_feat_32, &layer.w_phase, None, &mut scratch.cort_tmp2);
+                for m in 0..d {
+                    scratch.cort_tmp[m] =
+                        graph.slots[j * d + m] + tanhf(scratch.cort_tmp[m]) + scratch.cort_tmp2[m];
+                }
+                linear_f32(&scratch.cort_tmp, &layer.w_gk, None, &mut scratch.cort_gk[j * d..(j + 1) * d]);
+                linear_f32(&scratch.cort_tmp, &layer.w_gv, None, &mut scratch.cort_gv[j * d..(j + 1) * d]);
+            }
+
+            // 2. Query & strict-past window K/V projections
+            rmsnorm_f32(&scratch.cort_x, &layer.norm_attn, cfg.eps, &mut scratch.cort_tmp);
+            linear_f32(&scratch.cort_tmp, &layer.w_q, None, &mut scratch.cort_q);
+            Self::apply_concept_rope_2d_heads(
+                &scratch.cort_q,
+                cur_pos,
+                cur_start_depth,
+                n_heads,
+                cfg.rope_theta_concept,
+                cfg.rope_period,
+                &mut scratch.cort_q_rot,
+            );
+
+            for r in 0..w {
+                let diff = cur_pos - cortical.ring_pos[r];
+                if cortical.ring_valid[r] && diff >= 1 && diff <= (w as i64) {
+                    let kv_r = &cortical.ring_kv[r * d_s..(r + 1) * d_s];
+                    linear_f32(kv_r, &layer.w_uk, None, &mut scratch.cort_tmp);
+                    Self::apply_concept_rope_2d_heads(
+                        &scratch.cort_tmp,
+                        cortical.ring_pos[r],
+                        cortical.ring_depth[r],
+                        n_heads,
+                        cfg.rope_theta_concept,
+                        cfg.rope_period,
+                        &mut scratch.cort_k_ring[r * d..(r + 1) * d],
+                    );
+                    linear_f32(kv_r, &layer.w_uv, None, &mut scratch.cort_v_ring[r * d..(r + 1) * d]);
+                }
+            }
+
+            // 3. Single-softmax unified attention over (Strict-Past W Window ∪ K=8 Graph Slots)
+            scratch.cort_tmp.fill(0.0);
+            scratch.cort_copy_acc.fill(0.0);
+            for h in 0..n_heads {
+                let q_rot_h = &scratch.cort_q_rot[h * dh..(h + 1) * dh];
+                let q_raw_h = &scratch.cort_q[h * dh..(h + 1) * dh];
+                for r in 0..w {
+                    let diff = cur_pos - cortical.ring_pos[r];
+                    scratch.cort_scores[r] = if cortical.ring_valid[r] && diff >= 1 && diff <= (w as i64) {
+                        let k_rh = &scratch.cort_k_ring[r * d + h * dh..r * d + (h + 1) * dh];
+                        dot_f32(q_rot_h, k_rh) * scale
+                    } else {
+                        -1.0e9
+                    };
+                }
+                for j in 0..k {
+                    let gk_jh = &scratch.cort_gk[j * d + h * dh..j * d + (h + 1) * dh];
+                    scratch.cort_scores[w + j] =
+                        dot_f32(q_raw_h, gk_jh) * scale + scratch.cort_sal_bias[j];
+                }
+                softmax_inplace_f32(&mut scratch.cort_scores[..w + k]);
+                let ctx_h = &mut scratch.cort_tmp[h * dh..(h + 1) * dh];
+                for r in 0..w {
+                    let aw = scratch.cort_scores[r];
+                    scratch.cort_copy_acc[r] += aw * inv_h;
+                    let diff = cur_pos - cortical.ring_pos[r];
+                    if cortical.ring_valid[r] && diff >= 1 && diff <= (w as i64) {
+                        let v_rh = &scratch.cort_v_ring[r * d + h * dh..r * d + (h + 1) * dh];
+                        axpy_f32(aw, v_rh, ctx_h);
+                    }
+                }
+                for j in 0..k {
+                    let ag = scratch.cort_scores[w + j];
+                    let gv_jh = &scratch.cort_gv[j * d + h * dh..j * d + (h + 1) * dh];
+                    axpy_f32(ag, gv_jh, ctx_h);
+                }
+            }
+
+            scratch.cort_copy_f.fill(0.0);
+            for r in 0..w {
+                let cw = scratch.cort_copy_acc[r];
+                if cw != 0.0 {
+                    axpy_f32(cw, &cortical.ring_kv[r * d_s..(r + 1) * d_s], &mut scratch.cort_copy_f);
+                }
+            }
+
+            linear_f32(&scratch.cort_tmp, &layer.w_o, None, &mut scratch.cort_tmp2);
+            for i in 0..d {
+                scratch.cort_tmp2[i] += scratch.cort_x[i];
+            }
+            Self::run_cortical_moe(
+                cfg,
+                &layer.moe,
+                &scratch.cort_tmp2,
+                &mut scratch.cort_x,
+                &mut scratch.cort_tmp,
+                &mut scratch.vec_d_e,
+                &mut scratch.cort_shared_gu,
+                &mut scratch.cort_shared_h,
+                &mut scratch.router_logits,
+                &mut scratch.cort_routed_h1,
+                &mut scratch.cort_routed_h2,
+                &mut scratch.vec_d_f,
+                &mut scratch.cort_routed_out,
+            );
+        }
+
+        rmsnorm_f32(&scratch.cort_x, &weights.cort_norm_dec_out, cfg.eps, &mut scratch.cort_z_dec);
+        linear_f32(&scratch.cort_copy_f, &weights.cort_w_copy_out, None, &mut scratch.cort_copy_out);
+    }
+
+    /// Public zero-alloc helper running `decode_step_streaming` for `(lang_id, style_id)`.
+    pub fn cortical_decode_styled(&mut self, lang_id: usize, style_id: usize) {
+        let l_reg_arr = self.build_l_reg(lang_id, style_id);
+        let d_l = self.weights.cfg.d_l;
+        Self::cortical_decode_step_parts(
+            &self.weights,
+            &self.cortical,
+            &self.graph,
+            &mut self.scratch,
+            &l_reg_arr[..d_l],
+        );
+    }
+
+    /// Helper: Phase-aware message passing over K=8 concept graph slots -> writes `s_bar [K*D]` and `g_ctx [D]`.
+    #[allow(clippy::too_many_arguments)]
     fn message_pass_graph(
         cfg: &crate::config::DcpaConfig,
         w_e: &[f32],
+        w_slot_phase: &[f32],
         slots: &[f32],
         edges: &[f32],
         salience: &[f32],
+        phase: &[f32],
+        phase_feat_16: &mut [f32; 16],
+        s_phased: &mut [f32],
         w_attn: &mut [f32],
         tmp_e: &mut [f32],
         s_bar_out: &mut [f32],
@@ -384,13 +848,27 @@ impl DcpaEngine {
         w_attn[..k].copy_from_slice(&salience[..k]);
         softmax_inplace_f32(&mut w_attn[..k]);
 
-        s_bar_out[..k * d].copy_from_slice(&slots[..k * d]);
+        for slot_i in 0..k {
+            let p = phase[slot_i];
+            for idx in 0..8 {
+                let freq = powf(128.0, -(idx as f32) / 8.0);
+                let ang = p * freq;
+                phase_feat_16[idx] = sinf(ang);
+                phase_feat_16[8 + idx] = cosf(ang);
+            }
+            linear_f32(phase_feat_16, w_slot_phase, None, tmp_e);
+            for m in 0..d {
+                s_phased[slot_i * d + m] = slots[slot_i * d + m] + tmp_e[m];
+            }
+        }
+
+        s_bar_out[..k * d].copy_from_slice(&s_phased[..k * d]);
         for i in 0..k {
             let dst = &mut s_bar_out[i * d..(i + 1) * d];
             for j in 0..k {
                 let edge_off = (i * k + j) * d_r;
                 linear_f32(&edges[edge_off..edge_off + d_r], w_e, None, tmp_e);
-                let sj = &slots[j * d..(j + 1) * d];
+                let sj = &s_phased[j * d..(j + 1) * d];
                 let wj = w_attn[j];
                 for m in 0..d {
                     dst[m] += wj * tanhf(tmp_e[m]) * sj[m];
@@ -429,8 +907,9 @@ impl DcpaEngine {
     ) -> ConceptStepTrace {
         if unpin_trigger {
             self.graph.slot0_pinned = false;
+            self.graph.phase.fill(0.0);
         }
-        self.step_concept_from_scratch_with_opts(mean_info, sem_norm, pin_trigger, ach_override)
+        self.step_concept_from_scratch_internal(mean_info, sem_norm, pin_trigger, unpin_trigger, ach_override)
     }
 
     /// Full Spec 2 + Spec 5 concept transition with optional `Slot-0 Thesis Pinning` trigger and `ach_override`
@@ -443,6 +922,26 @@ impl DcpaEngine {
         pin_trigger: bool,
         ach_override: Option<f32>,
     ) -> ConceptStepTrace {
+        self.step_concept_from_scratch_internal(mean_info, sem_norm, pin_trigger, false, ach_override)
+    }
+
+    fn step_concept_from_scratch_internal(
+        &mut self,
+        mean_info: f32,
+        sem_norm: f32,
+        pin_trigger: bool,
+        unpin_reset: bool,
+        ach_override: Option<f32>,
+    ) -> ConceptStepTrace {
+        // 0. Module 1.5 Lower Cortical Sandwich (`encode_step_streaming` -> `scratch.cort_h_enc`)
+        Self::cortical_encode_step_parts(
+            &self.weights,
+            &mut self.cortical,
+            &mut self.scratch,
+            self.sgsc.last_seg_end_depth,
+            unpin_reset,
+        );
+
         let cfg = &self.weights.cfg;
         let d_s = cfg.d_s;
         let d = cfg.d_concept;
@@ -482,16 +981,16 @@ impl DcpaEngine {
         };
         let mu = gamma_hip / (gamma_slow + gamma_hip + cfg.eps);
 
-        // pi_cort = Softplus(f_prec_cort(c_slow)) + 1e-4
+        // pi_cort = Softplus(f_prec_cort(h_enc)) + 1e-4
         linear_f32(
-            &self.scratch.vec_d_a, // c_slow
+            &self.scratch.cort_h_enc, // h_enc from Lower Cortical Sandwich
             &self.weights.hip_f_prec_cort_w,
             Some(&self.weights.hip_f_prec_cort_b),
             &mut self.scratch.hip_prec_bu,
         );
         for i in 0..d {
             self.scratch.hip_c_fused[i] =
-                (1.0 - mu) * self.scratch.vec_d_a[i] + mu * self.scratch.hip_c_hip[i];
+                (1.0 - mu) * self.scratch.cort_h_enc[i] + mu * self.scratch.hip_c_hip[i];
             let pi_cort = softplus(self.scratch.hip_prec_bu[i]) + 1e-4;
             self.scratch.hip_prec_bu[i] = (1.0 - ach) * pi_cort;
         }
@@ -502,9 +1001,13 @@ impl DcpaEngine {
         Self::message_pass_graph(
             cfg,
             &self.weights.bcg_w_e,
+            &self.weights.bcg_w_slot_phase,
             &self.graph.slots,
             &self.graph.edges,
             &self.graph.salience,
+            &self.graph.phase,
+            &mut self.scratch.phase_feat_16,
+            &mut self.scratch.s_phased,
             &mut self.scratch.w_attn,
             &mut self.scratch.vec_d_b,
             &mut self.scratch.s_bar,
@@ -712,8 +1215,26 @@ impl DcpaEngine {
             surp_cur = l2_norm_f32(&self.scratch.vec_d_d) * inv_sqrt_d;
         }
 
-        // 3. Candidate slot expansion (K -> K+1): s_tilde [(K+1)*D], a_tilde [(K+1)*(K+1)*d_r]
-        self.scratch.s_tilde[..k * d].copy_from_slice(&self.graph.slots);
+        // 3. Log-Space Contractive Gate Lambda_m in [0.920, 0.998] & Candidate slot expansion (K -> K+1)
+        let already_pinned = self.graph.slot0_pinned;
+        linear_f32(
+            &self.scratch.vec_d_g, // z_star
+            &self.weights.bcg_w_lambda_w,
+            Some(&self.weights.bcg_w_lambda_b),
+            &mut self.scratch.lam_k,
+        );
+        for slot_i in 0..k {
+            let lam = if already_pinned && slot_i == 0 {
+                1.0f32
+            } else {
+                let gamma_m = 0.002 + 0.081 * sigmoid(-self.scratch.lam_k[slot_i]);
+                expf(-gamma_m)
+            };
+            for m in 0..d {
+                self.scratch.s_contracted[slot_i * d + m] = self.graph.slots[slot_i * d + m] * lam;
+            }
+        }
+        self.scratch.s_tilde[..k * d].copy_from_slice(&self.scratch.s_contracted);
         self.scratch.s_tilde[k * d..kp1 * d].copy_from_slice(&self.scratch.vec_d_g); // z_star
 
         for i in 0..kp1 {
@@ -755,7 +1276,6 @@ impl DcpaEngine {
         let mut win_j = 1usize;
         let mut pair_idx = 0usize;
 
-        let already_pinned = self.graph.slot0_pinned;
         for i in 0..kp1 {
             let wl_i = &self.scratch.wl_all[i * d_m..(i + 1) * d_m];
             for j in 0..kp1 {
@@ -817,7 +1337,16 @@ impl DcpaEngine {
             let g = sigmoid(self.scratch.vec_d_b[m]);
             self.scratch.vec_d_d[m] = g * self.scratch.vec_d_c[m] + (1.0 - g) * si[m];
         }
-        // Write merged parent in-place to slot u (preserving Slot 0 verbatim when already_pinned)!
+        // Write contracted slots + merged parent in-place (preserving Slot 0 at 0.0 ULP when already_pinned)!
+        for slot_i in 0..k {
+            if already_pinned && slot_i == 0 {
+                continue;
+            }
+            if slot_i != u && !(v < k && slot_i == v) {
+                self.graph.slots[slot_i * d..(slot_i + 1) * d]
+                    .copy_from_slice(&self.scratch.s_contracted[slot_i * d..(slot_i + 1) * d]);
+            }
+        }
         if !(already_pinned && u == 0) {
             rmsnorm_f32(
                 &self.scratch.vec_d_d,
@@ -894,13 +1423,37 @@ impl DcpaEngine {
             self.graph.salience[0] = self.graph.salience[0].max(2.0);
         }
 
+        // Slot Temporal Phase update (`phase [K]`)
+        let pin_slot0_prev_phase = self.graph.phase[0];
+        for slot_i in 0..k {
+            self.scratch.phase_tilde[slot_i] = self.graph.phase[slot_i] + 1.0;
+        }
+        self.scratch.phase_tilde[k] = 0.0;
+        let p_merged = self.scratch.phase_tilde[win_i].min(self.scratch.phase_tilde[win_j]);
+        for row in 0..k {
+            if row == u {
+                self.graph.phase[row] = p_merged;
+            } else if row == v && v < k {
+                self.graph.phase[row] = 0.0;
+            } else {
+                self.graph.phase[row] = self.scratch.phase_tilde[row];
+            }
+        }
+        if already_pinned {
+            self.graph.phase[0] = pin_slot0_prev_phase;
+        }
+
         // Post-merge message passing S_bar_post & g_post (in vec_d_c)
         Self::message_pass_graph(
             cfg,
             &self.weights.bcg_w_e,
+            &self.weights.bcg_w_slot_phase,
             &self.graph.slots,
             &self.graph.edges,
             &self.graph.salience,
+            &self.graph.phase,
+            &mut self.scratch.phase_feat_16,
+            &mut self.scratch.s_phased,
             &mut self.scratch.w_attn,
             &mut self.scratch.vec_d_b,
             &mut self.scratch.s_bar_post,
@@ -911,19 +1464,28 @@ impl DcpaEngine {
         if pin_trigger && !already_pinned {
             unit_rmsnorm_f32(&self.scratch.vec_d_c, cfg.eps, &mut self.graph.slots[0..d]);
             self.graph.salience[0] = self.graph.salience[0].max(2.0);
+            self.graph.phase[0] = 0.0;
             self.graph.slot0_pinned = true;
             Self::message_pass_graph(
                 cfg,
                 &self.weights.bcg_w_e,
+                &self.weights.bcg_w_slot_phase,
                 &self.graph.slots,
                 &self.graph.edges,
                 &self.graph.salience,
+                &self.graph.phase,
+                &mut self.scratch.phase_feat_16,
+                &mut self.scratch.s_phased,
                 &mut self.scratch.w_attn,
                 &mut self.scratch.vec_d_b,
                 &mut self.scratch.s_bar_post,
                 &mut self.scratch.vec_d_c,
             );
         }
+
+        // Update CorticalCarryState causal prev_z_ref
+        self.cortical.prev_z_ref.copy_from_slice(&self.scratch.vec_d_g);
+        self.cortical.has_prev_seg = true;
 
         // =====================================================================
         // 3. Module 3 Asymmetric Eligibility Inheritance (Commandment #8)
@@ -1215,28 +1777,41 @@ impl DcpaEngine {
     ///   4. Retrieves `f_out` from slow cortex + Hippocampus `M^{L<-C}` and initializes `motor.charge_e`
     /// Strictly ZERO heap allocations! Returns `rho_out`.
     pub fn mode1_step_and_retrieve_styled(&mut self, lang_id: usize, style_id: usize) -> f32 {
+        let l_reg_arr = self.build_l_reg(lang_id, style_id);
+        let d_l = self.weights.cfg.d_l;
+        let l_reg = &l_reg_arr[..d_l];
+
+        // 1. Upper Cortical Sandwich decoder -> `cort_z_dec` + `cort_copy_out`
+        Self::cortical_decode_step_parts(
+            &self.weights,
+            &self.cortical,
+            &self.graph,
+            &mut self.scratch,
+            l_reg,
+        );
+
         let cfg = &self.weights.cfg;
         let d = cfg.d_concept;
         let d_r = cfg.d_r;
-        let d_l = cfg.d_l;
         let d_s = cfg.d_s;
 
-        let l_reg_arr = self.build_l_reg(lang_id, style_id);
-        let l_reg = &l_reg_arr[..d_l];
-
+        // 2. Phase-aware graph readout -> `g_ctx` (`vec_d_h`) & `c_hat` (`pmd_z_out`)
         Self::message_pass_graph(
             cfg,
             &self.weights.bcg_w_e,
+            &self.weights.bcg_w_slot_phase,
             &self.graph.slots,
             &self.graph.edges,
             &self.graph.salience,
+            &self.graph.phase,
+            &mut self.scratch.phase_feat_16,
+            &mut self.scratch.s_phased,
             &mut self.scratch.w_attn,
             &mut self.scratch.vec_d_b,
             &mut self.scratch.s_bar,
             &mut self.scratch.vec_d_h, // g_ctx
         );
 
-        // c_hat = f_pred_2(silu(f_pred_1(g_ctx))) -> scratch.pmd_z_out
         linear_f32(
             &self.scratch.vec_d_h,
             &self.weights.bcg_f_pred_1_w,
@@ -1253,7 +1828,7 @@ impl DcpaEngine {
             &mut self.scratch.pmd_z_out, // c_hat
         );
 
-        // Streaming delta_syn: r_role = w_ctx_role(g_ctx)
+        // 3. Streaming delta_syn conditioned on g_ctx + z_dec
         linear_f32(
             &self.scratch.vec_d_h,
             &self.weights.pmd_w_ctx_role,
@@ -1269,7 +1844,7 @@ impl DcpaEngine {
             &mut self.scratch.vec_ds_a,
         );
         linear_f32(
-            &self.scratch.pmd_z_out,
+            &self.scratch.cort_z_dec,
             &self.weights.pmd_u_syn,
             None,
             &mut self.scratch.vec_ds_b,
@@ -1278,10 +1853,10 @@ impl DcpaEngine {
             self.scratch.pmd_delta_syn[i] = silu(self.scratch.vec_ds_a[i] + self.scratch.vec_ds_b[i]);
         }
 
-        // Expressive retrieval from c_hat + l_reg
+        // 4. Slow cortical stem + pointer-copy stem + Fast Hippocampal retrieval (`c_hat`)
         linear_f32(l_reg, &self.weights.hip_w_lang_lex, None, &mut self.scratch.vec_d_b);
         for i in 0..d {
-            self.scratch.vec_d_b[i] += self.scratch.pmd_z_out[i];
+            self.scratch.vec_d_b[i] += self.scratch.cort_z_dec[i];
         }
         linear_f32(
             &self.scratch.vec_d_b,
@@ -1290,6 +1865,9 @@ impl DcpaEngine {
             &mut self.scratch.vec_ds_c,
         );
         unit_rmsnorm_f32(&self.scratch.vec_ds_c, cfg.eps, &mut self.scratch.vec_ds_a);
+        for i in 0..d_s {
+            self.scratch.vec_ds_a[i] += self.scratch.cort_copy_out[i];
+        }
 
         linear_f32(&self.scratch.pmd_z_out, &self.weights.hip_r_sem, None, &mut self.scratch.dg_scores);
         Self::topk_relu_unit_norm(
@@ -1740,6 +2318,14 @@ mod engine_tests {
             max_repair_retries: 2,
             rope_period: 20.0,
             rope_num_harmonics: 8,
+            window_size: 32,
+            clause_chunk_size: 8,
+            n_enc_layers: 1,
+            n_dec_layers: 1,
+            n_heads: 4,
+            cort_expert_hidden: 64,
+            shared_expert_hidden: 64,
+            rope_theta_concept: 10000.0,
             lambda_var: 1.0,
             lambda_act: 0.01,
             lambda_halt: 0.01,

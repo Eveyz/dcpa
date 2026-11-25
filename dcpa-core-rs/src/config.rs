@@ -10,6 +10,34 @@ fn default_lambda_moe_bal() -> f32 {
     0.01
 }
 
+fn default_window_size() -> usize {
+    128
+}
+
+fn default_clause_chunk_size() -> usize {
+    16
+}
+
+fn default_n_cort_layers() -> usize {
+    2
+}
+
+fn default_n_heads() -> usize {
+    8
+}
+
+fn default_cort_expert_hidden() -> usize {
+    384
+}
+
+fn default_shared_expert_hidden() -> usize {
+    512
+}
+
+fn default_rope_theta_concept() -> f32 {
+    10000.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DcpaConfig {
     pub vocab_size: usize,
@@ -37,6 +65,22 @@ pub struct DcpaConfig {
     pub ponder_eta: f32,
     #[serde(default = "default_lambda_moe_bal")]
     pub lambda_moe_bal: f32,
+    #[serde(default = "default_window_size")]
+    pub window_size: usize,
+    #[serde(default = "default_clause_chunk_size")]
+    pub clause_chunk_size: usize,
+    #[serde(default = "default_n_cort_layers")]
+    pub n_enc_layers: usize,
+    #[serde(default = "default_n_cort_layers")]
+    pub n_dec_layers: usize,
+    #[serde(default = "default_n_heads")]
+    pub n_heads: usize,
+    #[serde(default = "default_cort_expert_hidden")]
+    pub cort_expert_hidden: usize,
+    #[serde(default = "default_shared_expert_hidden")]
+    pub shared_expert_hidden: usize,
+    #[serde(default = "default_rope_theta_concept")]
+    pub rope_theta_concept: f32,
     pub lif_lambda: f32,
     pub lif_beta1: f32,
     pub lif_beta2: f32,
@@ -85,6 +129,12 @@ impl DcpaConfig {
         }
         if self.d_l != 64 {
             return Err("d_l must be 64");
+        }
+        if self.window_size < 4 {
+            return Err("window_size must be >= 4");
+        }
+        if self.n_heads == 0 || self.d_concept % self.n_heads != 0 || (self.d_concept / self.n_heads) % 8 != 0 {
+            return Err("d_concept must be divisible by n_heads with d_head % 8 == 0");
         }
         Ok(())
     }

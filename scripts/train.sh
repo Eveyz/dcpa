@@ -42,6 +42,10 @@ SKIP_SFT=0
 RESUME_MODE="auto"
 TMUX_SESSION=""
 DRY_RUN=0
+GIT_PULL=0
+GIT_BRANCH=""
+WANDB_ARGS=()
+WANDB_SFT_ARGS=()
 PYTHON_BIN="${PYTHON_BIN:-}"
 EXTRA_TRAIN_ARGS=()
 
@@ -74,6 +78,17 @@ for arg in "$@"; do
     --no-resume) RESUME_MODE="none" ;;
     --skip-data) SKIP_DATA=1 ;;
     --skip-sft) SKIP_SFT=1 ;;
+    --git-pull) GIT_PULL=1 ;;
+    --git-branch=*) GIT_PULL=1; GIT_BRANCH="${arg#*=}" ;;
+    --wandb|--no-wandb) WANDB_ARGS+=("${arg}"); WANDB_SFT_ARGS+=("${arg}") ;;
+    --wandb-project=*|--wandb-entity=*|--wandb-mode=*|--wandb-tags=*|--wandb-log-every=*)
+      WANDB_ARGS+=("${arg}")
+      WANDB_SFT_ARGS+=("${arg}")
+      ;;
+    --wandb-run-name=*)
+      WANDB_ARGS+=("${arg}")
+      WANDB_SFT_ARGS+=("--wandb-run-name=${arg#*=}-sft")
+      ;;
     --tmux) TMUX_SESSION="dcpa" ;;
     --tmux=*) TMUX_SESSION="${arg#*=}" ;;
     --dry-run) DRY_RUN=1 ;;
@@ -241,6 +256,9 @@ if [[ -n "${BACKUP_DIR}" ]]; then
     "--drive-export-dir" "${BACKUP_DIR}/export"
   )
 fi
+if [[ "${#WANDB_ARGS[@]}" -gt 0 ]]; then
+  TRAIN_CMD+=("${WANDB_ARGS[@]}")
+fi
 if [[ "${#EXTRA_TRAIN_ARGS[@]}" -gt 0 ]]; then
   TRAIN_CMD+=("${EXTRA_TRAIN_ARGS[@]}")
 fi
@@ -257,6 +275,9 @@ SFT_CMD=(
   "--total-steps" "${SFT_STEPS}"
 )
 [[ -n "${BACKUP_DIR}" ]] && SFT_CMD+=("--drive-export-dir" "${BACKUP_DIR}/export")
+if [[ "${#WANDB_SFT_ARGS[@]}" -gt 0 ]]; then
+  SFT_CMD+=("${WANDB_SFT_ARGS[@]}")
+fi
 
 MODE_LABEL="$( [[ "${EFF_GPUS}" -gt 1 ]] && echo "Multi-GPU (${EFF_GPUS} GPUs)" || echo "Single-GPU / Single-Process" )"
 echo "======================================================================"
@@ -279,6 +300,13 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
 fi
 
 mkdir -p "${CKPT_DIR}" "${LOGS_DIR}" "${EXPORT_DIR}"
+
+if [[ "${GIT_PULL}" -eq 1 ]]; then
+  echo "[0/3] Syncing repository via git pull --ff-only..."
+  GIT_SYNC_CMD=("${PYTHON_BIN}" "${REPO_ROOT}/scripts/colab_git_sync.py" "--target-dir" "${REPO_ROOT}")
+  [[ -n "${GIT_BRANCH}" ]] && GIT_SYNC_CMD+=("--branch" "${GIT_BRANCH}")
+  "${GIT_SYNC_CMD[@]}"
+fi
 
 if [[ "${SKIP_DATA}" -eq 0 ]]; then
   echo "[1/3] Preparing & verifying binary shards (profile=${DATA_PROFILE})..."

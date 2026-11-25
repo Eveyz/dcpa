@@ -108,6 +108,7 @@ from utils.distributed import (
     sync_bool_any,
     sync_tensor_avg_,
 )
+from utils.wandb_tracker import WandbTracker, resolve_wandb_settings
 
 
 DEFAULT_CONFIG_PATH = _REPO_ROOT / "configs" / "v1" / "dcpa_48m_train.yaml"
@@ -131,6 +132,7 @@ class TrainRunSummary:
     hardware_tier: str = ""
     interrupted_by_signal: Optional[str] = None
     final_lr_multiplier: float = 1.0
+    wandb_run_id: Optional[str] = None
 
 
 def load_yaml_config(config_path: Optional[str | Path]) -> dict[str, Any]:
@@ -790,6 +792,13 @@ def run_training(
     auto_lr_scale: bool = True,
     length_bucketing: bool = True,
     bf16_grad_comm: bool = True,
+    use_wandb: Optional[bool] = None,
+    wandb_project: Optional[str] = None,
+    wandb_entity: Optional[str] = None,
+    wandb_run_name: Optional[str] = None,
+    wandb_mode: Optional[str] = None,
+    wandb_tags: Optional[str] = None,
+    wandb_log_every: Optional[int] = None,
     clock: Callable[[], float] = time.monotonic,
     pre_step_hook: Optional[Callable[[int, DCPAModel, torch.optim.Optimizer, dict[str, float]], None]] = None,
     step_hook: Optional[Callable[[int, DCPAModel, dict[str, float]], None]] = None,
@@ -857,6 +866,7 @@ def run_training(
         # preserve full continuous training telemetry across sessions.
         restore_drive_log_file(drive_logs_dir, eff_logs_dir, "metrics.jsonl")
         restore_drive_log_file(drive_logs_dir, eff_logs_dir, "watchdog_events.jsonl")
+        restore_drive_log_file(drive_logs_dir, eff_logs_dir, "wandb_run.json")
     dist_barrier(dist_ctx)
 
     run_log: Any = (
@@ -872,6 +882,7 @@ def run_training(
     run_log.__enter__()
     _exit_exc: tuple[Any, Any, Any] = (None, None, None)
     stream: Optional[_DynamicRaggedCursorStream] = None
+    wb_tracker: Optional[WandbTracker] = None
     try:
         if is_primary and hasattr(run_log, "local_log_path"):
             _r0_print(
@@ -1200,6 +1211,7 @@ def run_training(
         resumed_stage_id = -1
         fallback_resume_used = False
         best_val_metric = float("inf")
+        resumed_wandb_id: Optional[str] = None
 
         if resume and resume.lower() != "none":
             if resume.lower() == "auto":
@@ -1229,6 +1241,8 @@ def run_training(
                     )
                     resumed_stage_id = int(loaded_ckpt.get("stage_id", -1))
                     best_val_metric = float(loaded_ckpt.get("best_val_metric", loaded_ckpt.get("best_loss", float("inf"))))
+                    if loaded_ckpt.get("wandb_run_id"):
+                        resumed_wandb_id = str(loaded_ckpt["wandb_run_id"])
                     del loaded_ckpt
                     broadcast_model_state(model, dist_ctx)
                     stream.restore_cursor(restored_cursor)
@@ -1251,6 +1265,8 @@ def run_training(
                 )
                 resumed_stage_id = int(loaded_ckpt.get("stage_id", -1))
                 best_val_metric = float(loaded_ckpt.get("best_val_metric", loaded_ckpt.get("best_loss", float("inf"))))
+                if loaded_ckpt.get("wandb_run_id"):
+                    resumed_wandb_id = str(loaded_ckpt["wandb_run_id"])
                 del loaded_ckpt
                 broadcast_model_state(model, dist_ctx)
                 stream.restore_cursor(restored_cursor)
@@ -1260,6 +1276,39 @@ def run_training(
                 ckpt_mgr.last_healthy_step = start_step
                 wall_trigger.mark_saved(start_step)
                 _r0_print(f"[Resume] Restored explicit checkpoint {explicit} at step={start_step}", flush=True)
+
+        wb_settings = resolve_wandb_settings(
+            yaml_wandb_cfg=yaml_cfg.get("wandb") if isinstance(yaml_cfg.get("wandb"), Mapping) else None,
+            cli_enabled=use_wandb,
+            cli_project=wandb_project,
+            cli_entity=wandb_entity,
+            cli_run_name=wandb_run_name,
+            cli_mode=wandb_mode,
+            cli_tags=wandb_tags,
+            cli_log_every=wandb_log_every,
+        )
+        wb_tracker = WandbTracker(
+            enabled=bool(wb_settings["enabled"]),
+            is_primary=is_primary,
+            project=str(wb_settings["project"]),
+            entity=wb_settings["entity"],
+            run_name=wb_settings["run_name"] or f"dcpa-turbo-{eff_preset}",
+            mode=str(wb_settings["mode"]),
+            tags=list(wb_settings["tags"]),
+            log_every_steps=int(wb_settings["log_every_steps"]),
+            logs_dir=eff_logs_dir,
+            drive_logs_dir=drive_logs_dir,
+            config_payload={
+                "preset": eff_preset,
+                "total_steps": eff_total_steps,
+                "stage_boundaries": list(eff_boundaries),
+                "hardware_tier": profile.tier,
+                "world_size": dist_ctx.world_size,
+                "effective_bytes_per_step": actual_step_bytes,
+                "model": cfg.to_dict(),
+            },
+        )
+        wb_tracker.start(resumed_run_id=resumed_wandb_id, resume_step=start_step)
 
         def _eval_metric_regime(st_id: int) -> str:
             if st_id == 1:
@@ -1294,6 +1343,7 @@ def run_training(
                 best_val_metric=best_val_metric,
                 config_dict=cfg.to_dict(),
                 hardware_tier=profile.tier,
+                wandb_run_id=wb_tracker.run_id if wb_tracker is not None else None,
             )
 
         def _sync_log(force: bool = False) -> None:
@@ -1504,6 +1554,14 @@ def run_training(
                 if action.triggered:
                     optimizer.zero_grad(set_to_none=True)
                     rollback_events.append(action.event_record)
+                    if wb_tracker is not None:
+                        wb_tracker.log_watchdog_rollback(
+                            step=completed_step,
+                            rule=str(action.rule),
+                            reason=str(action.reason),
+                            rollback_count=watchdog.rollback_count,
+                            lr_multiplier=watchdog.directives.lr_multiplier,
+                        )
                     _r0_print(
                         f"[Watchdog Rule {action.rule}] {action.reason} | "
                         f"rollback_count={watchdog.rollback_count} | "
@@ -1575,6 +1633,17 @@ def run_training(
                 kb_per_sec = float(interval_steps * actual_step_bytes) / (interval_dt * 1024.0)
                 active_lrs = [v for v in applied_lrs.values() if v > 0.0]
                 disp_lr = max(active_lrs) if active_lrs else 0.0
+                if wb_tracker is not None and wb_tracker.should_log_step(completed_step, total_steps=eff_total_steps):
+                    wb_tracker.log_train_step(
+                        step=completed_step,
+                        stage_id=sc.stage_id,
+                        metrics=last_metrics,
+                        applied_lrs=applied_lrs,
+                        kb_per_sec=kb_per_sec,
+                        peak_mem_gb=get_peak_memory_gb(device),
+                        watchdog_lr_mult=watchdog.directives.lr_multiplier,
+                        total_steps=eff_total_steps,
+                    )
 
                 # Concise single-line console row every `console_every_steps` (default 50)
                 # plus first 10 steps after launch/resume so compile warmup -> steady-state KB/s is visible!
@@ -1641,6 +1710,12 @@ def run_training(
                     if math.isfinite(eval_metric) and eval_metric < best_val_metric:
                         best_val_metric = eval_metric
                         is_best = True
+                    if wb_tracker is not None:
+                        wb_tracker.log_visual_probe(
+                            step=completed_step,
+                            probe_result=probe_res,
+                            best_val_metric=best_val_metric,
+                        )
 
                     if drive_logs_dir is not None:
                         sync_file_to_drive(eff_logs_dir / "latest_probe.md", drive_logs_dir, dest_name="latest_probe.md")
@@ -1771,11 +1846,14 @@ def run_training(
             hardware_tier=profile.tier,
             interrupted_by_signal=interrupted_sig,
             final_lr_multiplier=watchdog.directives.lr_multiplier,
+            wandb_run_id=wb_tracker.run_id if wb_tracker is not None else None,
         )
     except BaseException:
         _exit_exc = sys.exc_info()
         raise
     finally:
+        if wb_tracker is not None:
+            wb_tracker.finish()
         if stream is not None:
             stream.close()
         run_log.__exit__(*_exit_exc)
@@ -1858,6 +1936,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-consecutive-meltdowns", type=int, default=3)
     ap.add_argument("--milestone-steps", type=str, default=None)
     ap.add_argument("--no-export", action="store_true")
+    ap.add_argument("--wandb", dest="use_wandb", action="store_true", default=None, help="Enable Weights & Biases live telemetry.")
+    ap.add_argument("--no-wandb", dest="use_wandb", action="store_false", help="Disable Weights & Biases telemetry.")
+    ap.add_argument("--wandb-project", type=str, default=None)
+    ap.add_argument("--wandb-entity", type=str, default=None)
+    ap.add_argument("--wandb-run-name", type=str, default=None)
+    ap.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default=None)
+    ap.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated W&B tags.")
+    ap.add_argument("--wandb-log-every", type=int, default=None)
     return ap
 
 
@@ -1910,6 +1996,13 @@ def main() -> None:
             fixed_global_batch=args.fixed_global_batch,
             auto_lr_scale=not args.no_auto_lr_scale,
             length_bucketing=not args.no_length_bucketing,
+            use_wandb=args.use_wandb,
+            wandb_project=args.wandb_project,
+            wandb_entity=args.wandb_entity,
+            wandb_run_name=args.wandb_run_name,
+            wandb_mode=args.wandb_mode,
+            wandb_tags=args.wandb_tags,
+            wandb_log_every=args.wandb_log_every,
         )
         if int(os.environ.get("RANK", "0") or "0") == 0:
             print(

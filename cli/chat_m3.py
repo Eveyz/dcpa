@@ -61,8 +61,10 @@ from dcpa.model import (
     _compute_unpin_trigger_byte_mask,
 )
 from dcpa.modules.bcg_pc import ConceptGraphState
+from dcpa.modules.cortical import CorticalCarryState
 from dcpa.modules.hippocampus import ColumnMajorFastWeights, EligibilityState
 from dcpa.ops.ragged import ragged_local_offsets, ragged_segment_sum
+from dcpa.ops.rope import compute_segment_scope_depths
 from train.train_dcpa import export_final_safetensors
 from train.train_stage5_sft import load_dcpa_model_from_weights
 from train.visual_probe import format_sgsc_segmentation
@@ -456,6 +458,7 @@ class DCPAChatSession:
             elig_state=EligibilityState.zeros(
                 1, self.model.cfg.k_slots, self.model.cfg.s_active, self.model.cfg.d_s, self.device, torch.float32
             ),
+            cortical_state=fresh.cortical_state,
         )
 
     def add_tool_signature(self, sig_line: str, fn: Optional[Callable[..., Any]] = None) -> str:
@@ -488,6 +491,7 @@ class DCPAChatSession:
             elig_state=EligibilityState.zeros(
                 1, self.model.cfg.k_slots, self.model.cfg.s_active, self.model.cfg.d_s, self.device, torch.float32
             ),
+            cortical_state=fresh.cortical_state,
         )
 
     def wipe_all_memory(self) -> None:
@@ -549,6 +553,15 @@ class DCPAChatSession:
         g_state = self.carry.graph_state
         f_state = self.carry.fast_state
         e_state = self.carry.elig_state
+        c_carry = (
+            self.carry.cortical_state
+            if self.carry.cortical_state is not None
+            else self.model.cortical.init_carry_state(1, device=self.device, dtype=torch.float32)
+        )
+        seg_doc_start = torch.zeros((m_total,), device=self.device, dtype=torch.bool)
+        _, seg_end_depth, final_ast = compute_segment_scope_depths(
+            x_t, sgsc_out.cu_seqlens, seg_doc_start, doc_reset_mask=None, init_depth=c_carry.ast_depth
+        )
 
         max_ach = 0.0
         hippo_writes = 0
@@ -562,17 +575,28 @@ class DCPAChatSession:
             sn_m = sgsc_out.sem_norm[m : m + 1]
             mi_m = sgsc_out.mean_info[m : m + 1]
             trig_m = seg_pin_trig[m : m + 1]
-            if float(seg_unpin_trig[m].item()) > 0.5 and g_state.slot0_pinned is not None:
+            unpin_m = seg_unpin_trig[m : m + 1] > 0.5
+            end_dep_m = seg_end_depth[m : m + 1]
+            if bool(unpin_m.item()) and g_state.slot0_pinned is not None:
                 g_state = ConceptGraphState(
                     slots=g_state.slots,
                     edges=g_state.edges,
                     salience=g_state.salience,
                     slot0_pinned=torch.zeros_like(g_state.slot0_pinned),
+                    phase=torch.zeros_like(g_state.phase) if g_state.phase is not None else None,
                 )
+
+            h_enc_m, c_carry = self.model.cortical.encode_step_streaming(
+                c_slow_step=c_m,
+                f_stem_step=f_m,
+                seg_end_depth=end_dep_m,
+                carry=c_carry,
+                unpin_reset=unpin_m,
+            )
 
             hip_r = self.model.hippocampus.read_comprehension(
                 f_stem=f_m,
-                c_slow=c_m,
+                c_slow=h_enc_m,
                 sem_norm=sn_m,
                 mean_info=mi_m,
                 fast_state=f_state,
@@ -590,6 +614,16 @@ class DCPAChatSession:
                 pin_trigger=trig_m,
             )
             g_state = bcg_o.state
+            c_carry = CorticalCarryState(
+                ring_kv=c_carry.ring_kv,
+                ring_pos=c_carry.ring_pos,
+                ring_depth=c_carry.ring_depth,
+                ring_valid=c_carry.ring_valid,
+                doc_pos=c_carry.doc_pos,
+                ast_depth=c_carry.ast_depth,
+                prev_z_ref=bcg_o.z_star.detach().to(c_carry.prev_z_ref.dtype),
+                has_prev_seg=torch.ones_like(c_carry.has_prev_seg),
+            )
             last_z_star = bcg_o.z_star
             last_g_ctx = bcg_o.g_ctx
             if float(bcg_o.ponder_steps[0].item()) < 0.5:
@@ -645,9 +679,20 @@ class DCPAChatSession:
                     )
                 )
 
+        c_carry = CorticalCarryState(
+            ring_kv=c_carry.ring_kv,
+            ring_pos=c_carry.ring_pos,
+            ring_depth=c_carry.ring_depth,
+            ring_valid=c_carry.ring_valid,
+            doc_pos=c_carry.doc_pos,
+            ast_depth=final_ast.clamp(0, 31),
+            prev_z_ref=c_carry.prev_z_ref,
+            has_prev_seg=c_carry.has_prev_seg,
+        )
         self.carry.sgsc_h = sgsc_out.h_seq[:, -1, :].detach().clone()
         self.carry.graph_state = g_state
         self.carry.elig_state = e_state
+        self.carry.cortical_state = c_carry
 
         return {
             "num_spikes": m_total,
@@ -694,21 +739,38 @@ class DCPAChatSession:
         # Closed-loop Mode-1 predictive motor drive aligned 1-to-1 with Stage 5 SFT (`use_broca_cq=False`):
         # derives `c_hat` from live `BCG-PC` graph readout `g_ctx`, updating `self.carry` after each segment!
         def _next_motor_drive():
+            c_st = (
+                self.carry.cortical_state
+                if self.carry.cortical_state is not None
+                else self.model.cortical.init_carry_state(1, device=self.device, dtype=torch.float32)
+            )
+            g_phase = (
+                self.carry.graph_state.phase
+                if self.carry.graph_state.phase is not None
+                else torch.zeros((1, self.model.cfg.k_slots), device=self.device, dtype=torch.float32)
+            )
+            z_dec, copy_stem = self.model.cortical.decode_step_streaming(
+                l_reg=l_reg,
+                carry=c_st,
+                slots=self.carry.graph_state.slots,
+                edges=self.carry.graph_state.edges,
+                salience=self.carry.graph_state.salience,
+                phase=g_phase,
+            )
             _, g_ctx = self.model.bcg_pc.message_pass(
                 self.carry.graph_state.slots,
                 self.carry.graph_state.edges,
                 self.carry.graph_state.salience,
+                phase=g_phase,
             )
             c_hat = self.model.bcg_pc.f_pred_2(F.silu(self.model.bcg_pc.f_pred_1(g_ctx)))
-            f_out, _ = self.model.hippocampus.read_expression(
-                z_out=c_hat,
-                l_reg=l_reg,
-                fast_state=self.carry.fast_state,
-                enabled=True,
-            )
+            f_slow, _ = self.model.hippocampus.read_expression(z_out=z_dec, l_reg=l_reg, enabled=False)
+            f_cort = f_slow + copy_stem
+            rho_out, f_hip = self.model._query_hippocampus_expression_fast(c_hat, self.carry.fast_state)
+            f_out = ((1.0 - rho_out).unsqueeze(-1) * f_cort.float() + rho_out.unsqueeze(-1) * f_hip).to(f_cort.dtype)
             delta_syn = self.model.pmd.compute_streaming_delta_syn(
                 g_ctx=g_ctx,
-                z_star=c_hat,
+                z_star=z_dec,
                 l_reg=l_reg,
             )
             charge0 = self.model.pmd.init_segment_charge(f_out, delta_syn, l_reg)

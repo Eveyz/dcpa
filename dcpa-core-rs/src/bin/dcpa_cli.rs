@@ -161,6 +161,7 @@ fn cmd_verify_golden(dir: &Path) {
     let mut rust_spikes = Vec::with_capacity(t_len);
     let mut rust_f_stem = Vec::new();
     let mut rust_c_slow = Vec::new();
+    let mut rust_h_enc = Vec::new();
     let mut rust_c_fused = Vec::new();
     let mut rust_prec_bu = Vec::new();
     let mut rust_ach = Vec::new();
@@ -188,6 +189,7 @@ fn cmd_verify_golden(dir: &Path) {
             rust_c_slow.extend_from_slice(&engine.scratch.vec_d_a);
 
             let ctr = engine.step_concept_from_scratch(tr.mean_info, tr.sem_norm);
+            rust_h_enc.extend_from_slice(&engine.scratch.cort_h_enc);
             rust_c_fused.extend_from_slice(&engine.scratch.hip_c_fused);
             rust_prec_bu.extend_from_slice(&engine.scratch.hip_prec_bu);
             rust_ach.push(ctr.ach);
@@ -211,6 +213,11 @@ fn cmd_verify_golden(dir: &Path) {
     check_vec_parity("sgsc.info", &rust_info, &golden["sgsc.info"].data_f32, 1e-5, 0.9999);
     check_vec_parity("sgsc.f_stem", &rust_f_stem, &golden["sgsc.f_stem"].data_f32, 1e-5, 0.9999);
     check_vec_parity("sgsc.c_slow", &rust_c_slow, &golden["sgsc.c_slow"].data_f32, 1e-5, 0.9999);
+
+    check_vec_parity("cortical.h_enc", &rust_h_enc, &golden["cortical.h_enc"].data_f32, 1e-5, 0.9999);
+    engine.cortical_decode_styled(lang_id, 0);
+    check_vec_parity("cortical.z_dec", &engine.scratch.cort_z_dec, &golden["cortical.z_dec"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("cortical.copy_stem", &engine.scratch.cort_copy_out, &golden["cortical.copy_stem"].data_f32, 1e-5, 0.9999);
 
     check_vec_parity("hip.c_fused", &rust_c_fused, &golden["hip.c_fused"].data_f32, 1e-5, 0.9999);
     check_vec_parity("hip.prec_bu", &rust_prec_bu, &golden["hip.prec_bu"].data_f32, 1e-5, 0.9999);
@@ -257,6 +264,7 @@ fn cmd_verify_golden(dir: &Path) {
     check_vec_parity("bcg.final_slots", &engine.graph.slots, &golden["bcg.final_slots"].data_f32, 1e-5, 0.9999);
     check_vec_parity("bcg.final_edges", &engine.graph.edges, &golden["bcg.final_edges"].data_f32, 1e-5, 0.9999);
     check_vec_parity("bcg.final_salience", &engine.graph.salience, &golden["bcg.final_salience"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("bcg.final_phase", &engine.graph.phase, &golden["bcg.final_phase"].data_f32, 1e-5, 0.9999);
 
     engine.broca_cq_init();
     let (rho_out, _done) = engine.broca_cq_step_and_retrieve(lang_id);

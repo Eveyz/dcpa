@@ -40,6 +40,8 @@ pub struct SgscState {
     pub seg_unpin_hit: bool,
     pub pending_asst_pin: bool,
     pub pending_asst_ticks: u8,
+    pub raw_ast_depth: i32,
+    pub last_seg_end_depth: i32,
 }
 
 impl SgscState {
@@ -61,6 +63,8 @@ impl SgscState {
             seg_unpin_hit: false,
             pending_asst_pin: false,
             pending_asst_ticks: 0,
+            raw_ast_depth: 0,
+            last_seg_end_depth: 0,
         }
     }
 
@@ -79,6 +83,8 @@ impl SgscState {
         self.seg_unpin_hit = false;
         self.pending_asst_pin = false;
         self.pending_asst_ticks = 0;
+        self.raw_ast_depth = 0;
+        self.last_seg_end_depth = 0;
     }
 
     #[inline]
@@ -98,6 +104,61 @@ impl SgscState {
         self.seg_unpin_hit = src.seg_unpin_hit;
         self.pending_asst_pin = src.pending_asst_pin;
         self.pending_asst_ticks = src.pending_asst_ticks;
+        self.raw_ast_depth = src.raw_ast_depth;
+        self.last_seg_end_depth = src.last_seg_end_depth;
+    }
+}
+
+/// Shared O(1) MLA-compressed local morpheme/concept ring (`W=128`, ~48 KB in BF16 / ~96 KB in FP32).
+#[derive(Clone)]
+pub struct CorticalState {
+    pub ring_kv: Vec<f32>,    // [W * d_s]
+    pub ring_pos: Vec<i64>,   // [W]
+    pub ring_depth: Vec<i32>, // [W]
+    pub ring_valid: Vec<bool>,// [W]
+    pub doc_pos: i64,
+    pub ast_depth: i32,
+    pub prev_z_ref: Vec<f32>, // [D]
+    pub has_prev_seg: bool,
+}
+
+impl CorticalState {
+    pub fn new(weights: &DcpaWeights) -> Self {
+        let w = weights.cfg.window_size;
+        let d_s = weights.cfg.d_s;
+        Self {
+            ring_kv: vec![0.0f32; w * d_s],
+            ring_pos: vec![0i64; w],
+            ring_depth: vec![0i32; w],
+            ring_valid: vec![false; w],
+            doc_pos: 0,
+            ast_depth: 0,
+            prev_z_ref: weights.cort_bos_concept.clone(),
+            has_prev_seg: false,
+        }
+    }
+
+    pub fn reset(&mut self, weights: &DcpaWeights) {
+        self.ring_kv.fill(0.0);
+        self.ring_pos.fill(0);
+        self.ring_depth.fill(0);
+        self.ring_valid.fill(false);
+        self.doc_pos = 0;
+        self.ast_depth = 0;
+        self.prev_z_ref.copy_from_slice(&weights.cort_bos_concept);
+        self.has_prev_seg = false;
+    }
+
+    #[inline]
+    pub fn copy_from(&mut self, src: &Self) {
+        self.ring_kv.copy_from_slice(&src.ring_kv);
+        self.ring_pos.copy_from_slice(&src.ring_pos);
+        self.ring_depth.copy_from_slice(&src.ring_depth);
+        self.ring_valid.copy_from_slice(&src.ring_valid);
+        self.doc_pos = src.doc_pos;
+        self.ast_depth = src.ast_depth;
+        self.prev_z_ref.copy_from_slice(&src.prev_z_ref);
+        self.has_prev_seg = src.has_prev_seg;
     }
 }
 
@@ -107,15 +168,18 @@ pub struct ConceptGraphState {
     pub slots: Vec<f32>,    // [K * D]
     pub edges: Vec<f32>,    // [K * K * d_r]
     pub salience: Vec<f32>, // [K]
+    pub phase: Vec<f32>,    // [K]
     pub slot0_pinned: bool, // Spec 2 Slot-0 Thesis Pinning latch
 }
 
 impl ConceptGraphState {
     pub fn new(weights: &DcpaWeights) -> Self {
+        let k = weights.cfg.k_slots;
         Self {
             slots: weights.bcg_s0.clone(),
             edges: weights.bcg_a0.clone(),
             salience: weights.bcg_omega0.clone(),
+            phase: vec![0.0f32; k],
             slot0_pinned: false,
         }
     }
@@ -124,6 +188,7 @@ impl ConceptGraphState {
         self.slots.copy_from_slice(&weights.bcg_s0);
         self.edges.copy_from_slice(&weights.bcg_a0);
         self.salience.copy_from_slice(&weights.bcg_omega0);
+        self.phase.fill(0.0);
         self.slot0_pinned = false;
     }
 
@@ -132,6 +197,7 @@ impl ConceptGraphState {
         self.slots.copy_from_slice(&src.slots);
         self.edges.copy_from_slice(&src.edges);
         self.salience.copy_from_slice(&src.salience);
+        self.phase.copy_from_slice(&src.phase);
         self.slot0_pinned = src.slot0_pinned;
     }
 }
@@ -621,6 +687,7 @@ impl MotorState {
 #[derive(Clone)]
 pub struct BrainSnapshot {
     pub sgsc: SgscState,
+    pub cortical: CorticalState,
     pub graph: ConceptGraphState,
     pub elig: EligibilityTags,
     pub motor: MotorState,
@@ -630,6 +697,7 @@ impl BrainSnapshot {
     pub fn new(weights: &DcpaWeights) -> Self {
         Self {
             sgsc: SgscState::new(weights),
+            cortical: CorticalState::new(weights),
             graph: ConceptGraphState::new(weights),
             elig: EligibilityTags::new(&weights.cfg),
             motor: MotorState::new(weights),
@@ -640,11 +708,13 @@ impl BrainSnapshot {
     pub fn capture_from(
         &mut self,
         sgsc: &SgscState,
+        cortical: &CorticalState,
         graph: &ConceptGraphState,
         elig: &EligibilityTags,
         motor: &MotorState,
     ) {
         self.sgsc.copy_from(sgsc);
+        self.cortical.copy_from(cortical);
         self.graph.copy_from(graph);
         self.elig.copy_from(elig);
         self.motor.copy_from(motor);
@@ -654,23 +724,28 @@ impl BrainSnapshot {
     pub fn restore_into(
         &self,
         sgsc: &mut SgscState,
+        cortical: &mut CorticalState,
         graph: &mut ConceptGraphState,
         elig: &mut EligibilityTags,
         motor: &mut MotorState,
     ) {
         sgsc.copy_from(&self.sgsc);
+        cortical.copy_from(&self.cortical);
         graph.copy_from(&self.graph);
         elig.copy_from(&self.elig);
         motor.copy_from(&self.motor);
     }
 
-    /// Exact active working-memory footprint in bytes (~22–38 KB depending on d_s/D).
+    /// Exact active working-memory footprint in bytes.
     pub fn byte_footprint(&self) -> usize {
         let f32_elems = self.sgsc.h.len()
             + self.sgsc.seg_h.len()
+            + self.cortical.ring_kv.len()
+            + self.cortical.prev_z_ref.len()
             + self.graph.slots.len()
             + self.graph.edges.len()
             + self.graph.salience.len()
+            + self.graph.phase.len()
             + self.elig.e_val.len()
             + self.elig.f_tilde.len()
             + self.elig.eta.len()
@@ -680,8 +755,12 @@ impl BrainSnapshot {
             + self.motor.queue_q_init.len()
             + self.motor.a_prev.len();
         let usize_elems = self.elig.e_idx.len();
+        let ring_meta_bytes = self.cortical.ring_pos.len() * 8
+            + self.cortical.ring_depth.len() * 4
+            + self.cortical.ring_valid.len();
         f32_elems * core::mem::size_of::<f32>()
             + usize_elems * core::mem::size_of::<usize>()
+            + ring_meta_bytes
             + 64
     }
 }
@@ -790,6 +869,36 @@ pub struct ScratchPool {
     pub mon_f_stem: Vec<f32>,   // [d_s]
     pub mon_c_slow: Vec<f32>,   // [D]
     pub mon_c_check: Vec<f32>,  // [D]
+
+    // Cortical Sandwich & Contractive Phase Graph scratch (0 allocs/byte!)
+    pub cort_h_enc: Vec<f32>,       // [D]
+    pub cort_z_dec: Vec<f32>,       // [D]
+    pub cort_x: Vec<f32>,           // [D]
+    pub cort_tmp: Vec<f32>,         // [D]
+    pub cort_tmp2: Vec<f32>,        // [D]
+    pub cort_q: Vec<f32>,           // [D]
+    pub cort_q_rot: Vec<f32>,       // [D]
+    pub cort_k_ring: Vec<f32>,      // [W * D]
+    pub cort_v_ring: Vec<f32>,      // [W * D]
+    pub cort_gk: Vec<f32>,          // [K * D]
+    pub cort_gv: Vec<f32>,          // [K * D]
+    pub cort_sal_bias: Vec<f32>,    // [K]
+    pub cort_scores: Vec<f32>,      // [W + K]
+    pub cort_copy_acc: Vec<f32>,    // [W]
+    pub cort_copy_f: Vec<f32>,      // [d_s]
+    pub cort_copy_out: Vec<f32>,    // [d_s]
+    pub cort_shared_gu: Vec<f32>,   // [2 * shared_expert_hidden]
+    pub cort_shared_h: Vec<f32>,    // [shared_expert_hidden]
+    pub cort_routed_h1: Vec<f32>,   // [cort_expert_hidden]
+    pub cort_routed_h2: Vec<f32>,   // [cort_expert_hidden]
+    pub cort_routed_out: Vec<f32>,  // [D]
+    pub phase_feat_16: [f32; 16],
+    pub phase_feat_32: [f32; 32],
+    pub lam_k: Vec<f32>,            // [K]
+    pub phase_tilde: Vec<f32>,      // [K + 1]
+    pub s_phased: Vec<f32>,         // [K * D]
+    pub s_contracted: Vec<f32>,     // [K * D]
+    pub edge_in_kd: Vec<f32>,       // [K * d_r]
 }
 
 impl ScratchPool {
@@ -801,6 +910,9 @@ impl ScratchPool {
         let d_r = cfg.d_r;
         let d_l = cfg.d_l;
         let s = cfg.s_active;
+        let w = cfg.window_size;
+        let sh = cfg.shared_expert_hidden;
+        let ch = cfg.cort_expert_hidden;
         Self {
             logits_256: [0.0; 256],
             probs_256: [0.0; 256],
@@ -869,6 +981,35 @@ impl ScratchPool {
             mon_f_stem: vec![0.0; d_s],
             mon_c_slow: vec![0.0; d],
             mon_c_check: vec![0.0; d],
+
+            cort_h_enc: vec![0.0; d],
+            cort_z_dec: vec![0.0; d],
+            cort_x: vec![0.0; d],
+            cort_tmp: vec![0.0; d],
+            cort_tmp2: vec![0.0; d],
+            cort_q: vec![0.0; d],
+            cort_q_rot: vec![0.0; d],
+            cort_k_ring: vec![0.0; w * d],
+            cort_v_ring: vec![0.0; w * d],
+            cort_gk: vec![0.0; k * d],
+            cort_gv: vec![0.0; k * d],
+            cort_sal_bias: vec![0.0; k],
+            cort_scores: vec![0.0; w + k],
+            cort_copy_acc: vec![0.0; w],
+            cort_copy_f: vec![0.0; d_s],
+            cort_copy_out: vec![0.0; d_s],
+            cort_shared_gu: vec![0.0; 2 * sh],
+            cort_shared_h: vec![0.0; sh],
+            cort_routed_h1: vec![0.0; ch],
+            cort_routed_h2: vec![0.0; ch],
+            cort_routed_out: vec![0.0; d],
+            phase_feat_16: [0.0; 16],
+            phase_feat_32: [0.0; 32],
+            lam_k: vec![0.0; k],
+            phase_tilde: vec![0.0; kp1],
+            s_phased: vec![0.0; k * d],
+            s_contracted: vec![0.0; k * d],
+            edge_in_kd: vec![0.0; k * d_r],
         }
     }
 }

@@ -131,7 +131,7 @@ hardware:
   compile_doc_bucket_size: 16
   compile_cache_size_limit: 128
   bcg_checkpoint_vram_watermark_gb: 74.0   # Auto-clamped (~20.8GB on 32GB 5090, 74GB on 95GB Blackwell -> 0% recompute!)
-  bcg_chunk_steps: 2                       # Pack 2 BCG-PC steps (16 MoE layers) per compiled graph (fast ~1m cold compile, 2x less CPU dispatch)
+  bcg_chunk_steps: 16                      # Pack 16 zero-MoE contractive clause steps per compiled graph (8x less Python/chunk dispatch)
   bcg_tbptt_window: 32
   bcg_tbptt_replay: auto
   prefetch_depth: 3

@@ -350,6 +350,10 @@ def configure_model_compile(
         bcg_unwrapped = unwrap_compiled_module(getattr(model, "bcg_pc"))
         if hasattr(bcg_unwrapped, "disable_compiled_subkernels"):
             bcg_unwrapped.disable_compiled_subkernels()
+    if hasattr(model, "cortical"):
+        cort_unwrapped = unwrap_compiled_module(getattr(model, "cortical"))
+        if hasattr(cort_unwrapped, "disable_compiled_kernels"):
+            cort_unwrapped.disable_compiled_kernels()
 
     if eff_mode == "none":
         return CompileReport(
@@ -415,11 +419,21 @@ def configure_model_compile(
         if hasattr(bcg_raw, "enable_compiled_chunk_kernel"):
             bcg_raw.enable_compiled_chunk_kernel(**compile_kwargs)
             hotspots.append("bcg_chunk_kernel")
+        if hasattr(bcg_raw, "enable_compiled_ponder_parallel"):
+            bcg_raw.enable_compiled_ponder_parallel(**compile_kwargs)
+            hotspots.append("bcg_ponder_parallel_kernel")
         compiled_bcg = torch.compile(bcg_raw, **compile_kwargs)
         setattr(model, "bcg_pc", compiled_bcg)
         if hasattr(model, "enable_doc_bucketing"):
             setattr(model, "enable_doc_bucketing", True)
         hotspots.append("bcg_step_kernel")
+
+    # --- Hotspot C: Parallel Cortical Sandwich (Tiled 2D Concept-RoPE SWA + Shared/Routed MoE) ---
+    if hasattr(model, "cortical"):
+        cort_mod = unwrap_compiled_module(getattr(model, "cortical"))
+        if hasattr(cort_mod, "enable_compiled_kernels"):
+            cort_mod.enable_compiled_kernels(**compile_kwargs)
+            hotspots.append("cortical_sandwich_kernel")
 
     # --- Hotspot B1: SGSC per-byte gated projections & chunked diagonal scan ---
     if hasattr(model, "sgsc"):

@@ -789,6 +789,7 @@ class BCGPC(nn.Module):
         self._compiled_post_merge: Optional[Callable[..., Any]] = None
         self._compiled_chunk_fn: Optional[Callable[..., Any]] = None
         self._compiled_clause_chunk_fn: Optional[Callable[..., Any]] = None
+        self._compiled_ponder_parallel: Optional[Callable[..., Any]] = None
 
         self._init_weights()
 
@@ -801,6 +802,10 @@ class BCGPC(nn.Module):
         compiled_fn = torch.compile(self._forward_clause_chunk_impl, **compile_kwargs)
         self._compiled_chunk_fn = compiled_fn
         self._compiled_clause_chunk_fn = compiled_fn
+
+    def enable_compiled_ponder_parallel(self, **compile_kwargs: Any) -> None:
+        """Compile zero-sync static-bucketed `ponder_parallel` into a single Inductor graph."""
+        self._compiled_ponder_parallel = torch.compile(self._ponder_parallel_static_impl, **compile_kwargs)
 
     def enable_compiled_subkernels(self, **compile_kwargs: Any) -> None:
         """Compile static-shape pre-ponder, active-compacted ponder/MoE, and post-merge sub-kernels."""
@@ -821,6 +826,7 @@ class BCGPC(nn.Module):
         self._compiled_post_merge = None
         self._compiled_chunk_fn = None
         self._compiled_clause_chunk_fn = None
+        self._compiled_ponder_parallel = None
 
     def _init_weights(self) -> None:
         # Initialize f_prec bias so Softplus(bias) ~ 1.0 and w_gen near identity so pondering
@@ -1053,7 +1059,16 @@ class BCGPC(nn.Module):
         k_prev, v_prev = self.cross_attn.project_kv(s_bar_prev)
         return s_bar_prev, g_ctx, c_hat, pi_m, pi_eff, surprisal_0, eps_0, z_0, k_prev, v_prev
 
-    def ponder_parallel(
+    @staticmethod
+    def _bucket_ponder_tokens(m: int) -> int:
+        """Map `M` (`1..65536`) to half-power-of-two static buckets (`<= 32` distinct shapes total)."""
+        if m <= 4:
+            return max(1, m)
+        p = 1 << ((m - 1).bit_length() - 1)
+        half_step = p + (p >> 1)
+        return half_step if m <= half_step else (p << 1)
+
+    def _ponder_parallel_static_impl(
         self,
         z_0: torch.Tensor,
         eps_0: torch.Tensor,
@@ -1061,37 +1076,26 @@ class BCGPC(nn.Module):
         s_bar_prev: torch.Tensor,
         c_fused: torch.Tensor,
         pi_eff: torch.Tensor,
-        active_mask: Optional[torch.Tensor] = None,
+        active_mask: torch.Tensor,
+        w_gu1: torch.Tensor,
+        w_d1: torch.Tensor,
+        w_gu2: torch.Tensor,
+        w_d2: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Full-batch parallel System-2 Pondering across all `[M_total, D]` segments simultaneously!
+        """Zero-sync static-shape parallel Pondering kernel (0 `torch.nonzero` syncs, 0 dynamic recompiles).
 
-        Compacts ONLY surprised concepts (`surp_cur > tau_skip/tau_halt`) into a single dense
-        `[M_surprised, D]` Tensor-Core matrix per step (`<= L_max` steps, exiting immediately once
-        `M_surprised == 0`), turning 3,400+ tiny sequential MoE calls into 2-4 large batched GEMMs!
+        Uses Sentinel-E masked `F.grouped_mm` in `SparseMicroMoE` (`sample_mask=active`), which skips
+        100% of inactive/halted/padded expert rows on SM80+ CUDA without a single GPU->CPU sync.
         """
-        M, D = z_0.shape
+        M = z_0.shape[0]
         dev = z_0.device
-        orig_dtype = z_0.dtype
-        if M == 0:
-            return (
-                z_0,
-                torch.zeros((0,), device=dev, dtype=torch.float32),
-                torch.zeros((), device=dev, dtype=torch.float32),
-            )
-
-        am = torch.ones((M,), device=dev, dtype=torch.bool) if active_mask is None else active_mask.bool()
-        if not self.training and dev.type == "cpu":
-            return self._ponder_loop_sparse(z_0, eps_0, surprisal_0, s_bar_prev, c_fused, pi_eff, am)
-
-        packed_w = self.moe.pack_weights(dtype=orig_dtype)
+        packed_w = (w_gu1, w_d1, w_gu2, w_d2)
         k_prev, v_prev = self.cross_attn.project_kv(s_bar_prev)
-        router_fn = self._compiled_ponder_router if self._compiled_ponder_router is not None else self._ponder_router_impl
-        update_fn = self._compiled_ponder_update if self._compiled_ponder_update is not None else self._ponder_update_impl
 
         z_cur = z_0
         eps_cur = eps_0
         surp_cur = surprisal_0
-        active = am
+        active = active_mask.bool()
         ponder_steps = torch.zeros((M,), device=dev, dtype=torch.float32)
         moe_bal_sum = torch.zeros((), device=dev, dtype=torch.float32)
         moe_bal_count = torch.zeros((), device=dev, dtype=torch.float32)
@@ -1107,42 +1111,95 @@ class BCGPC(nn.Module):
             ste_act = (hard_act - soft_act).detach() + soft_act
             ponder_steps = ponder_steps + ste_act
 
-            act_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
-            n_act = int(act_idx.numel())
-            if n_act == 0:
-                break
+            if self.training and l_idx > 0:
+                z_in = z_cur.detach() + 0.5 * (z_cur - z_cur.detach())
+                eps_in = eps_cur.detach() + 0.5 * (eps_cur - eps_cur.detach())
+            else:
+                z_in = z_cur
+                eps_in = eps_cur
 
-            z_act = z_cur[act_idx]
-            eps_act = eps_cur[act_idx]
-            router_in = router_fn(z_act, eps_act, k_prev[act_idx], v_prev[act_idx])
-            delta_act, bal_l = self.moe.forward_compacted_bmm(
-                router_in,
-                n_valid=n_act,
-                sample_mask=None,
+            r_all = self.cross_attn.forward_with_kv(z_in, k_prev, v_prev)
+            delta_all, bal_l = self.moe(
+                eps_in + r_all,
+                static_shape=True,
+                sample_mask=active,
                 packed_weights=packed_w,
-                compiled_experts_fn=self._compiled_experts_bmm,
-                compiled_grouped_mm_fn=self._compiled_experts_grouped_mm,
             )
             moe_bal_sum = moe_bal_sum + bal_l
-            moe_bal_count = moe_bal_count + 1.0
+            moe_bal_count = moe_bal_count + (hard_act.sum() > 0.0).float()
 
-            z_next_a, eps_next_a, surp_next_a = update_fn(
-                z_act, delta_act, c_fused[act_idx], pi_eff[act_idx]
-            )
-            z_next = z_cur.clone()
-            z_next[act_idx] = z_next_a
-            z_cur = z_next
-
-            eps_next = eps_cur.clone()
-            eps_next[act_idx] = eps_next_a
-            eps_cur = eps_next
-
-            surp_next = surp_cur.clone()
-            surp_next[act_idx] = surp_next_a
-            surp_cur = surp_next
+            z_cand, eps_cand, surp_cand = self._ponder_update_impl(z_in, delta_all, c_fused, pi_eff)
+            act_col = active.unsqueeze(-1)
+            z_cur = torch.where(act_col, z_cand, z_cur)
+            eps_cur = torch.where(act_col, eps_cand, eps_cur)
+            surp_cur = torch.where(active, surp_cand, surp_cur)
 
         moe_bal_loss = moe_bal_sum / moe_bal_count.clamp_min(1.0)
         return z_cur, ponder_steps, moe_bal_loss
+
+    def ponder_parallel(
+        self,
+        z_0: torch.Tensor,
+        eps_0: torch.Tensor,
+        surprisal_0: torch.Tensor,
+        s_bar_prev: torch.Tensor,
+        c_fused: torch.Tensor,
+        pi_eff: torch.Tensor,
+        active_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Full-batch parallel System-2 Pondering across all `[M_total, D]` segments simultaneously!
+
+        On GPU / compiled execution: pads `M_total` to a half-power-of-two static bucket (`<= 32` buckets
+        total, well within `cache_size_limit=128`) and runs Sentinel-E masked `F.grouped_mm` with ZERO
+        `torch.nonzero` GPU->CPU syncs and ZERO dynamic-shape recompiles!
+        """
+        M, D = z_0.shape
+        dev = z_0.device
+        orig_dtype = z_0.dtype
+        if M == 0:
+            return (
+                z_0,
+                torch.zeros((0,), device=dev, dtype=torch.float32),
+                torch.zeros((), device=dev, dtype=torch.float32),
+            )
+
+        am = torch.ones((M,), device=dev, dtype=torch.bool) if active_mask is None else active_mask.bool()
+        if not self.training and dev.type == "cpu" and self._compiled_ponder_parallel is None:
+            return self._ponder_loop_sparse(z_0, eps_0, surprisal_0, s_bar_prev, c_fused, pi_eff, am)
+
+        use_bucket = self._compiled_ponder_parallel is not None or self._static_kernel_mode
+        M_pad = self._bucket_ponder_tokens(M) if use_bucket else M
+        pad = M_pad - M
+        if pad > 0:
+            K = s_bar_prev.shape[1]
+            z_pad = torch.cat([z_0, torch.zeros((pad, D), device=dev, dtype=orig_dtype)], dim=0)
+            eps_pad = torch.cat([eps_0, torch.zeros((pad, D), device=dev, dtype=orig_dtype)], dim=0)
+            surp_pad = torch.cat([surprisal_0, torch.zeros((pad,), device=dev, dtype=surprisal_0.dtype)], dim=0)
+            sbar_pad = torch.cat([s_bar_prev, torch.zeros((pad, K, D), device=dev, dtype=s_bar_prev.dtype)], dim=0)
+            cf_pad = torch.cat([c_fused, torch.zeros((pad, D), device=dev, dtype=c_fused.dtype)], dim=0)
+            pie_pad = torch.cat([pi_eff, torch.zeros((pad, D), device=dev, dtype=pi_eff.dtype)], dim=0)
+            am_pad = torch.cat([am, torch.zeros((pad,), device=dev, dtype=torch.bool)], dim=0)
+        else:
+            z_pad, eps_pad, surp_pad, sbar_pad, cf_pad, pie_pad, am_pad = (
+                z_0,
+                eps_0,
+                surprisal_0,
+                s_bar_prev,
+                c_fused,
+                pi_eff,
+                am,
+            )
+
+        w_gu1, w_d1, w_gu2, w_d2 = self.moe.pack_weights(dtype=orig_dtype)
+        fn = (
+            self._compiled_ponder_parallel
+            if self._compiled_ponder_parallel is not None
+            else self._ponder_parallel_static_impl
+        )
+        z_out, ponder_steps, moe_bal_loss = fn(
+            z_pad, eps_pad, surp_pad, sbar_pad, cf_pad, pie_pad, am_pad, w_gu1, w_d1, w_gu2, w_d2
+        )
+        return z_out[:M], ponder_steps[:M], moe_bal_loss
 
     def _ponder_router_impl(
         self,
@@ -2323,6 +2380,9 @@ class BCGPC(nn.Module):
         z_star, ponder_steps, moe_bal_loss = self.ponder_parallel(
             z_cur, eps_0, surprisal_0, s_bar_prev, c_fused, pi_eff, active_mask=am
         )
+        # Merge pre-ponder `z_cur` (`z_0`) into the K=8 concept graph so Mode I streaming, `export.py`,
+        # and Rust `dcpa-core-rs` are 100% mathematically equivalent to Mode II/III parallel training,
+        # while returning pondered `z_star` for `CorticalCarryState.prev_z_ref` and `L_gen_align`!
         (
             s_new,
             a_new,
@@ -2339,7 +2399,7 @@ class BCGPC(nn.Module):
             state.slots,
             state.edges,
             state.salience,
-            z_star,
+            z_cur,
             surprisal_0,
             tau_t,
             am,

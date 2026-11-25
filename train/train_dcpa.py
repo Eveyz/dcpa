@@ -1040,9 +1040,10 @@ def run_training(
             yaml_wm = float(hw_cfg.get("bcg_checkpoint_vram_watermark_gb", default_wm))
             model.bcg_checkpoint_vram_watermark_gb = min(yaml_wm, safe_cap_wm) if yaml_wm > 0.0 else default_wm
 
+        yaml_bcg_chunk = int(hw_cfg.get("bcg_chunk_steps", cfg.clause_chunk_size))
         model.bcg_chunk_steps = max(
             1,
-            int(hw_cfg.get("bcg_chunk_steps", 2 if device.type == "cuda" else 1)),
+            yaml_bcg_chunk if device.type == "cuda" else min(yaml_bcg_chunk, 2),
         )
         model.bcg_tbptt_window = max(0, int(hw_cfg.get("bcg_tbptt_window", 0)))
         raw_tbptt_replay = hw_cfg.get("bcg_tbptt_replay", False)

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -132,7 +132,11 @@ class SharedAndRoutedMoE(nn.Module):
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        sample_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """x: `[N, D]` -> `(y [N, D], aux_bal_loss scalar fp32)`."""
         N, D = x.shape
         if N == 0:
@@ -143,17 +147,33 @@ class SharedAndRoutedMoE(nn.Module):
         s_g, s_u = self.shared_w_gu(x_n).chunk(2, dim=-1)
         y_shared = self.shared_w_d(F.silu(s_g) * s_u)
 
-        # 2. Router in float32 precision island
+        # 2. Router in float32 precision island (masked strictly over valid non-padded tokens)
         E = self.num_experts
         top_k = self.top_k
         with fp32_island(x.device):
-            logits = F.linear(x_n.float(), self.router.weight.float())  # [N, E]
+            if not self.training and x_n.dtype == torch.float32 and sample_mask is None and not torch.compiler.is_compiling():
+                logits = torch.bmm(
+                    x_n.float().unsqueeze(1),
+                    self.router.weight.float().t().unsqueeze(0).expand(N, -1, -1),
+                ).squeeze(1)
+            else:
+                logits = F.linear(x_n.float(), self.router.weight.float())  # [N, E]
             probs = F.softmax(logits, dim=-1)
             top_vals, top_idx = torch.topk(logits, k=top_k, dim=-1)
             gates_f32 = F.softmax(top_vals, dim=-1)
-            p_e = probs.mean(dim=0)
-            f_e = F.one_hot(top_idx, num_classes=E).float().sum(dim=1).mean(dim=0) / float(top_k)
-            aux_bal = float(E) * (f_e.detach() * p_e).sum()
+            if sample_mask is None:
+                p_e = probs.mean(dim=0)
+                f_e = F.one_hot(top_idx, num_classes=E).float().sum(dim=1).mean(dim=0) / float(top_k)
+                aux_bal = float(E) * (f_e.detach() * p_e).sum()
+            else:
+                mask_f = sample_mask.float().view(N, 1)
+                m_sum = mask_f.sum()
+                denom = m_sum.clamp_min(1.0)
+                has_any = (m_sum > 0.0).float()
+                p_e = (probs * mask_f).sum(dim=0) / denom
+                dispatch_oh = F.one_hot(top_idx, num_classes=E).float().sum(dim=1) / float(top_k)
+                f_e = (dispatch_oh * mask_f).sum(dim=0) / denom
+                aux_bal = has_any * float(E) * (f_e.detach() * p_e).sum()
 
         # 3. Routed specialist dispatch
         w_gu_t = self.w_gu.to(dtype=x_n.dtype).transpose(1, 2)  # [E, D, 2*H]
@@ -165,20 +185,46 @@ class SharedAndRoutedMoE(nn.Module):
             and E > top_k
             and _device_supports_grouped_mm(x_n.device, allow_cpu_bf16=self.allow_cpu_grouped_mm)
         ):
-            flat_e = top_idx.reshape(-1)
-            perm = torch.argsort(flat_e, stable=True)
-            e_sorted = flat_e[perm]
-            tok_sorted = torch.div(perm, top_k, rounding_mode="floor")
-            x_sorted = x_n[tok_sorted].contiguous()
-            counts = torch.zeros((E,), device=x.device, dtype=torch.int32).scatter_add(
-                0, e_sorted, torch.ones_like(e_sorted, dtype=torch.int32)
-            )
-            offs = torch.cumsum(counts, dim=0, dtype=torch.int32)
-            gu_out = F.grouped_mm(x_sorted, w_gu_t, offs=offs)
-            g_r, u_r = gu_out.chunk(2, dim=-1)
-            act_r = (F.silu(g_r) * u_r).contiguous()
-            y_sorted = F.grouped_mm(act_r, w_d_t, offs=offs)
-            gate_sorted = gates_f32.reshape(-1)[perm].unsqueeze(-1)
+            flat_e_raw = top_idx.reshape(-1)
+            if sample_mask is not None:
+                pair_active = sample_mask.bool().view(N, 1).expand(N, top_k).reshape(-1)
+                sentinel = torch.full_like(flat_e_raw, E)
+                flat_e = torch.where(pair_active, flat_e_raw, sentinel)
+                perm = torch.argsort(flat_e, stable=True)
+                e_sorted = flat_e[perm]
+                tok_sorted = torch.div(perm, top_k, rounding_mode="floor")
+                x_sorted = x_n[tok_sorted].contiguous()
+                counts_ext = torch.zeros((E + 1,), device=x.device, dtype=torch.int32).scatter_add(
+                    0, e_sorted, torch.ones_like(e_sorted, dtype=torch.int32)
+                )
+                offs = torch.cumsum(counts_ext[:E], dim=0, dtype=torch.int32)
+                active_row_mask = (e_sorted < E).unsqueeze(-1)
+                x_in_gmm = torch.where(active_row_mask, x_sorted, torch.zeros_like(x_sorted))
+                gu_raw = F.grouped_mm(x_in_gmm, w_gu_t, offs=offs)
+                gu_out = torch.where(active_row_mask, gu_raw, torch.zeros_like(gu_raw))
+                g_r, u_r = gu_out.chunk(2, dim=-1)
+                act_r = (F.silu(g_r) * u_r).contiguous()
+                y_raw = F.grouped_mm(act_r, w_d_t, offs=offs)
+                y_sorted = torch.where(active_row_mask, y_raw, torch.zeros_like(y_raw))
+                gate_sorted = torch.where(
+                    active_row_mask,
+                    gates_f32.reshape(-1)[perm].unsqueeze(-1),
+                    torch.zeros((N * top_k, 1), device=x.device, dtype=torch.float32),
+                )
+            else:
+                perm = torch.argsort(flat_e_raw, stable=True)
+                e_sorted = flat_e_raw[perm]
+                tok_sorted = torch.div(perm, top_k, rounding_mode="floor")
+                x_sorted = x_n[tok_sorted].contiguous()
+                counts = torch.zeros((E,), device=x.device, dtype=torch.int32).scatter_add(
+                    0, e_sorted, torch.ones_like(e_sorted, dtype=torch.int32)
+                )
+                offs = torch.cumsum(counts, dim=0, dtype=torch.int32)
+                gu_out = F.grouped_mm(x_sorted, w_gu_t, offs=offs)
+                g_r, u_r = gu_out.chunk(2, dim=-1)
+                act_r = (F.silu(g_r) * u_r).contiguous()
+                y_sorted = F.grouped_mm(act_r, w_d_t, offs=offs)
+                gate_sorted = gates_f32.reshape(-1)[perm].unsqueeze(-1)
             y_routed = (
                 torch.zeros((N, D), device=x.device, dtype=torch.float32)
                 .index_add(0, tok_sorted, y_sorted.float() * gate_sorted)
@@ -187,7 +233,7 @@ class SharedAndRoutedMoE(nn.Module):
             return x + y_shared + y_routed, aux_bal
 
         # Exact row-independent fp32 path when deterministic eval, else batched 2-BMM
-        if not self.training and x_n.dtype == torch.float32:
+        if not self.training and x_n.dtype == torch.float32 and not torch.compiler.is_compiling():
             y_routed_f = torch.zeros((N, D), device=x.device, dtype=torch.float32)
             w_gu_f = self.w_gu.float()
             w_d_f = self.w_d.float()
@@ -255,6 +301,7 @@ class CorticalEncoderLayer(nn.Module):
         doc_ids: torch.Tensor,
         pos_in_doc: torch.Tensor,
         scope_depth: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Tiled O(M * W) causal sliding-window attention (`0 <= m - n < W`) across `[M_total, D]`."""
         M, D = x.shape
@@ -318,15 +365,26 @@ class CorticalEncoderLayer(nn.Module):
         valid_safe = (valid | diag_fallback).unsqueeze(1)                    # [Nt, 1, W, 2W]
 
         scale = 1.0 / math.sqrt(float(Dh))
-        with fp32_island(device):
-            scores = torch.matmul(q_tiles.float(), k_2w.float().transpose(-2, -1)) * scale
-            scores = torch.where(valid_safe, scores, torch.full_like(scores, -1.0e9))
-            attn = F.softmax(scores, dim=-1)
-            ctx_tiles = torch.matmul(attn, v_2w.float())  # [Nt, H, W, Dh]
+        if device.type == "cuda" or (self.training and orig_dtype != torch.float32):
+            ctx_tiles = F.scaled_dot_product_attention(
+                q_tiles.to(orig_dtype),
+                k_2w.to(orig_dtype),
+                v_2w.to(orig_dtype),
+                attn_mask=valid_safe,
+                dropout_p=0.0,
+                scale=scale,
+            )
+            ctx = ctx_tiles.permute(0, 2, 1, 3).reshape(M_pad, D)[:M].to(orig_dtype)
+        else:
+            with fp32_island(device):
+                scores = torch.matmul(q_tiles.float(), k_2w.float().transpose(-2, -1)) * scale
+                scores = torch.where(valid_safe, scores, torch.full_like(scores, -1.0e9))
+                attn = F.softmax(scores, dim=-1)
+                ctx_tiles = torch.matmul(attn, v_2w.float())  # [Nt, H, W, Dh]
+            ctx = ctx_tiles.permute(0, 2, 1, 3).reshape(M_pad, D)[:M].to(orig_dtype)
 
-        ctx = ctx_tiles.permute(0, 2, 1, 3).reshape(M_pad, D)[:M].to(orig_dtype)
         x = x + self.w_o(ctx)
-        return self.moe(x)
+        return self.moe(x, sample_mask=valid_token_mask)
 
     def step_streaming(
         self,
@@ -448,6 +506,7 @@ class CorticalDecoderLayer(nn.Module):
         pre_edges: torch.Tensor,
         pre_salience: torch.Tensor,
         pre_phase: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Strictly `< m` causal attention over `(W=128 RoPE Window ∪ K=8 Graph Slots)`.
 
@@ -555,7 +614,7 @@ class CorticalDecoderLayer(nn.Module):
         ctx_flat = ctx_tot.permute(0, 2, 1, 3).reshape(M_pad, D)[:M].to(orig_dtype)
         f_copy = f_copy_tiles.reshape(M_pad, d_s)[:M].to(orig_dtype)
         x_mid = x + self.w_o(ctx_flat)
-        x_out, aux_bal = self.moe(x_mid)
+        x_out, aux_bal = self.moe(x_mid, sample_mask=valid_token_mask)
         return x_out, f_copy, aux_bal
 
     def step_streaming(
@@ -656,6 +715,26 @@ class CorticalSandwich(nn.Module):
         # Position-aware pointer-copy stem residual (initialized to 0 so Stage 1->2 transition is smooth!)
         self.w_copy_out = nn.Linear(d_s, d_s, bias=False)
         nn.init.zeros_(self.w_copy_out.weight)
+        self._compiled_encode: Optional[Callable[..., Any]] = None
+        self._compiled_decode: Optional[Callable[..., Any]] = None
+
+    @staticmethod
+    def _bucket_cortical_tiles(n_tiles: int) -> int:
+        """Map tile count `n_tiles` (`ceil(M / W)`) to `<= 18` static half-power-of-two shapes."""
+        if n_tiles <= 4:
+            return max(1, n_tiles)
+        p = 1 << ((n_tiles - 1).bit_length() - 1)
+        half_step = p + (p >> 1)
+        return half_step if n_tiles <= half_step else (p << 1)
+
+    def enable_compiled_kernels(self, **compile_kwargs: Any) -> None:
+        """Compile static-tile Lower Cortical Encoder & Upper Cortical Decoder stacks."""
+        self._compiled_encode = torch.compile(self._encode_tiled_impl, **compile_kwargs)
+        self._compiled_decode = torch.compile(self._decode_tiled_impl, **compile_kwargs)
+
+    def disable_compiled_kernels(self) -> None:
+        self._compiled_encode = None
+        self._compiled_decode = None
 
     def init_carry_state(
         self,
@@ -682,6 +761,27 @@ class CorticalSandwich(nn.Module):
         """Build `O(1)` shared MLA-latent `c_kv [..., d_s]` fusing spelling stem and slow semantics."""
         return self.norm_kv(f_stem + self.w_kv_c(c_slow.to(f_stem.dtype)))
 
+    def _encode_tiled_impl(
+        self,
+        c_slow: torch.Tensor,
+        f_stem: torch.Tensor,
+        doc_ids: torch.Tensor,
+        pos_in_doc: torch.Tensor,
+        seg_end_depth: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        c_kv = self.build_shared_kv(f_stem, c_slow)
+        x = c_slow
+        bal_sum = torch.zeros((), device=c_slow.device, dtype=torch.float32)
+        for layer in self.enc_layers:
+            x, bal_l = layer.forward_parallel(
+                x, c_kv, doc_ids, pos_in_doc, seg_end_depth, valid_token_mask=valid_token_mask
+            )
+            bal_sum = bal_sum + bal_l
+        h_enc = self.norm_enc_out(x)
+        bal_mean = bal_sum / float(max(len(self.enc_layers), 1))
+        return h_enc, c_kv, bal_mean
+
     def encode_parallel(
         self,
         c_slow: torch.Tensor,
@@ -691,15 +791,72 @@ class CorticalSandwich(nn.Module):
         seg_end_depth: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run Shared KV compression + Lower Cortical Encoder across all `[M_total, D]` segments."""
-        c_kv = self.build_shared_kv(f_stem, c_slow)
-        x = c_slow
-        bal_sum = torch.zeros((), device=c_slow.device, dtype=torch.float32)
-        for layer in self.enc_layers:
-            x, bal_l = layer.forward_parallel(x, c_kv, doc_ids, pos_in_doc, seg_end_depth)
+        M, D = c_slow.shape
+        d_s = f_stem.shape[-1]
+        dev = c_slow.device
+        if M == 0:
+            return (
+                c_slow,
+                torch.zeros((0, d_s), device=dev, dtype=f_stem.dtype),
+                torch.zeros((), device=dev, dtype=torch.float32),
+            )
+        if self._compiled_encode is None:
+            return self._encode_tiled_impl(c_slow, f_stem, doc_ids, pos_in_doc, seg_end_depth, None)
+
+        W = self.cfg.window_size
+        n_tiles = self._bucket_cortical_tiles((M + W - 1) // W)
+        M_pad = n_tiles * W
+        pad = M_pad - M
+        valid_mask = torch.arange(M_pad, device=dev) < M
+        if pad > 0:
+            c_p = torch.cat([c_slow, torch.zeros((pad, D), device=dev, dtype=c_slow.dtype)], dim=0)
+            f_p = torch.cat([f_stem, torch.zeros((pad, d_s), device=dev, dtype=f_stem.dtype)], dim=0)
+            doc_p = torch.cat([doc_ids, torch.full((pad,), -2, device=dev, dtype=torch.int64)], dim=0)
+            pos_p = torch.cat([pos_in_doc, torch.zeros((pad,), device=dev, dtype=pos_in_doc.dtype)], dim=0)
+            dep_p = torch.cat([seg_end_depth, torch.zeros((pad,), device=dev, dtype=seg_end_depth.dtype)], dim=0)
+        else:
+            c_p, f_p, doc_p, pos_p, dep_p = c_slow, f_stem, doc_ids, pos_in_doc, seg_end_depth
+
+        h_enc_p, c_kv_p, bal_mean = self._compiled_encode(c_p, f_p, doc_p, pos_p, dep_p, valid_mask)
+        return h_enc_p[:M], c_kv_p[:M], bal_mean
+
+    def _decode_tiled_impl(
+        self,
+        z_ref_prev: torch.Tensor,
+        l_reg_seg: torch.Tensor,
+        c_kv: torch.Tensor,
+        doc_ids: torch.Tensor,
+        pos_in_doc: torch.Tensor,
+        seg_start_depth: torch.Tensor,
+        seg_end_depth: torch.Tensor,
+        pre_slots: torch.Tensor,
+        pre_edges: torch.Tensor,
+        pre_salience: torch.Tensor,
+        pre_phase: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = z_ref_prev + self.w_lang_dec(l_reg_seg.to(z_ref_prev.dtype))
+        f_copy_last = torch.zeros((x.shape[0], self.cfg.d_s), device=x.device, dtype=x.dtype)
+        bal_sum = torch.zeros((), device=x.device, dtype=torch.float32)
+        for layer in self.dec_layers:
+            x, f_copy_last, bal_l = layer.forward_parallel(
+                x=x,
+                c_kv=c_kv,
+                doc_ids=doc_ids,
+                pos_in_doc=pos_in_doc,
+                seg_start_depth=seg_start_depth,
+                seg_end_depth=seg_end_depth,
+                pre_slots=pre_slots,
+                pre_edges=pre_edges,
+                pre_salience=pre_salience,
+                pre_phase=pre_phase,
+                valid_token_mask=valid_token_mask,
+            )
             bal_sum = bal_sum + bal_l
-        h_enc = self.norm_enc_out(x)
-        bal_mean = bal_sum / float(max(len(self.enc_layers), 1))
-        return h_enc, c_kv, bal_mean
+        z_dec = self.norm_dec_out(x)
+        copy_stem = self.w_copy_out(f_copy_last)
+        bal_mean = bal_sum / float(max(len(self.dec_layers), 1))
+        return z_dec, copy_stem, bal_mean
 
     def decode_parallel(
         self,
@@ -716,27 +873,66 @@ class CorticalSandwich(nn.Module):
         pre_phase: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run Upper Cortical Decoder across all `[M_total, D]` segments strictly from `< m` inputs."""
-        x = z_ref_prev + self.w_lang_dec(l_reg_seg.to(z_ref_prev.dtype))
-        f_copy_last = torch.zeros((x.shape[0], self.cfg.d_s), device=x.device, dtype=x.dtype)
-        bal_sum = torch.zeros((), device=x.device, dtype=torch.float32)
-        for layer in self.dec_layers:
-            x, f_copy_last, bal_l = layer.forward_parallel(
-                x=x,
-                c_kv=c_kv,
-                doc_ids=doc_ids,
-                pos_in_doc=pos_in_doc,
-                seg_start_depth=seg_start_depth,
-                seg_end_depth=seg_end_depth,
-                pre_slots=pre_slots,
-                pre_edges=pre_edges,
-                pre_salience=pre_salience,
-                pre_phase=pre_phase,
+        M, D = z_ref_prev.shape
+        d_s = self.cfg.d_s
+        dev = z_ref_prev.device
+        if M == 0:
+            return (
+                z_ref_prev,
+                torch.zeros((0, d_s), device=dev, dtype=z_ref_prev.dtype),
+                torch.zeros((), device=dev, dtype=torch.float32),
             )
-            bal_sum = bal_sum + bal_l
-        z_dec = self.norm_dec_out(x)
-        copy_stem = self.w_copy_out(f_copy_last)
-        bal_mean = bal_sum / float(max(len(self.dec_layers), 1))
-        return z_dec, copy_stem, bal_mean
+        if self._compiled_decode is None:
+            return self._decode_tiled_impl(
+                z_ref_prev,
+                l_reg_seg,
+                c_kv,
+                doc_ids,
+                pos_in_doc,
+                seg_start_depth,
+                seg_end_depth,
+                pre_slots,
+                pre_edges,
+                pre_salience,
+                pre_phase,
+                None,
+            )
+
+        W = self.cfg.window_size
+        K = self.cfg.k_slots
+        d_r = self.cfg.d_r
+        d_l = l_reg_seg.shape[-1]
+        n_tiles = self._bucket_cortical_tiles((M + W - 1) // W)
+        M_pad = n_tiles * W
+        pad = M_pad - M
+        valid_mask = torch.arange(M_pad, device=dev) < M
+        if pad > 0:
+            zr_p = torch.cat([z_ref_prev, torch.zeros((pad, D), device=dev, dtype=z_ref_prev.dtype)], dim=0)
+            lr_p = torch.cat([l_reg_seg, torch.zeros((pad, d_l), device=dev, dtype=l_reg_seg.dtype)], dim=0)
+            ckv_p = torch.cat([c_kv, torch.zeros((pad, d_s), device=dev, dtype=c_kv.dtype)], dim=0)
+            doc_p = torch.cat([doc_ids, torch.full((pad,), -2, device=dev, dtype=torch.int64)], dim=0)
+            pos_p = torch.cat([pos_in_doc, torch.zeros((pad,), device=dev, dtype=pos_in_doc.dtype)], dim=0)
+            sd_p = torch.cat([seg_start_depth, torch.zeros((pad,), device=dev, dtype=seg_start_depth.dtype)], dim=0)
+            ed_p = torch.cat([seg_end_depth, torch.zeros((pad,), device=dev, dtype=seg_end_depth.dtype)], dim=0)
+            ps_p = torch.cat([pre_slots, torch.zeros((pad, K, D), device=dev, dtype=pre_slots.dtype)], dim=0)
+            pe_p = torch.cat([pre_edges, torch.zeros((pad, K, K, d_r), device=dev, dtype=pre_edges.dtype)], dim=0)
+            pw_p = torch.cat([pre_salience, torch.zeros((pad, K), device=dev, dtype=pre_salience.dtype)], dim=0)
+            pp_p = torch.cat([pre_phase, torch.zeros((pad, K), device=dev, dtype=pre_phase.dtype)], dim=0)
+        else:
+            zr_p, lr_p, ckv_p, doc_p, pos_p = z_ref_prev, l_reg_seg, c_kv, doc_ids, pos_in_doc
+            sd_p, ed_p, ps_p, pe_p, pw_p, pp_p = (
+                seg_start_depth,
+                seg_end_depth,
+                pre_slots,
+                pre_edges,
+                pre_salience,
+                pre_phase,
+            )
+
+        z_dec_p, copy_p, bal_mean = self._compiled_decode(
+            zr_p, lr_p, ckv_p, doc_p, pos_p, sd_p, ed_p, ps_p, pe_p, pw_p, pp_p, valid_mask
+        )
+        return z_dec_p[:M], copy_p[:M], bal_mean
 
     def push_ring_step(
         self,

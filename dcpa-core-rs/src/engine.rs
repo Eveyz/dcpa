@@ -1076,6 +1076,9 @@ impl DcpaEngine {
             cfg.eps,
             &mut self.scratch.vec_d_g,
         );
+        // Preserve pre-ponder z_0 for K+1 -> K working-memory merge (100% parity with Mode III parallel training;
+        // System-2 pondering refines vec_d_g -> z_star for CorticalDecoder prev_z_ref).
+        self.scratch.bcg_z0.copy_from_slice(&self.scratch.vec_d_g);
 
         // Event-driven pondering loop (L_max = 8; immediate shortcut when surprisal <= tau_skip!)
         let mut surp_cur = surprisal_0;
@@ -1216,9 +1219,10 @@ impl DcpaEngine {
         }
 
         // 3. Log-Space Contractive Gate Lambda_m in [0.920, 0.998] & Candidate slot expansion (K -> K+1)
+        // Uses pre-ponder z_0 (`bcg_z0`) to match Mode II/III parallel graph trajectory 1-to-1!
         let already_pinned = self.graph.slot0_pinned;
         linear_f32(
-            &self.scratch.vec_d_g, // z_star
+            &self.scratch.bcg_z0,
             &self.weights.bcg_w_lambda_w,
             Some(&self.weights.bcg_w_lambda_b),
             &mut self.scratch.lam_k,
@@ -1235,7 +1239,7 @@ impl DcpaEngine {
             }
         }
         self.scratch.s_tilde[..k * d].copy_from_slice(&self.scratch.s_contracted);
-        self.scratch.s_tilde[k * d..kp1 * d].copy_from_slice(&self.scratch.vec_d_g); // z_star
+        self.scratch.s_tilde[k * d..kp1 * d].copy_from_slice(&self.scratch.bcg_z0);
 
         for i in 0..kp1 {
             let si = &self.scratch.s_tilde[i * d..(i + 1) * d];
@@ -1356,8 +1360,8 @@ impl DcpaEngine {
             );
         }
         if v < k && !(already_pinned && v == 0) {
-            // Case B: place z_star into freed slot v!
-            self.graph.slots[v * d..(v + 1) * d].copy_from_slice(&self.scratch.vec_d_g);
+            // Case B: place pre-ponder z_0 into freed slot v!
+            self.graph.slots[v * d..(v + 1) * d].copy_from_slice(&self.scratch.bcg_z0);
         }
 
         // Exact sparse edge contraction A_new = einsum('ka,lc,acr->klr', P, P, A_tilde)
@@ -1405,7 +1409,7 @@ impl DcpaEngine {
             self.scratch.omega_tilde[i] = self.graph.salience[i] - cfg.delta_decay;
         }
         let omega_cand =
-            dot_f32(&self.weights.bcg_w_omega, &self.scratch.vec_d_g) + self.weights.bcg_kappa_omega * surprisal_0;
+            dot_f32(&self.weights.bcg_w_omega, &self.scratch.bcg_z0) + self.weights.bcg_kappa_omega * surprisal_0;
         self.scratch.omega_tilde[k] = omega_cand;
         for row in 0..k {
             if row == u {

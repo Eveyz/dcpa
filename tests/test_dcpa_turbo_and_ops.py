@@ -431,3 +431,140 @@ def test_colab_git_sync_clone_and_fast_forward_pull(tmp_path: Path) -> None:
     )
     assert res3["mode"] == "bundle_zip"
     assert (fb_dst / "version.txt").read_text(encoding="utf-8").strip() == "from-zip"
+
+
+def test_mode1_streaming_matches_mode2_and_mode3_with_active_pondering() -> None:
+    """Verify Mode I (streaming carry) == Mode II (eval) == Mode III (parallel) when Pondering fires."""
+    torch.manual_seed(2027)
+    cfg = DCPAConfig.micro()
+    cfg.tau_skip = 0.0  # Force System-2 pondering MoE to execute on EVERY concept segment!
+    cfg.tau_halt = 0.0
+    model = DCPAModel(cfg).eval()
+
+    raw = torch.tensor(
+        [list(b"fn solve(x: i32) { let y = (x + 3) * [1, 2][0]; return y; }")],
+        dtype=torch.uint8,
+    )
+    lang_id = torch.tensor([4], dtype=torch.long)
+
+    with torch.no_grad():
+        carry0 = model.init_carry_state(batch_size=1, device=raw.device, dtype=torch.float32)
+        # Mode I: streaming carry path (`graph_state is not None`)
+        out_m1 = model(
+            raw,
+            lang_id,
+            stage="D",
+            tau_s=0.35,
+            tau_m=0.25,
+            use_broca_cq=False,
+            fast_state=carry0.fast_state,
+            graph_state=carry0.graph_state,
+            elig_state=carry0.elig_state,
+            cortical_state=carry0.cortical_state,
+            h_init=carry0.sgsc_h,
+            m_init=carry0.pmd_m,
+            xi_init=carry0.pmd_xi,
+            write_threshold_override=0.0,
+        )
+        # Mode II: isolated varlen eval path (`doc_cu_seqlens is not None and V <= 8`)
+        doc_cu = torch.tensor([0, raw.shape[1]], dtype=torch.int32)
+        out_m2 = model(
+            raw,
+            lang_id,
+            stage="D",
+            tau_s=0.35,
+            tau_m=0.25,
+            use_broca_cq=False,
+            doc_cu_seqlens=doc_cu,
+            write_threshold_override=0.0,
+        )
+        # Mode III: full-batch parallel path (`doc_cu_seqlens is None and graph_state is None`)
+        out_m3 = model(
+            raw,
+            lang_id,
+            stage="D",
+            tau_s=0.35,
+            tau_m=0.25,
+            use_broca_cq=False,
+            write_threshold_override=0.0,
+        )
+
+    assert float(out_m1.metrics["avg_ponder_steps"]) >= 3.9
+    assert out_m1.s_trace is not None and out_m2.s_trace is not None and out_m3.s_trace is not None
+    assert (out_m1.s_trace - out_m2.s_trace).abs().max().item() < 1e-5
+    assert (out_m1.s_trace - out_m3.s_trace).abs().max().item() < 1e-5
+    assert (out_m1.pmd.byte_logits - out_m2.pmd.byte_logits).abs().max().item() < 1e-5
+    assert (out_m1.pmd.byte_logits - out_m3.pmd.byte_logits).abs().max().item() < 1e-5
+
+
+def test_compiled_cortical_and_zero_sync_static_ponder_parallel(monkeypatch) -> None:
+    """Verify `configure_model_compile` compiles `cortical` + `ponder_parallel` with 0 `torch.nonzero` calls."""
+    from dcpa.compile_utils import configure_model_compile, unwrap_compiled_module
+
+    torch.manual_seed(31415)
+    cfg = DCPAConfig.micro()
+    cfg.tau_skip = 0.0
+    cfg.tau_halt = 0.0
+    cfg.window_size = 16
+
+    m_eager = DCPAModel(cfg).train()
+    m_comp = DCPAModel(cfg).train()
+    m_comp.load_state_dict(m_eager.state_dict())
+
+    rep = configure_model_compile(
+        m_comp, compile_mode="reduce-overhead", device=torch.device("cpu"), allow_cpu_compile=True
+    )
+    assert "cortical_sandwich_kernel" in rep.compiled_hotspots
+    assert "bcg_ponder_parallel_kernel" in rep.compiled_hotspots
+
+    # Forbid `torch.nonzero` during `ponder_parallel` to prove 0 GPU->CPU stream syncs!
+    bcg_comp = unwrap_compiled_module(m_comp.bcg_pc)
+    orig_nonzero = torch.nonzero
+    nonzero_calls = [0]
+
+    def _forbid_nonzero(*args, **kwargs):
+        nonzero_calls[0] += 1
+        return orig_nonzero(*args, **kwargs)
+
+    for m_len in (19, 37, 53):
+        z0 = torch.randn(m_len, cfg.d_concept, requires_grad=True)
+        z0_c = z0.detach().clone().requires_grad_(True)
+        eps0 = torch.randn(m_len, cfg.d_concept)
+        surp0 = torch.ones(m_len) * 1.5
+        sbar = torch.randn(m_len, cfg.k_slots, cfg.d_concept)
+        cf = torch.randn(m_len, cfg.d_concept)
+        pie = torch.ones(m_len, cfg.d_concept)
+
+        z_e, ps_e, bal_e = m_eager.bcg_pc.ponder_parallel(z0, eps0, surp0, sbar, cf, pie)
+        monkeypatch.setattr(torch, "nonzero", _forbid_nonzero)
+        try:
+            z_c, ps_c, bal_c = bcg_comp.ponder_parallel(z0_c, eps0, surp0, sbar, cf, pie)
+        finally:
+            monkeypatch.setattr(torch, "nonzero", orig_nonzero)
+
+        assert nonzero_calls[0] == 0
+        assert (z_e - z_c).abs().max().item() < 1e-5
+        assert (ps_e - ps_c).abs().max().item() < 1e-5
+        assert abs(float(bal_e.item() - bal_c.item())) < 1e-5
+        (z_e.sum() + bal_e).backward()
+        (z_c.sum() + bal_c).backward()
+        assert z0.grad is not None and z0_c.grad is not None
+        assert (z0.grad - z0_c.grad).abs().max().item() < 1e-5
+
+    # Also verify compiled `CorticalSandwich` forward+backward across unaligned M=23 (pads to tile bucket)
+    c_slow = torch.randn(23, cfg.d_concept, requires_grad=True)
+    c_slow_c = c_slow.detach().clone().requires_grad_(True)
+    f_stem = torch.randn(23, cfg.d_s)
+    doc_ids = torch.tensor([0] * 11 + [1] * 12, dtype=torch.long)
+    pos = torch.tensor(list(range(11)) + list(range(12)), dtype=torch.long)
+    dep = torch.zeros(23, dtype=torch.int32)
+
+    he_e, ckv_e, be_e = m_eager.cortical.encode_parallel(c_slow, f_stem, doc_ids, pos, dep)
+    he_c, ckv_c, be_c = m_comp.cortical.encode_parallel(c_slow_c, f_stem, doc_ids, pos, dep)
+    assert (he_e - he_c).abs().max().item() < 1e-5
+    assert (ckv_e - ckv_c).abs().max().item() < 1e-5
+    assert abs(float(be_e.item() - be_c.item())) < 1e-5
+    (he_e.sum() + be_e).backward()
+    (he_c.sum() + be_c).backward()
+    assert c_slow.grad is not None and c_slow_c.grad is not None
+    assert (c_slow.grad - c_slow_c.grad).abs().max().item() < 1e-5

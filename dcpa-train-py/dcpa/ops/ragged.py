@@ -118,12 +118,15 @@ def ragged_segment_cumsum(
     values: torch.Tensor,
     cu_seqlens: torch.Tensor,
     seg_id: torch.Tensor,
+    max_seg_len: int | None = None,
 ) -> torch.Tensor:
     """Parallel O(log N) segmented inclusive prefix sum with ZERO cross-segment float32 cancellation.
 
     For flat 1D values [N], returns inclusive cumsum strictly reset at each cu_seqlens boundary
     using an associative segmented scan (a[seg_start] = 0, a[other] = 1) so earlier documents
     cannot introduce floating-point cancellation noise into later documents.
+    Pass `max_seg_len` when an upper bound is known (e.g. `cfg.max_seg_len + 4`) to avoid a
+    GPU->CPU `.item()` sync!
     """
     from dcpa.ops.scan import parallel_diag_scan
 
@@ -133,8 +136,11 @@ def ragged_segment_cumsum(
         return v_f32
     reset = torch.zeros((n,), device=v_f32.device, dtype=torch.bool)
     starts = cu_seqlens[:-1].to(torch.int64)
-    ends = cu_seqlens[1:].to(torch.int64)
-    max_seg = int((ends - starts).max().item()) if starts.numel() > 0 else n
+    if max_seg_len is not None:
+        max_seg = min(int(max_seg_len), n)
+    else:
+        ends = cu_seqlens[1:].to(torch.int64)
+        max_seg = int((ends - starts).max().item()) if starts.numel() > 0 else n
     if starts.numel() > 0:
         reset[starts] = True
     a = torch.where(reset, torch.zeros_like(v_f32), torch.ones_like(v_f32))

@@ -512,6 +512,10 @@ def test_device_abstraction_and_four_tier_hardware_contract():
     a100_40 = select_hardware_tier("cuda", vram_gb=40.0, device_name="NVIDIA A100-SXM4-40GB")
     assert (a100_40.micro_batch_bytes, a100_40.grad_accum_steps, a100_40.use_bf16) == (65_536, 2, True)
 
+    rtx_5090 = select_hardware_tier("cuda", vram_gb=32.0, device_name="NVIDIA GeForce RTX 5090")
+    assert rtx_5090.tier == "rtx_5090_32g"
+    assert (rtx_5090.micro_batch_bytes, rtx_5090.grad_accum_steps, rtx_5090.use_bf16) == (65_536, 2, True)
+
     l4 = select_hardware_tier("cuda", vram_gb=24.0, device_name="NVIDIA L4")
     assert (l4.micro_batch_bytes, l4.grad_accum_steps, l4.use_bf16) == (32_768, 4, True)
 

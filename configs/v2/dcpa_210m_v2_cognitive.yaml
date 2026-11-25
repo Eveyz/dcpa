@@ -117,7 +117,10 @@ hardware:
   compile_mode: auto
   compile_doc_bucket_size: 16
   compile_cache_size_limit: 128
-  bcg_checkpoint_vram_watermark_gb: 48.0   # Skips BCG recomputation on >=75GB GPUs while VRAM < 48GB
+  bcg_checkpoint_vram_watermark_gb: 48.0   # Auto-clamped on 32GB-48GB GPUs; skips BCG recompute while VRAM < watermark
+  bcg_chunk_steps: 2                       # Pack 2 BCG-PC steps (16 MoE layers) per compiled graph (fast ~1m cold compile, 2x less CPU dispatch)
+  bcg_tbptt_window: 32                     # Chunked TBPTT (0.5^32 = 2.3e-10 < fp32 eps; breaks 430-step autograd graph)
+  bcg_tbptt_replay: auto                   # O(W=32) replay on <=26GB GPUs for >=100M models; 1-pass watermark on >=30GB GPUs
   prefetch_depth: 3
   prefetch_workers: 2
   auto_sharding_tiers:

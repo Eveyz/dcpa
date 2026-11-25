@@ -32,6 +32,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+# Prevent CUDA caching allocator fragmentation (e.g. fb=94GB on 96GB Blackwell / 32GB RTX 5090)
+# and persist TorchInductor FX + AOTAutograd graphs on disk so restarts skip cold compilation!
+# Must be set BEFORE `import torch` so it also applies automatically under older Colab notebooks!
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
+
 import numpy as np
 import torch
 import yaml
@@ -49,7 +56,7 @@ from dcpa.compile_utils import configure_model_compile, unwrap_compiled_module
 from dcpa.config import DCPAConfig
 from dcpa.data.synthetic import generate_dyck_sequence, generate_grid_physics_episode
 from dcpa.export import extract_flat_state_dict
-from dcpa.model import DCPAModel
+from dcpa.model import DCPAModel, materialize_metric_vec
 from train.colab_drive_sync import (
     ABDriveSyncManager,
     CheckpointTrigger,
@@ -1004,13 +1011,43 @@ def run_training(
             # Decorrelate per-rank Gumbel exploration noise while keeping model weights bit-identical!
             reseed_all_rngs(seed + dist_ctx.rank * 104729, device=device)
 
-        if device.type == "cuda" and profile.vram_gb >= 75.0:
-            default_wm = 48.0 if cfg.num_experts >= 16 else 52.0
-            if profile.vram_gb < 88.0:
-                default_wm = 40.0 if cfg.num_experts >= 32 else 44.0
-            model.bcg_checkpoint_vram_watermark_gb = float(
-                hw_cfg.get("bcg_checkpoint_vram_watermark_gb", default_wm)
+        if device.type == "cuda" and profile.vram_gb >= 30.0:
+            # Tier-aware VRAM watermark:
+            #   - >=88GB (95GB Blackwell / 96-141GB H200): 74GB watermark (~78% cap -> 21GB headroom,
+            #     eliminating 100% of checkpoint recomputation overhead on 48M-210M long-doc batches!).
+            #   - 75-87GB (80GB A100/H100): 60GB watermark (~76% cap).
+            #   - 30-74GB (32GB RTX 5090 / 40GB A100 / 48GB L40S): clamped to <=0.65*VRAM (~20.8GB on 5090).
+            if profile.vram_gb >= 88.0:
+                default_wm = 70.0 if cfg.num_experts >= 32 else 74.0
+                safe_cap_wm = round(0.78 * profile.vram_gb, 1)
+            elif profile.vram_gb >= 75.0:
+                default_wm = 56.0 if cfg.num_experts >= 32 else 60.0
+                safe_cap_wm = round(0.76 * profile.vram_gb, 1)
+            else:
+                default_wm = round(0.62 * profile.vram_gb, 1)
+                safe_cap_wm = round(0.65 * profile.vram_gb, 1)
+            yaml_wm = float(hw_cfg.get("bcg_checkpoint_vram_watermark_gb", default_wm))
+            model.bcg_checkpoint_vram_watermark_gb = min(yaml_wm, safe_cap_wm) if yaml_wm > 0.0 else default_wm
+
+        model.bcg_chunk_steps = max(
+            1,
+            int(hw_cfg.get("bcg_chunk_steps", 2 if device.type == "cuda" else 1)),
+        )
+        model.bcg_tbptt_window = max(0, int(hw_cfg.get("bcg_tbptt_window", 0)))
+        raw_tbptt_replay = hw_cfg.get("bcg_tbptt_replay", False)
+        if isinstance(raw_tbptt_replay, str) and raw_tbptt_replay.strip().lower() == "auto":
+            # Auto-engage O(W)-VRAM windowed replay ONLY on tight <=28GB GPUs (24GB 4090/L4) with >=100M
+            # models where 1-pass cannot fit; >=30GB GPUs (RTX 5090 32GB / A100 / H100 / Blackwell 96GB)
+            # run faster 1-pass `bcg_chunk` + clamped VRAM watermark + TBPTT!
+            total_params = int(model.count_parameters()["total"])
+            model.bcg_tbptt_replay = bool(
+                device.type == "cuda"
+                and profile.vram_gb < 28.0
+                and total_params >= 100_000_000
+                and model.bcg_tbptt_window > 0
             )
+        else:
+            model.bcg_tbptt_replay = bool(raw_tbptt_replay) and model.bcg_tbptt_window > 0
         optimizer = create_dcpa_optimizer(model, optimizer_cfg=opt_cfg)
         grad_clip_norm = float(opt_cfg.get("grad_clip_norm", cfg.grad_clip_norm))
 
@@ -1027,7 +1064,9 @@ def run_training(
             f"boundaries={list(eff_boundaries)} | micro_batch_bytes={eff_micro_bytes:,} | "
             f"grad_accum_steps={grad_accum_steps} | effective_bytes_per_step={actual_step_bytes:,} | "
             f"bf16={use_bf16} | grad_scaler=False | "
-            f"bcg_ckpt_watermark_gb={model.bcg_checkpoint_vram_watermark_gb:.1f}",
+            f"bcg_ckpt_watermark_gb={model.bcg_checkpoint_vram_watermark_gb:.1f} | "
+            f"bcg_chunk={model.bcg_chunk_steps} | "
+            f"tbptt_w={model.bcg_tbptt_window} (replay={model.bcg_tbptt_replay})",
             flush=True,
         )
 
@@ -1044,6 +1083,7 @@ def run_training(
             doc_bucket_size=int(hw_cfg.get("compile_doc_bucket_size", 16)),
             cache_size_limit=int(hw_cfg.get("compile_cache_size_limit", 128)),
             allow_cpu_compile=allow_cpu_compile,
+            cache_dir=local_cache / "compile_cache",
         )
         _r0_print(
             f"[Compile] requested={compile_report.requested_mode} -> effective={compile_report.effective_mode} "
@@ -1237,6 +1277,8 @@ def run_training(
         steps_since_start = 0
         t_run_start = clock()
         last_heartbeat_t = t_run_start
+        last_log_t = t_run_start
+        last_log_steps = 0
         header_printed = False
         interrupted_sig: Optional[str] = None
 
@@ -1303,10 +1345,15 @@ def run_training(
 
                 optimizer.zero_grad(set_to_none=True)
                 accum_metrics: dict[str, float] = {}
+                accum_metric_vec: Optional[torch.Tensor] = None
                 step_loss_finite = True
 
                 for _micro_idx in range(grad_accum_steps):
                     batch = stream.next_batch(target_batch_bytes=eff_micro_bytes, state=sc)
+                    # Check Stage-2 loss_mask homogeneity on CPU before async H2D DMA (zero CUDA sync!)
+                    loss_mask_all_ones: Optional[bool] = (
+                        bool(batch["loss_mask"].all()) if sc.stage_id == 2 else None
+                    )
                     x_bytes = to_device_async(batch["x_bytes"], device)
                     cu_seqlens = to_device_async(batch["cu_seqlens"], device)
                     doc_lang_ids = to_device_async(batch["doc_lang_ids"], device)
@@ -1330,6 +1377,7 @@ def run_training(
                         loss_mask=loss_mask,
                         wug_target_mask=wug_target_mask,
                         state=sc,
+                        loss_mask_all_ones=loss_mask_all_ones,
                     )
                     fam_mask = (
                         _compute_familiar_doc_mask(cu_seqlens, loss_mask, wug_target_mask)
@@ -1337,41 +1385,84 @@ def run_training(
                         else None
                     )
 
+                    use_tbptt_replay_step = bool(
+                        model.bcg_tbptt_replay
+                        and model.bcg_tbptt_window > 0
+                        and sc.model_stage in ("B", "C")
+                    )
                     with amp_autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
-                        out = model(
-                            raw_bytes=x_bytes.unsqueeze(0),
-                            lang_ids=doc_lang_ids,
-                            style_ids=doc_style_ids_t,
-                            ponder_tax_scale=doc_pts_t,
-                            stage=sc.model_stage,
-                            tau_s=eff_tau_s,
-                            tau_m=eff_tau_m,
-                            use_broca_cq=sc.use_broca_cq,
-                            loss_weights=loss_w,
-                            lambda_rate_override=eff_lam_rate,
-                            lambda_var_override=eff_lam_var,
-                            lambda_pc_override=sc.lambda_pc,
-                            lambda_act_override=sc.lambda_act,
-                            lambda_halt_override=sc.lambda_halt,
-                            target_spike_rate_override=sc.target_spike_rate,
-                            merge_kl_weight=eff_merge_kl,
-                            merge_uniform_mix=eff_uniform_mix,
-                            familiar_ach_reg_weight=sc.lambda_ach_reg if sc.stage_id == 4 else 0.0,
-                            familiar_doc_mask=fam_mask,
-                            doc_cu_seqlens=cu_seqlens,
-                            record_traces=False,
+                        if use_tbptt_replay_step:
+                            out = model.forward_and_backward_tbptt(
+                                raw_bytes=x_bytes.unsqueeze(0),
+                                lang_ids=doc_lang_ids,
+                                style_ids=doc_style_ids_t,
+                                ponder_tax_scale=doc_pts_t,
+                                stage=sc.model_stage,
+                                tau_s=eff_tau_s,
+                                tau_m=eff_tau_m,
+                                use_broca_cq=sc.use_broca_cq,
+                                loss_weights=loss_w,
+                                lambda_rate_override=eff_lam_rate,
+                                lambda_var_override=eff_lam_var,
+                                lambda_pc_override=sc.lambda_pc,
+                                lambda_act_override=sc.lambda_act,
+                                lambda_halt_override=sc.lambda_halt,
+                                target_spike_rate_override=sc.target_spike_rate,
+                                merge_kl_weight=eff_merge_kl,
+                                merge_uniform_mix=eff_uniform_mix,
+                                familiar_ach_reg_weight=0.0,
+                                familiar_doc_mask=None,
+                                doc_cu_seqlens=cu_seqlens,
+                                record_traces=False,
+                                sync_metrics=False,
+                                loss_scale=1.0 / float(grad_accum_steps),
+                            )
+                        else:
+                            out = model(
+                                raw_bytes=x_bytes.unsqueeze(0),
+                                lang_ids=doc_lang_ids,
+                                style_ids=doc_style_ids_t,
+                                ponder_tax_scale=doc_pts_t,
+                                stage=sc.model_stage,
+                                tau_s=eff_tau_s,
+                                tau_m=eff_tau_m,
+                                use_broca_cq=sc.use_broca_cq,
+                                loss_weights=loss_w,
+                                lambda_rate_override=eff_lam_rate,
+                                lambda_var_override=eff_lam_var,
+                                lambda_pc_override=sc.lambda_pc,
+                                lambda_act_override=sc.lambda_act,
+                                lambda_halt_override=sc.lambda_halt,
+                                target_spike_rate_override=sc.target_spike_rate,
+                                merge_kl_weight=eff_merge_kl,
+                                merge_uniform_mix=eff_uniform_mix,
+                                familiar_ach_reg_weight=sc.lambda_ach_reg if sc.stage_id == 4 else 0.0,
+                                familiar_doc_mask=fam_mask,
+                                doc_cu_seqlens=cu_seqlens,
+                                record_traces=False,
+                                sync_metrics=False,
+                            )
+
+                    # Launch backward IMMEDIATELY with zero pre-backward GPU->CPU sync bubbles!
+                    if not use_tbptt_replay_step:
+                        scaled_loss = out.loss_total / float(grad_accum_steps)
+                        scaled_loss.backward()
+
+                    if out.metrics_tensor is not None:
+                        m_vec = torch.cat(
+                            [out.loss_total.detach().float().reshape(1), out.metrics_tensor[1:].detach().float()],
+                            dim=0,
                         )
+                        accum_metric_vec = m_vec if accum_metric_vec is None else (accum_metric_vec + m_vec)
+                    else:
+                        for k, v in out.metrics.items():
+                            accum_metrics[k] = accum_metrics.get(k, 0.0) + float(v) / float(grad_accum_steps)
 
-                    for k, v in out.metrics.items():
-                        accum_metrics[k] = accum_metrics.get(k, 0.0) + float(v) / float(grad_accum_steps)
-
-                    local_bad_loss = not bool(torch.isfinite(out.loss_total).item())
-                    if sync_bool_any(local_bad_loss, dist_ctx, device):
-                        step_loss_finite = False
-                        break
-
-                    scaled_loss = out.loss_total / float(grad_accum_steps)
-                    scaled_loss.backward()
+                if accum_metric_vec is not None:
+                    accum_metrics = materialize_metric_vec(accum_metric_vec / float(grad_accum_steps))
+                local_bad_loss = not math.isfinite(float(accum_metrics.get("loss_total", float("nan"))))
+                if sync_bool_any(local_bad_loss, dist_ctx, device):
+                    step_loss_finite = False
 
                 # Test injection / instrumentation hook before Watchdog check & optimizer.step()
                 if pre_step_hook is not None:
@@ -1479,14 +1570,16 @@ def run_training(
                     step_hook(completed_step, model, last_metrics)
 
                 now_t = clock()
-                elapsed = max(now_t - t_run_start, 1e-6)
-                kb_per_sec = float(steps_since_start * actual_step_bytes) / (elapsed * 1024.0)
+                interval_steps = max(steps_since_start - last_log_steps, 1)
+                interval_dt = max(now_t - last_log_t, 1e-6)
+                kb_per_sec = float(interval_steps * actual_step_bytes) / (interval_dt * 1024.0)
                 active_lrs = [v for v in applied_lrs.values() if v > 0.0]
                 disp_lr = max(active_lrs) if active_lrs else 0.0
 
                 # Concise single-line console row every `console_every_steps` (default 50)
+                # plus first 10 steps after launch/resume so compile warmup -> steady-state KB/s is visible!
                 if is_primary and (
-                    completed_step == start_step + 1
+                    steps_since_start <= 10
                     or is_final_step
                     or (eff_console_every > 0 and completed_step % eff_console_every == 0)
                     or (heartbeat_seconds > 0 and (now_t - last_heartbeat_t) >= heartbeat_seconds)
@@ -1506,6 +1599,8 @@ def run_training(
                         flush=True,
                     )
                     last_heartbeat_t = now_t
+                    last_log_t = now_t
+                    last_log_steps = steps_since_start
                     _sync_log(force=False)
 
                 # 500-step zero-grad visual diagnostic probe (Rank 0 only; isolated RNG)

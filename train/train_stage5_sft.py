@@ -27,6 +27,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+# Prevent CUDA caching allocator fragmentation (e.g. fb=94GB on 96GB Blackwell / 32GB RTX 5090)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
+
 import torch
 from safetensors.torch import load_file
 
@@ -37,9 +42,14 @@ for _p in (str(_REPO_ROOT), str(_TRAIN_PY)):
         sys.path.insert(0, _p)
 
 from data.build_sft_stage5 import SFTByteDataset
-from dcpa.compile_utils import configure_model_compile, strip_orig_mod_prefix, unwrap_compiled_module
+from dcpa.compile_utils import (
+    configure_model_compile,
+    migrate_legacy_moe_state_dict,
+    strip_orig_mod_prefix,
+    unwrap_compiled_module,
+)
 from dcpa.config import DCPAConfig
-from dcpa.model import DCPAModel
+from dcpa.model import DCPAModel, materialize_metric_vec
 from train.colab_drive_sync import assert_not_drive_path, sync_file_to_drive
 from train.curriculum_state_machine import _canonical_param_name
 from train.train_dcpa import export_final_safetensors
@@ -126,7 +136,7 @@ def load_dcpa_model_from_weights(
             raise FileNotFoundError(f"Matching config.json not found next to {wp}: {cp}")
         cfg = DCPAConfig.load_json(cp)
         model = DCPAModel(cfg)
-        raw_tensors = strip_orig_mod_prefix(load_file(str(wp)))
+        raw_tensors = migrate_legacy_moe_state_dict(strip_orig_mod_prefix(load_file(str(wp))))
         if "sgsc.theta_raw" in raw_tensors:
             # Undo export's lif_theta_scale folding so model.sgsc.theta matches verbatim
             raw_tensors["sgsc.theta_raw"] = raw_tensors["sgsc.theta_raw"].float() / float(cfg.lif_theta_scale)
@@ -154,7 +164,7 @@ def load_dcpa_model_from_weights(
     ckpt = torch.load(str(wp), map_location="cpu", weights_only=False)
     cfg = DCPAConfig(**ckpt["config"])
     model = DCPAModel(cfg)
-    sd = strip_orig_mod_prefix(ckpt["model_state_dict"])
+    sd = migrate_legacy_moe_state_dict(strip_orig_mod_prefix(ckpt["model_state_dict"]))
     model.load_state_dict(sd, strict=True)
     return model.to(device)
 
@@ -416,7 +426,15 @@ def run_stage5_sft(
         for pg in freeze_info["param_groups"]:
             pg["base_lr"] = float(pg["base_lr"]) * sft_lr_scale
             pg["lr"] = float(pg["lr"]) * sft_lr_scale
-    optimizer = torch.optim.AdamW(freeze_info["param_groups"], betas=(0.9, 0.95), eps=1.0e-8)
+    sft_params = [p for g in freeze_info["param_groups"] for p in g["params"]]
+    use_fused_sft = bool(sft_params and all(p.is_cuda and p.is_floating_point() for p in sft_params))
+    if use_fused_sft:
+        try:
+            optimizer = torch.optim.AdamW(freeze_info["param_groups"], betas=(0.9, 0.95), eps=1.0e-8, fused=True)
+        except (RuntimeError, TypeError):
+            optimizer = torch.optim.AdamW(freeze_info["param_groups"], betas=(0.9, 0.95), eps=1.0e-8)
+    else:
+        optimizer = torch.optim.AdamW(freeze_info["param_groups"], betas=(0.9, 0.95), eps=1.0e-8)
 
     comp_rep = configure_model_compile(model, compile_mode=compile_mode, device=device)
     _r0_print(
@@ -494,6 +512,7 @@ def run_stage5_sft(
 
             optimizer.zero_grad(set_to_none=True)
             accum_m: dict[str, float] = {}
+            accum_m_vec: Optional[torch.Tensor] = None
             step_finite = True
             for _ in range(grad_accum):
                 # Synchronize shard & length-tier selection across all ranks (`batch_cursor`) while sharding dialogue index!
@@ -538,14 +557,24 @@ def run_stage5_sft(
                         write_threshold_override=eff_w_thresh,
                         doc_cu_seqlens=cu,
                         record_traces=False,
+                        sync_metrics=False,
                     )
-                if sync_bool_any(not bool(torch.isfinite(out.loss_total).item()), dist_ctx, device):
-                    step_finite = False
-                    break
                 scaled_loss = out.loss_total / float(grad_accum)
                 scaled_loss.backward()
-                for k, v in out.metrics.items():
-                    accum_m[k] = accum_m.get(k, 0.0) + float(v) / float(grad_accum)
+                if out.metrics_tensor is not None:
+                    mv = torch.cat(
+                        [out.loss_total.detach().float().reshape(1), out.metrics_tensor[1:].detach().float()],
+                        dim=0,
+                    )
+                    accum_m_vec = mv if accum_m_vec is None else (accum_m_vec + mv)
+                else:
+                    for k, v in out.metrics.items():
+                        accum_m[k] = accum_m.get(k, 0.0) + float(v) / float(grad_accum)
+
+            if accum_m_vec is not None:
+                accum_m = materialize_metric_vec(accum_m_vec / float(grad_accum))
+            if sync_bool_any(not math.isfinite(float(accum_m.get("loss_total", float("nan")))), dist_ctx, device):
+                step_finite = False
 
             if not step_finite:
                 optimizer.zero_grad(set_to_none=True)

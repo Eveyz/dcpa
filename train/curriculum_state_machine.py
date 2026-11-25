@@ -244,13 +244,30 @@ def build_three_way_param_groups(
 def create_dcpa_optimizer(
     model: nn.Module,
     optimizer_cfg: Optional[Mapping[str, Any]] = None,
+    *,
+    fused: Optional[bool] = None,
 ) -> torch.optim.AdamW:
-    """Create the fixed Step-0 three-way AdamW optimizer (`betas=(0.9, 0.95), eps=1e-8`)."""
+    """Create the fixed Step-0 three-way AdamW optimizer (`betas=(0.9, 0.95), eps=1e-8`).
+
+    Automatically enables `fused=True` on CUDA devices (single fused multi-tensor CUDA kernel)
+    while falling back cleanly on MPS/CPU.
+    """
     cfg = optimizer_cfg or {}
     betas_raw = cfg.get("betas", [0.9, 0.95])
     betas = (float(betas_raw[0]), float(betas_raw[1]))
     eps = float(cfg.get("eps", 1.0e-8))
     groups = build_three_way_param_groups(model, optimizer_cfg=cfg)
+    all_params = [p for g in groups for p in g["params"]]
+    want_fused = (
+        bool(fused)
+        if fused is not None
+        else bool(all_params and all(p.is_cuda and p.is_floating_point() for p in all_params))
+    )
+    if want_fused:
+        try:
+            return torch.optim.AdamW(groups, betas=betas, eps=eps, fused=True)
+        except (RuntimeError, TypeError):
+            pass
     return torch.optim.AdamW(groups, betas=betas, eps=eps)
 
 
@@ -740,6 +757,8 @@ def build_byte_loss_weights(
     loss_mask: torch.Tensor,
     wug_target_mask: torch.Tensor,
     state: CurriculumStepState,
+    *,
+    loss_mask_all_ones: Optional[bool] = None,
 ) -> Optional[torch.Tensor]:
     """Build exact per-byte loss weighting tensor `[1, T]` for Stages 3 and 4.
 
@@ -780,7 +799,9 @@ def build_byte_loss_weights(
         w = torch.where(is_tool, torch.maximum(w, torch.full_like(w, 2.0)), w)
         return w.unsqueeze(0)
 
-    if state.stage_id == 2 and not bool(loss_mask.all().item()):
-        return loss_mask.to(device=device, dtype=torch.float32).unsqueeze(0)
+    if state.stage_id == 2:
+        all_ones = bool(loss_mask.all().item()) if loss_mask_all_ones is None else bool(loss_mask_all_ones)
+        if not all_ones:
+            return loss_mask.to(device=device, dtype=torch.float32).unsqueeze(0)
 
     return None

@@ -19,8 +19,9 @@ Implements Engineering Blueprint Section 2.5, Chapter 3 & Theory Doc Part 4:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -136,6 +137,12 @@ class PMD(nn.Module):
         self.w_e_init = nn.Linear(2 * d_s + d_l, 1, bias=True)
         self.w_drain = nn.Linear(2 * d_s, 1, bias=True)
 
+        # Precomputed lateral-inhibition off-diagonal mask [1, K, K] (non-persistent; avoids per-step torch.eye allocs)
+        self.register_buffer(
+            "cq_eye_mask",
+            1.0 - torch.eye(cfg.k_slots, dtype=torch.float32).unsqueeze(0),
+            persistent=False,
+        )
         self._compiled_motor_scan = None
         self._init_weights()
 
@@ -259,7 +266,7 @@ class PMD(nn.Module):
             p_ord = torch.tanh(torch.einsum("br,bijr->bij", ord_vec, graph.edges.float()))  # [B, K, K]
 
             # Lateral inhibition from unexpressed j != i
-            eye_mask = 1.0 - torch.eye(K, device=q_prev.device, dtype=torch.float32).unsqueeze(0)
+            eye_mask = self.cq_eye_mask.to(device=q_prev.device, dtype=torch.float32)
             inh = torch.einsum("bj,bij->bi", q_prev.float(), F.relu(p_ord) * eye_mask)  # [B, K]
 
             coh_vec = F.linear(l_reg.float(), self.w_coh.weight.float())  # [B, d_r]
@@ -293,6 +300,175 @@ class PMD(nn.Module):
             done=done,
         )
 
+    def broca_cq_blocks_parallel(
+        self,
+        pre_slots_flat: torch.Tensor,
+        pre_edges_flat: torch.Tensor,
+        pre_sal_flat: torch.Tensor,
+        l_reg_seg: torch.Tensor,
+        seg_counts_cpu: Sequence[int],
+        seg_offsets_cpu: Sequence[int],
+        tau_q: Optional[float] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Vectorized K-step block-parallel Broca CQ + IoR across ALL independent K-step windows.
+
+        Because Broca CQ resets its IoR queue `(q_prev, a_prev)` at every `step_m % K == 0`
+        (and has zero feedback into BCG-PC), all `N_blk = sum(ceil(c / K))` K-step blocks across
+        all documents in a batch are 100% independent! Executes at most `K` (= 8) vectorized GPU
+        steps instead of `m_max` (= 400+) sequential eager Python calls (~54x fewer launches) and
+        hoists `w_ord`, `w_coh`, `z_out`, `r_role`, and `w_syn`/`u_syn` into single flat GEMMs.
+
+        Returns `(z_out_flat [M_total, D], delta_syn_flat [M_total, d_s])` bit-equivalent (< 1e-5)
+        to sequential `broca_cq_step` execution for both forward and backward gradients.
+        """
+        m_total = int(pre_slots_flat.shape[0])
+        device = pre_slots_flat.device
+        if m_total == 0:
+            return (
+                torch.zeros((0, self.cfg.d_concept), device=device, dtype=pre_slots_flat.dtype),
+                torch.zeros((0, self.cfg.d_s), device=device, dtype=pre_slots_flat.dtype),
+            )
+
+        K = self.cfg.k_slots
+        d_r = self.cfg.d_r
+        tau = self.cfg.tau_q if tau_q is None else tau_q
+
+        # Build independent K-step block schedules via vectorized NumPy + ONE single H2D DMA transfer
+        # (eliminates Python list comprehensions over 27k segments & 15 synchronous `torch.tensor(..., device=cuda)` stalls!)
+        cnts_np = np.asarray(seg_counts_cpu, dtype=np.int64)
+        offs_np = np.asarray(seg_offsets_cpu, dtype=np.int64)
+        valid_doc = cnts_np > 0
+        cnts_np = cnts_np[valid_doc]
+        offs_np = offs_np[valid_doc]
+        if cnts_np.size == 0:
+            return (
+                torch.zeros((m_total, self.cfg.d_concept), device=device, dtype=pre_slots_flat.dtype),
+                torch.zeros((m_total, self.cfg.d_s), device=device, dtype=pre_slots_flat.dtype),
+            )
+
+        n_blks_per_doc = (cnts_np + K - 1) // K
+        total_blks = int(n_blks_per_doc.sum())
+        doc_blk_offsets = np.zeros(cnts_np.size, dtype=np.int64)
+        if cnts_np.size > 1:
+            doc_blk_offsets[1:] = np.cumsum(n_blks_per_doc[:-1])
+        blk_doc_id = np.repeat(np.arange(cnts_np.size, dtype=np.int64), n_blks_per_doc)
+        blk_k = np.arange(total_blks, dtype=np.int64) - np.repeat(doc_blk_offsets, n_blks_per_doc)
+        blk_rel_off = blk_k * K
+        cur_starts_np = offs_np[blk_doc_id] + blk_rel_off
+        cur_lens_np = np.minimum(K, cnts_np[blk_doc_id] - blk_rel_off)
+
+        idx_np_list: list[np.ndarray] = []
+        keep_np_list: list[np.ndarray] = []
+        step_meta: list[tuple[int, int, Optional[tuple[int, int]]]] = []
+        idx_cursor = 0
+        keep_cursor = 0
+
+        for pos in range(K):
+            if pos == 0:
+                n_cur = int(cur_starts_np.size)
+                if n_cur == 0:
+                    break
+                idx_np_list.append(cur_starts_np)
+                step_meta.append((idx_cursor, idx_cursor + n_cur, None))
+                idx_cursor += n_cur
+            else:
+                keep_mask = cur_lens_np > pos
+                if not np.any(keep_mask):
+                    break
+                if bool(np.all(keep_mask)):
+                    keep_span: Optional[tuple[int, int]] = None
+                else:
+                    keep_idx_np = np.flatnonzero(keep_mask).astype(np.int64, copy=False)
+                    cur_starts_np = cur_starts_np[keep_idx_np]
+                    cur_lens_np = cur_lens_np[keep_idx_np]
+                    n_keep = int(keep_idx_np.size)
+                    keep_np_list.append(keep_idx_np)
+                    keep_span = (keep_cursor, keep_cursor + n_keep)
+                    keep_cursor += n_keep
+                pos_idx_np = cur_starts_np + pos
+                n_cur = int(pos_idx_np.size)
+                idx_np_list.append(pos_idx_np)
+                step_meta.append((idx_cursor, idx_cursor + n_cur, keep_span))
+                idx_cursor += n_cur
+
+        packed_parts = idx_np_list + keep_np_list
+        packed_cpu = torch.from_numpy(np.concatenate(packed_parts, axis=0))
+        if device.type == "cuda":
+            try:
+                packed_cpu = packed_cpu.pin_memory()
+            except Exception:
+                pass
+            packed_gpu = packed_cpu.to(device=device, dtype=torch.int64, non_blocking=bool(packed_cpu.is_pinned()))
+        else:
+            packed_gpu = packed_cpu.to(device=device, dtype=torch.int64)
+        all_idx = packed_gpu[:idx_cursor]
+        all_keep = packed_gpu[idx_cursor:]
+
+        # Hoist language-conditioned precedence/coherence projections ONCE across all M_total segments
+        eye_mask = self.cq_eye_mask.to(device=device, dtype=torch.float32)
+        tau_denom = max(tau, 1e-4)
+        with fp32_island(device):
+            l_reg_f = l_reg_seg.float()
+            ord_vec_all = F.linear(l_reg_f, self.w_ord.weight.float())  # [M_total, d_r]
+            coh_vec_all = F.linear(l_reg_f, self.w_coh.weight.float())  # [M_total, d_r]
+            q_init_all = torch.sigmoid(pre_sal_flat.float())  # [M_total, K]
+
+        pi_tensors: list[torch.Tensor] = []
+        q_prev: Optional[torch.Tensor] = None
+        a_prev: Optional[torch.Tensor] = None
+        n_pos = len(step_meta)
+
+        for pos, (i_start, i_end, keep_span) in enumerate(step_meta):
+            idx_t = all_idx[i_start:i_end]
+            edges_p = pre_edges_flat[idx_t]  # [N_p, K, K, d_r]
+            ord_p = ord_vec_all[idx_t]  # [N_p, d_r]
+            coh_p = coh_vec_all[idx_t]  # [N_p, d_r]
+
+            if pos == 0:
+                q_in = q_init_all[idx_t]
+                a_in = torch.zeros((idx_t.shape[0], K, d_r), device=device, dtype=edges_p.dtype)
+            else:
+                assert q_prev is not None and a_prev is not None
+                if keep_span is not None:
+                    keep_t = all_keep[keep_span[0] : keep_span[1]]
+                    q_in = q_prev[keep_t]
+                    a_in = a_prev[keep_t]
+                else:
+                    q_in = q_prev
+                    a_in = a_prev
+
+            with fp32_island(device):
+                p_ord = torch.tanh(torch.einsum("br,bijr->bij", ord_p, edges_p.float()))  # [N_p, K, K]
+                inh = torch.einsum("bj,bij->bi", q_in.float(), F.relu(p_ord) * eye_mask)  # [N_p, K]
+                coh = torch.einsum("br,bir->bi", coh_p, a_in.float())  # [N_p, K]
+                u_ready = torch.log(q_in.float().clamp_min(self.cfg.eps)) - self.cfg.lambda_inh * inh + coh
+                pi_soft = F.softmax(u_ready / tau_denom, dim=-1)
+                win = u_ready.argmax(dim=-1)
+                pi_hard = F.one_hot(win, num_classes=K).float()
+                pi_sel = (pi_hard - pi_soft).detach() + pi_soft  # [N_p, K] fp32
+                if pos + 1 < n_pos:
+                    q_prev = (q_in.float() * (1.0 - pi_sel)).clamp(0.0, 1.0)
+
+            if pos + 1 < n_pos:
+                a_prev = torch.einsum("bk,bkir->bir", pi_sel.to(edges_p.dtype), edges_p)
+
+            pi_tensors.append(pi_sel)
+
+        all_pi = torch.cat(pi_tensors, dim=0)
+        pi_sel_flat = all_pi[torch.argsort(all_idx)]  # [M_total, K] fp32 in exact flat segment order
+
+        # Single batched slot readout & syntactic modulation GEMM over all M_total segments!
+        pi_dt_s = pi_sel_flat.to(pre_slots_flat.dtype)
+        pi_dt_e = pi_sel_flat.to(pre_edges_flat.dtype)
+        z_out_flat = torch.einsum("mk,mkd->md", pi_dt_s, pre_slots_flat)  # [M_total, D]
+        r_role_flat = torch.einsum(
+            "mi,mj,mjir->mr", pi_dt_e, q_init_all.to(pre_edges_flat.dtype), pre_edges_flat
+        )  # [M_total, d_r]
+        delta_syn_flat = F.silu(
+            self.w_syn(torch.cat([r_role_flat, l_reg_seg], dim=-1)) + self.u_syn(z_out_flat)
+        )  # [M_total, d_s]
+        return z_out_flat, delta_syn_flat
+
     def decode_teacher_forced(
         self,
         target_bytes: torch.Tensor,
@@ -303,6 +479,7 @@ class PMD(nn.Module):
         m_init: Optional[torch.Tensor] = None,
         xi_init: Optional[torch.Tensor] = None,
         doc_cu_seqlens: Optional[torch.Tensor] = None,
+        known_max_seg_len: Optional[int] = None,
     ) -> PMDDecodeOutput:
         """Fully parallel O(log T) teacher-forced byte decoding across all segments in a batch!
 
@@ -314,6 +491,7 @@ class PMD(nn.Module):
         device = target_bytes.device
         d_s = self.cfg.d_s
         N = B * T
+        use_compiled_motor = self._compiled_motor_scan is not None and T > 0 and xi_init is None
 
         doc_reset_mask: Optional[torch.Tensor] = None
         doc_max_span: Optional[int] = None
@@ -327,7 +505,8 @@ class PMD(nn.Module):
             num_docs = doc_lens.numel()
             if num_docs > 0:
                 doc_reset_mask[0, doc_starts] = True
-                doc_max_span = int(doc_lens.max().item())
+                if not use_compiled_motor:
+                    doc_max_span = int(doc_lens.max().item())
             doc_id_flat = torch.repeat_interleave(
                 torch.arange(num_docs, device=device, dtype=torch.int64),
                 doc_lens,
@@ -353,6 +532,7 @@ class PMD(nn.Module):
             period=self.cfg.rope_period,
             num_harmonics=self.cfg.rope_num_harmonics,
             inverse=True,
+            max_pos=known_max_seg_len,
         )  # [N, d_s]
         delta_syn_flat = delta_syn_seg[seg_id]  # [N, d_s]
         u_prev_flat = u_prev.reshape(N, d_s)
@@ -367,14 +547,14 @@ class PMD(nn.Module):
         # 2 & 3. Hotspot B2: 128B Chunked Parallel Stack Scan + Causal Byte Motor Micro-Core + Logits
         # Spec 1 multi-frame isolation: reset 128B pushdown stack Xi_t at doc starts,
         # after 0x04 / 0x13 / 0x1E, and immediately after `b"\x1dE\n"`.
-        full_stack_reset = _compute_multi_frame_stack_reset(target_bytes, prev_bytes, doc_reset_mask)
-        has_any_reset = bool(full_stack_reset.any().item()) if not torch.compiler.is_compiling() else True
-        stack_reset_mask = full_stack_reset if has_any_reset else doc_reset_mask
+        # Pass `full_stack_reset` directly (branchless in parallel_stack_scan, zero GPU->CPU .any().item() sync!).
+        stack_reset_mask = _compute_multi_frame_stack_reset(target_bytes, prev_bytes, doc_reset_mask)
 
         l_reg_bt = l_reg[doc_id_flat].view(B, T, self.cfg.d_l)
         m_start = self.m0 if m_init is None else m_init
-        if self._compiled_motor_scan is not None and T > 0 and xi_init is None:
-            pad = (256 - (T % 256)) % 256
+        if use_compiled_motor:
+            align_b = 16384 if T >= 16384 else (4096 if T >= 4096 else 256)
+            pad = (align_b - (T % align_b)) % align_b
             if pad > 0:
                 u_in = torch.cat([u_prev, torch.zeros((B, pad, d_s), device=device, dtype=u_prev.dtype)], dim=1)
                 d_in = torch.cat([d_drive, torch.zeros((B, pad, d_s), device=device, dtype=d_drive.dtype)], dim=1)
@@ -427,7 +607,9 @@ class PMD(nn.Module):
         drain_flat = F.softplus(
             (drain_in * self.w_drain.weight.float()).sum(dim=-1) + self.w_drain.bias.float()
         )  # [N] fp32 > 0
-        cum_drain = ragged_segment_cumsum(drain_flat, cu_seqlens, seg_id)  # [N] fp32
+        cum_drain = ragged_segment_cumsum(
+            drain_flat, cu_seqlens, seg_id, max_seg_len=known_max_seg_len
+        )  # [N] fp32
         charge_e = (e_init_seg[seg_id] - cum_drain).view(B, T)  # [B, T] fp32
         p_seg_end = torch.sigmoid(-charge_e / max(self.cfg.tau_e, 1e-4))  # [B, T] fp32
 

@@ -195,14 +195,18 @@ class SGSC(nn.Module):
             ends = doc_cu_seqlens[1:].to(dtype=torch.int64, device=device)
             if starts.numel() > 0:
                 doc_reset_mask[0, starts] = True
-                doc_max_span = int((ends - starts).max().item())
+                # Skip GPU->CPU sync when compiled byte scan ignores max_span
+                if self._compiled_byte_scan is None:
+                    doc_max_span = int((ends - starts).max().item())
 
         h_start = self.h0 if h_init is None else h_init
         # 1-3. Hotspot B1: per-byte projections + O(log T) diagonal scan + strictly causal prior
         if self._compiled_byte_scan is not None and T > 0:
-            # Align T up to chunk multiple (256) strictly inside Hotspot B1 (with reset_mask=True on
-            # tail and immediate slice [:T]) so compiled dynamic=False sees constant static shapes!
-            pad = (256 - (T % 256)) % 256
+            # Align T up to 16KB for prod batches >=16KB (4KB for 4-16KB, 256B for tiny tests)
+            # strictly inside Hotspot B1 so 100% of 64KB/128KB/256KB ragged batches hit ONE static
+            # Inductor graph (<0.8% padding overhead, zero mid-run recompiles!).
+            align_b = 16384 if T >= 16384 else (4096 if T >= 4096 else 256)
+            pad = (align_b - (T % align_b)) % align_b
             if pad > 0:
                 rb_in = torch.cat([raw_bytes, torch.zeros((B, pad), device=device, dtype=raw_bytes.dtype)], dim=1)
                 if doc_reset_mask is not None:
@@ -278,12 +282,14 @@ class SGSC(nn.Module):
         h_flat = h_seq.reshape(B * T, d_s)
         h_end = h_flat[seg_end_idx]  # [M_total, d_s]
 
+        rope_max_pos = (self.cfg.max_seg_len + 4) if forced_spikes is None else None
         q_seg = apply_holographic_rope(
             self.w_q(h_end),
             seg_lens,
             period=self.cfg.rope_period,
             num_harmonics=self.cfg.rope_num_harmonics,
             inverse=False,
+            max_pos=rope_max_pos,
         )  # [M_total, d_s]
         k_flat = apply_holographic_rope(
             self.w_k(h_flat),
@@ -291,6 +297,7 @@ class SGSC(nn.Module):
             period=self.cfg.rope_period,
             num_harmonics=self.cfg.rope_num_harmonics,
             inverse=False,
+            max_pos=rope_max_pos,
         )  # [B*T, d_s]
 
         # Intra-segment attention scores & softmax strictly in float32
@@ -303,6 +310,7 @@ class SGSC(nn.Module):
             period=self.cfg.rope_period,
             num_harmonics=self.cfg.rope_num_harmonics,
             inverse=False,
+            max_pos=rope_max_pos,
         )  # [B*T, d_s]
         weighted_v = gamma.unsqueeze(-1).to(v_rot.dtype) * v_rot
         agg = ragged_segment_sum(weighted_v, seg_id, m_total)  # [M_total, d_s]

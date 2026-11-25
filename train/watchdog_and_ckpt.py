@@ -38,7 +38,13 @@ from typing import Any, Mapping, Optional, Sequence
 import numpy as np
 import torch
 
-from dcpa.compile_utils import get_clean_state_dict, strip_orig_mod_prefix, unwrap_compiled_module
+from dcpa.compile_utils import (
+    get_clean_state_dict,
+    migrate_legacy_moe_optimizer_state_dict,
+    migrate_legacy_moe_state_dict,
+    strip_orig_mod_prefix,
+    unwrap_compiled_module,
+)
 from utils.device import capture_rng_state, restore_rng_state, seed_everything
 
 
@@ -651,7 +657,7 @@ class CheckpointManager:
         Strips any `_orig_mod.` prefixes and restores cleanly into either compiled or uncompiled
         models with `strict=True` (Performance Audit Task 2.4).
         """
-        clean_sd = strip_orig_mod_prefix(ckpt["model_state_dict"])
+        clean_sd = migrate_legacy_moe_state_dict(strip_orig_mod_prefix(ckpt["model_state_dict"]))
         target_mod = unwrap_compiled_module(model)
         # If individual submodules (e.g. model.bcg_pc) are compiled, unwrap temporarily for strict=True load
         # or remap keys to match active submodule wrapper cleanly.
@@ -665,16 +671,30 @@ class CheckpointManager:
                 if canon in clean_sd:
                     remapped[tk] = clean_sd[canon]
             target_mod.load_state_dict(remapped, strict=True)
-        # Preserve active YAML config's `base_lr` per group across resume so LR tuning in YAML
-        # takes effect immediately while retaining 100% of AdamW momentum (exp_avg / exp_avg_sq).
+        # Preserve active YAML config's `base_lr` and runtime `fused` flag per group across resume
+        # so LR tuning & fused CUDA AdamW take effect immediately while retaining 100% of AdamW momentum.
         configured_base_lrs = [
             float(g.get("base_lr", g["lr"])) for g in optimizer.param_groups
         ]
+        configured_fused = [g.get("fused") for g in optimizer.param_groups]
         # Free existing GPU AdamW moment buffers BEFORE materializing restored moments to prevent 2x VRAM spikes
         optimizer.state.clear()
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        for g, cfg_blr in zip(optimizer.param_groups, configured_base_lrs):
+        opt_sd = migrate_legacy_moe_optimizer_state_dict(ckpt["optimizer_state_dict"], optimizer)
+        # Align group `fused` flag before load_state_dict so PyTorch places `step` on the right device!
+        if "param_groups" in opt_sd and len(opt_sd["param_groups"]) == len(configured_fused):
+            opt_sd = dict(opt_sd)
+            patched_groups = []
+            for og, f_val in zip(opt_sd["param_groups"], configured_fused):
+                pg = dict(og)
+                if f_val is not None:
+                    pg["fused"] = f_val
+                patched_groups.append(pg)
+            opt_sd["param_groups"] = patched_groups
+        optimizer.load_state_dict(opt_sd)
+        for g, cfg_blr, f_val in zip(optimizer.param_groups, configured_base_lrs, configured_fused):
             g["base_lr"] = cfg_blr
+            if f_val is not None:
+                g["fused"] = f_val
         if hasattr(controller, "load_state_dict"):
             controller.load_state_dict(ckpt.get("scheduler_state"))
         if watchdog is not None:

@@ -301,8 +301,6 @@ class CompactHouseholderState:
         doc_active = (beta.detach().float() > float(write_threshold)).float()
         if (not _skip_thresh_check) and float(doc_active.max().item()) <= 0.0:
             return
-        if float(doc_active.max().item()) <= 0.0:
-            return
 
         # Precision Island #5 (Red Line #1): s=32 active sparse column Householder Gated Delta
         # erase/write & familiarity accumulation strictly in float32 (zero residual ghosting!).
@@ -718,15 +716,15 @@ class HippocampusDualMemory(nn.Module):
         new_f[b_arange, u] = f_ext[b_arange, p_star]
         new_eta[b_arange, u] = self.cfg.lambda_eta * eta_ext[b_arange, p_star]
 
-        # Case B (v < K): freed slot v gets candidate slot K
-        case_b = v < K
-        if case_b.any():
-            b_cb = b_arange[case_b]
-            v_cb = v[case_b]
-            new_e_idx[b_cb, v_cb] = cand_idx[b_cb]
-            new_e_val[b_cb, v_cb] = cand_val_aligned[b_cb]
-            new_f[b_cb, v_cb] = cand_f_aligned[b_cb]
-            new_eta[b_cb, v_cb] = cand_ach.float()[b_cb]
+        # Case B (v < K): freed slot v gets candidate slot K (100% branchless, zero GPU->CPU sync!)
+        case_b = v < K  # [B] bool
+        v_safe = v.clamp_max(K - 1)  # [B] int64 in 0..K-1
+        slot_ids = torch.arange(K, device=device, dtype=torch.int64).unsqueeze(0)  # [1, K]
+        write_v_mask = case_b.unsqueeze(1) & (slot_ids == v_safe.unsqueeze(1))  # [B, K]
+        new_e_idx = torch.where(write_v_mask.unsqueeze(-1), cand_idx.unsqueeze(1), new_e_idx)
+        new_e_val = torch.where(write_v_mask.unsqueeze(-1), cand_val_aligned.unsqueeze(1), new_e_val)
+        new_f = torch.where(write_v_mask.unsqueeze(-1), cand_f_aligned.unsqueeze(1), new_f)
+        new_eta = torch.where(write_v_mask, cand_ach.float().unsqueeze(1), new_eta)
 
         return EligibilityState(e_idx=new_e_idx, e_val=new_e_val, f_tilde=new_f, eta=new_eta)
 
@@ -767,13 +765,12 @@ class HippocampusDualMemory(nn.Module):
                 else (0.0 if write_threshold is None else write_threshold)
             )
 
-            # Single `[K]` max-beta transfer + single batched `[B, K, D]` DG semantic projection
-            # (cuts 16 CUDA-CPU `.item()` syncs -> 1 and 8 sequential `dg_sem` GEMMs -> 1 per step!).
-            slot_max_betas = beta.detach().amax(dim=0).to("cpu").tolist()
-            active_slots = [si for si, mb in enumerate(slot_max_betas) if float(mb) > thresh]
-            if active_slots:
+            # Stage 4 training (`thresh <= 0.0`): zero GPU->CPU sync vectorized write across all K slots!
+            # Stage 5 SFT / eval (`thresh > 0.0`): single `[K]` max-beta check protects `w_max` ring buffer
+            # from zero-delta dummy evictions without per-slot `.item()` stalls.
+            if float(thresh) <= 0.0:
                 phi_idx_all, phi_val_all = self.dg_sem(s_bar_post)  # [B, K, s]
-                for slot_i in active_slots:
+                for slot_i in range(K):
                     fast_state.write_slot(
                         beta=beta[:, slot_i],
                         e_idx=elig.e_idx[:, slot_i, :],
@@ -785,6 +782,23 @@ class HippocampusDualMemory(nn.Module):
                         write_threshold=thresh,
                         _skip_thresh_check=True,
                     )
+            else:
+                slot_max_betas = beta.detach().amax(dim=0).to("cpu").tolist()
+                active_slots = [si for si, mb in enumerate(slot_max_betas) if float(mb) > thresh]
+                if active_slots:
+                    phi_idx_all, phi_val_all = self.dg_sem(s_bar_post)  # [B, K, s]
+                    for slot_i in active_slots:
+                        fast_state.write_slot(
+                            beta=beta[:, slot_i],
+                            e_idx=elig.e_idx[:, slot_i, :],
+                            e_val=elig.e_val[:, slot_i, :],
+                            s_bar=s_bar_post[:, slot_i, :],
+                            phi_idx=phi_idx_all[:, slot_i, :],
+                            phi_val=phi_val_all[:, slot_i, :],
+                            f_tilde=elig.f_tilde[:, slot_i, :],
+                            write_threshold=thresh,
+                            _skip_thresh_check=True,
+                        )
 
             # Quench consumed eligibility traces
             new_eta = (1.0 - self.cfg.kappa_quench * beta.detach()) * elig.eta.float()

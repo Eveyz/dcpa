@@ -76,13 +76,18 @@ else
   echo "[WARN] nvidia-smi not found in PATH."
 fi
 
-# 3. Reuse container PyTorch only if CUDA + F.grouped_mm (PyTorch >= 2.8) are both available
+# 3. Reuse container PyTorch only if CUDA + F.grouped_mm (PyTorch >= 2.8) + live SM kernel execution succeed
+#    (catches preinstalled cu126 PyTorch on Blackwell sm_120 / RTX 5090 that lacks sm_120 kernels!)
 if ! "${PYTHON_BIN}" -c "
 import sys, torch, torch.nn.functional as F
-sys.exit(0 if (torch.cuda.is_available() and hasattr(F, 'grouped_mm')) else 1)
+if not (torch.cuda.is_available() and hasattr(F, 'grouped_mm')):
+    sys.exit(1)
+x = torch.ones((4,), device='cuda', dtype=torch.bfloat16)
+_ = (x + 1.0).sum().item()
+sys.exit(0)
 " >/dev/null 2>&1; then
-  echo "[PyTorch] Installing/upgrading PyTorch >= 2.8 CUDA wheels (required for F.grouped_mm MoE)..."
-  "${PYTHON_BIN}" -m pip install -q --upgrade torch --index-url https://download.pytorch.org/whl/cu126
+  echo "[PyTorch] Installing/upgrading PyTorch >= 2.8 CUDA 12.8 wheels (cu128 supports SM80..SM120 / RTX 5090 & F.grouped_mm)..."
+  "${PYTHON_BIN}" -m pip install -q --upgrade torch --index-url https://download.pytorch.org/whl/cu128
 else
   echo "[PyTorch] Reusing preinstalled CUDA PyTorch with F.grouped_mm ($("${PYTHON_BIN}" -c 'import torch; print(torch.__version__)'))."
 fi

@@ -48,6 +48,27 @@ def extract_flat_state_dict(model: DCPAModel, dtype: torch.dtype = torch.float32
     for name, tensor in get_clean_state_dict(model).items():
         if name in skip_keys:
             continue
+        # Unpack native 3D stacked MoE weights into flat per-expert Rust/safetensors keys
+        if name in ("bcg_pc.moe.w_gu1", "bcg_pc.moe.w_d1", "bcg_pc.moe.w_gu2", "bcg_pc.moe.w_d2"):
+            t_cpu = tensor.detach().to(device="cpu", dtype=dtype).contiguous()
+            n_exp = int(t_cpu.shape[0])
+            if name == "bcg_pc.moe.w_gu1":
+                h = int(t_cpu.shape[1]) // 2
+                for e in range(n_exp):
+                    tensors[f"bcg_pc.moe.experts.{e}.w_gate1.weight"] = t_cpu[e, :h].contiguous()
+                    tensors[f"bcg_pc.moe.experts.{e}.w_up1.weight"] = t_cpu[e, h:].contiguous()
+            elif name == "bcg_pc.moe.w_d1":
+                for e in range(n_exp):
+                    tensors[f"bcg_pc.moe.experts.{e}.w_down1.weight"] = t_cpu[e].contiguous()
+            elif name == "bcg_pc.moe.w_gu2":
+                h = int(t_cpu.shape[1]) // 2
+                for e in range(n_exp):
+                    tensors[f"bcg_pc.moe.experts.{e}.w_gate2.weight"] = t_cpu[e, :h].contiguous()
+                    tensors[f"bcg_pc.moe.experts.{e}.w_up2.weight"] = t_cpu[e, h:].contiguous()
+            else:
+                for e in range(n_exp):
+                    tensors[f"bcg_pc.moe.experts.{e}.w_down2.weight"] = t_cpu[e].contiguous()
+            continue
         t = tensor.detach().to(device="cpu", dtype=dtype).contiguous()
         if name == "sgsc.theta_raw":
             # Fold dimensionless lif_theta_scale so Rust core evaluates softplus(sgsc_theta_raw) verbatim

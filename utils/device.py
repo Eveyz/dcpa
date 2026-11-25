@@ -288,6 +288,11 @@ def select_hardware_tier(
             tier = "a100_40g"
             base_micro = 65_536
             base_accum = 2
+        elif vram_gb >= 30.0:
+            # RTX 5090 (32GB Blackwell sm_120): 64KB x 2 gives V=16 docs @ 4096B (0% bucket padding waste!)
+            tier = "rtx_5090_32g"
+            base_micro = 65_536
+            base_accum = 2
         elif vram_gb >= 20.0:
             tier = "l4_or_4090"
             base_micro = 32_768

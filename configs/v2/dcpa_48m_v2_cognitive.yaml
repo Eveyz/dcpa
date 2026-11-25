@@ -104,7 +104,10 @@ hardware:
   compile_mode: auto
   compile_doc_bucket_size: 16
   compile_cache_size_limit: 128
-  bcg_checkpoint_vram_watermark_gb: 32.0   # 48M weights+AdamW ~0.8 GB; skips BCG recompute on 40G/80G cards while protecting 24G
+  bcg_checkpoint_vram_watermark_gb: 74.0   # Auto-clamped (~20.8GB on 32GB 5090, 74GB on 95GB Blackwell -> 0% recompute!)
+  bcg_chunk_steps: 2                       # Pack 2 BCG-PC steps (16 MoE layers) per compiled graph (fast ~1m cold compile, 2x less CPU dispatch)
+  bcg_tbptt_window: 32
+  bcg_tbptt_replay: auto
   prefetch_depth: 3
   prefetch_workers: 2
   auto_sharding_tiers:

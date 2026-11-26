@@ -29,7 +29,11 @@ import torch
 import torch.nn.functional as F
 
 from data.ragged_dataloader import RaggedByteDataset
-from dcpa.model import DCPAModel
+from dcpa.compile_utils import unwrap_compiled_module
+from dcpa.model import DCPAModel, compute_segment_scope_depths
+from dcpa.modules.bcg_pc import ConceptGraphState
+from dcpa.modules.cortical import CorticalCarryState
+from dcpa.modules.hippocampus import EligibilityState
 from utils.device import amp_autocast, get_peak_memory_gb
 
 
@@ -47,6 +51,14 @@ FIXED_DOMAIN_PROBES: tuple[tuple[str, int, str], ...] = (
     ("ZH", 1, "深度学习系统通过字节流感知与受限概念图实现高效的双语逻辑推演。"),
     ("Python", 3, "def sum_positive(xs: list[int]) -> int:\n    return sum(v for v in xs if v > 0)"),
     ("JS", 5, "function sumPositive(xs) { let acc = 0; for (const v of xs) { if (v > 0) { acc += v; } } return acc; }"),
+)
+
+# (label, lang_id, style_id, prompt, temperature)
+FIXED_GENERATION_PROBES: tuple[tuple[str, int, int, str, float], ...] = (
+    ("EN", 0, 2, "In physics, energy conservation states that ", 0.65),
+    ("ZH", 1, 2, "人工智能系统在学习新知识时，最重要的是", 0.65),
+    ("Python", 3, 4, "def fibonacci(n: int) -> int:\n    ", 0.0),
+    ("JS", 5, 4, "function isPrime(n) {\n  ", 0.0),
 )
 
 FIXED_WUG_PROBES: tuple[dict[str, Any], ...] = (
@@ -407,6 +419,302 @@ def _run_live_wug_probes(
     return results, mean_wug_bpc, exact_hits
 
 
+def _sample_probe_byte(
+    logits_1d: torch.Tensor,
+    *,
+    temp: float,
+    top_p: float,
+    gen: torch.Generator,
+) -> int:
+    """Deterministic temperature + nucleus byte sampler (greedy when `temp <= 0`)."""
+    if temp <= 0.0:
+        return int(logits_1d.argmax(dim=-1).item())
+    probs = F.softmax(logits_1d.float().to("cpu") / max(float(temp), 1e-4), dim=-1)
+    sorted_p, sorted_idx = torch.sort(probs, descending=True)
+    cdf = torch.cumsum(sorted_p, dim=-1)
+    keep = (cdf - sorted_p) <= float(top_p)
+    keep[0] = True
+    filtered = torch.where(keep, sorted_p, torch.zeros_like(sorted_p))
+    filtered = filtered / filtered.sum().clamp_min(1e-8)
+    pick = int(torch.multinomial(filtered, num_samples=1, generator=gen).item())
+    return int(sorted_idx[pick].item())
+
+
+@torch.no_grad()
+def generate_streaming_continuation(
+    model: DCPAModel,
+    prompt: str,
+    *,
+    lang_id: int,
+    style_id: int,
+    device: torch.device,
+    use_bf16: bool,
+    model_stage: str,
+    tau_s: float,
+    tau_m: float,
+    max_new_bytes: int = 96,
+    temperature: float = 0.65,
+    top_p: float = 0.90,
+    seed: int = 2026,
+) -> dict[str, Any]:
+    """Closed-loop O(1) Mode-I autoregressive continuation (slow concept brain + fast PMD byte motor)."""
+    prompt_bytes = prompt.encode("utf-8")
+    if not prompt_bytes:
+        return {"prompt": prompt, "generated": "", "num_bytes": 0, "num_segments": 0, "stopped_eot": False}
+
+    sgsc_raw = unwrap_compiled_module(model.sgsc)
+    bcg_raw = unwrap_compiled_module(model.bcg_pc)
+    cort_raw = unwrap_compiled_module(model.cortical)
+    pmd_raw = unwrap_compiled_module(model.pmd)
+    hip_raw = unwrap_compiled_module(model.hippocampus)
+
+    hip_enabled = model_stage.upper() == "D"
+    act_dtype = torch.bfloat16 if (use_bf16 and device.type == "cuda") else torch.float32
+    l_reg = pmd_raw.get_lang_vec(
+        torch.tensor([int(lang_id)], dtype=torch.long, device=device),
+        torch.tensor([int(style_id)], dtype=torch.long, device=device),
+    )
+
+    sgsc_h: Optional[torch.Tensor] = None
+    g_state: ConceptGraphState = bcg_raw.init_state(1, device=device, dtype=act_dtype)
+    c_carry: CorticalCarryState = cort_raw.init_carry_state(1, device=device, dtype=act_dtype)
+    f_state = (
+        hip_raw.init_fast_state(1, mode="compact", device=device)
+        if hip_enabled
+        else None
+    )
+    e_state = (
+        EligibilityState.zeros(1, model.cfg.k_slots, model.cfg.s_active, model.cfg.d_s, device, act_dtype)
+        if hip_enabled
+        else None
+    )
+
+    def _ingest(chunk_bytes: bytes) -> int:
+        nonlocal sgsc_h, g_state, c_carry, e_state
+        if not chunk_bytes:
+            return 0
+        x_t = torch.tensor(list(chunk_bytes), dtype=torch.uint8, device=device).unsqueeze(0)
+        with amp_autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
+            sgsc_out = sgsc_raw(x_t, tau_s=tau_s, h_init=sgsc_h)
+            m_cnt = int(sgsc_out.f_stem.shape[0])
+            seg_doc_start = torch.zeros((m_cnt,), device=device, dtype=torch.bool)
+            _, seg_end_depth, final_ast = compute_segment_scope_depths(
+                x_t, sgsc_out.cu_seqlens, seg_doc_start, doc_reset_mask=None, init_depth=c_carry.ast_depth
+            )
+            for m in range(m_cnt):
+                f_m = sgsc_out.f_stem[m : m + 1]
+                c_m = sgsc_out.c_slow[m : m + 1]
+                sn_m = sgsc_out.sem_norm[m : m + 1]
+                mi_m = sgsc_out.mean_info[m : m + 1]
+                end_dep_m = seg_end_depth[m : m + 1]
+
+                h_enc_m, c_carry = cort_raw.encode_step_streaming(
+                    c_slow_step=c_m,
+                    f_stem_step=f_m,
+                    seg_end_depth=end_dep_m,
+                    carry=c_carry,
+                )
+                hip_r = hip_raw.read_comprehension(
+                    f_stem=f_m,
+                    c_slow=h_enc_m,
+                    sem_norm=sn_m,
+                    mean_info=mi_m,
+                    fast_state=f_state,
+                    enabled=hip_enabled,
+                )
+                bcg_o = bcg_raw.step(
+                    c_fused=hip_r.c_fused,
+                    prec_bu=hip_r.prec_bu,
+                    ach=hip_r.ach_signal,
+                    state=g_state,
+                    tau_m=tau_m,
+                    use_gumbel=False,
+                    update_c0_ema=False,
+                )
+                g_state = bcg_o.state
+                c_carry = CorticalCarryState(
+                    ring_kv=c_carry.ring_kv,
+                    ring_pos=c_carry.ring_pos,
+                    ring_depth=c_carry.ring_depth,
+                    ring_valid=c_carry.ring_valid,
+                    doc_pos=c_carry.doc_pos,
+                    ast_depth=c_carry.ast_depth,
+                    prev_z_ref=bcg_o.z_star.detach().to(c_carry.prev_z_ref.dtype),
+                    has_prev_seg=torch.ones_like(c_carry.has_prev_seg),
+                )
+                if hip_enabled and f_state is not None and e_state is not None:
+                    e_state = hip_raw.inherit_eligibility_on_merge(
+                        elig=e_state,
+                        cand_idx=hip_r.psi_idx,
+                        cand_val=hip_r.psi_val,
+                        cand_f=f_m,
+                        cand_ach=hip_r.ach_signal,
+                        win_i=bcg_o.win_i,
+                        win_j=bcg_o.win_j,
+                    )
+                    e_state, _, _ = hip_raw.three_factor_write(
+                        s_bar_post=bcg_o.s_bar_post,
+                        edges_post=g_state.edges,
+                        c0=bcg_raw.c0,
+                        elig=e_state,
+                        fast_state=f_state,
+                        write_threshold=model.cfg.householder_write_threshold,
+                    )
+            c_carry = CorticalCarryState(
+                ring_kv=c_carry.ring_kv,
+                ring_pos=c_carry.ring_pos,
+                ring_depth=c_carry.ring_depth,
+                ring_valid=c_carry.ring_valid,
+                doc_pos=c_carry.doc_pos,
+                ast_depth=final_ast.clamp(0, 31),
+                prev_z_ref=c_carry.prev_z_ref,
+                has_prev_seg=c_carry.has_prev_seg,
+            )
+            sgsc_h = sgsc_out.h_seq[:, -1, :].detach().clone()
+            return m_cnt
+
+    def _motor_drive() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        with amp_autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
+            g_phase = (
+                g_state.phase
+                if g_state.phase is not None
+                else torch.zeros((1, model.cfg.k_slots), device=device, dtype=torch.float32)
+            )
+            z_dec, copy_stem = cort_raw.decode_step_streaming(
+                l_reg=l_reg,
+                carry=c_carry,
+                slots=g_state.slots,
+                edges=g_state.edges,
+                salience=g_state.salience,
+                phase=g_phase,
+            )
+            _, g_ctx = bcg_raw.message_pass(g_state.slots, g_state.edges, g_state.salience, phase=g_phase)
+            f_slow, _ = hip_raw.read_expression(z_out=z_dec, l_reg=l_reg, enabled=False)
+            f_cort = f_slow + copy_stem
+            if hip_enabled and f_state is not None:
+                c_hat = bcg_raw.f_pred_2(F.silu(bcg_raw.f_pred_1(g_ctx)))
+                rho_out, f_hip = model._query_hippocampus_expression_fast(c_hat, f_state)
+                f_out = ((1.0 - rho_out).unsqueeze(-1) * f_cort.float() + rho_out.unsqueeze(-1) * f_hip).to(f_cort.dtype)
+            else:
+                f_out = f_cort
+            delta_syn = pmd_raw.compute_streaming_delta_syn(g_ctx=g_ctx, z_star=z_dec, l_reg=l_reg)
+            charge0 = pmd_raw.init_segment_charge(f_out, delta_syn, l_reg)
+            return f_out, delta_syn, charge0
+
+    _ingest(prompt_bytes)
+    f_out, delta_syn, charge_cur = _motor_drive()
+    m_cur = pmd_raw.m0.detach().to(device=device, dtype=f_out.dtype).unsqueeze(0).clone()
+    xi_cur = torch.zeros((1, model.cfg.stack_depth, model.cfg.stack_tag_dim), device=device, dtype=torch.float32)
+    prev_b = torch.tensor([prompt_bytes[-1]], dtype=torch.long, device=device)
+
+    gen = torch.Generator(device="cpu").manual_seed(int(seed))
+    out_bytes = bytearray()
+    seg_buf = bytearray()
+    utf8_rem = 0
+    tau_step = 1
+    gen_segments = 0
+    stopped_eot = False
+
+    for _ in range(int(max_new_bytes)):
+        with amp_autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
+            logits, m_cur, xi_cur, charge_cur, p_end = pmd_raw.step_byte_streaming(
+                prev_byte=prev_b,
+                f_out=f_out,
+                delta_syn=delta_syn,
+                l_reg=l_reg,
+                tau_step=tau_step,
+                m_prev=m_cur,
+                xi_prev=xi_cur,
+                charge_prev=charge_cur,
+            )
+        nxt = _sample_probe_byte(logits[0], temp=temperature, top_p=top_p, gen=gen)
+        if nxt in (0x00, 0x04):
+            stopped_eot = True
+            break
+        out_bytes.append(nxt)
+        seg_buf.append(nxt)
+        if nxt < 0x80:
+            utf8_rem = 0
+        elif (nxt & 0xE0) == 0xC0:
+            utf8_rem = 1
+        elif (nxt & 0xF0) == 0xE0:
+            utf8_rem = 2
+        elif (nxt & 0xF8) == 0xF0:
+            utf8_rem = 3
+        elif (nxt & 0xC0) == 0x80:
+            utf8_rem = max(utf8_rem - 1, 0)
+        else:
+            utf8_rem = 0
+
+        prev_b = torch.tensor([nxt], dtype=torch.long, device=device)
+        tau_step += 1
+        seg_done = float(p_end[0].item()) >= 0.5 or tau_step > model.cfg.max_seg_len
+        if seg_done and (utf8_rem == 0 or tau_step > model.cfg.max_seg_len + 3):
+            if seg_buf:
+                gen_segments += max(1, _ingest(bytes(seg_buf)))
+                seg_buf.clear()
+            f_out, delta_syn, charge_cur = _motor_drive()
+            tau_step = 1
+
+    # Trim any incomplete trailing UTF-8 sequence for clean display
+    clean_bytes = bytes(out_bytes)
+    while clean_bytes and (clean_bytes[-1] & 0xC0) == 0x80:
+        try:
+            clean_bytes.decode("utf-8", errors="strict")
+            break
+        except UnicodeDecodeError:
+            clean_bytes = clean_bytes[:-1]
+    if clean_bytes:
+        try:
+            clean_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            if (clean_bytes[-1] & 0x80) != 0:
+                clean_bytes = clean_bytes[:-1]
+    gen_text = clean_bytes.decode("utf-8", errors="replace")
+    return {
+        "prompt": prompt,
+        "generated": gen_text,
+        "num_bytes": len(out_bytes),
+        "num_segments": gen_segments,
+        "stopped_eot": stopped_eot,
+    }
+
+
+@torch.no_grad()
+def _run_free_generation_probes(
+    model: DCPAModel,
+    *,
+    device: torch.device,
+    use_bf16: bool,
+    model_stage: str,
+    tau_s: float,
+    tau_m: float,
+    max_new_bytes: int = 96,
+) -> list[dict[str, Any]]:
+    """Run true closed-loop autoregressive generation across EN / ZH / Python / JS (Stages 2–4)."""
+    if model_stage.upper() == "A":
+        return []
+    rows: list[dict[str, Any]] = []
+    for idx, (label, lid, sid, prompt, temp) in enumerate(FIXED_GENERATION_PROBES):
+        res = generate_streaming_continuation(
+            model,
+            prompt,
+            lang_id=lid,
+            style_id=sid,
+            device=device,
+            use_bf16=use_bf16,
+            model_stage=model_stage,
+            tau_s=tau_s,
+            tau_m=tau_m,
+            max_new_bytes=max_new_bytes,
+            temperature=temp,
+            top_p=0.90,
+            seed=2026 + idx * 17,
+        )
+        rows.append({"label": label, "temp": temp, **res})
+    return rows
+
+
 @torch.no_grad()
 def run_visual_probe(
     model: DCPAModel,
@@ -463,6 +771,14 @@ def run_visual_probe(
             tau_s=tau_s,
             tau_m=tau_m,
         )
+        gen_rows = _run_free_generation_probes(
+            model,
+            device=device,
+            use_bf16=use_bf16,
+            model_stage=model_stage,
+            tau_s=tau_s,
+            tau_m=tau_m,
+        )
     finally:
         if was_training:
             model.train()
@@ -510,11 +826,16 @@ def run_visual_probe(
 
     for row in domain_rows:
         split_flag = "OK (0 UTF8 splits)" if row["utf8_splits"] == 0 else f"ALARM ({row['utf8_splits']} UTF8 splits!)"
+        pmd_label = (
+            "PMD Decoded (Autoencoder)"
+            if model_stage.upper() == "A"
+            else "PMD 1-Byte Argmax (teacher-forced, NOT free gen)"
+        )
         lines.extend(
             [
                 f"- **{row['label']}** (`T={row['num_bytes']}B -> M={row['num_segments']}`, UTF-8=`{split_flag}`, `eps_mon={row['eps_mon']:.4f}`{row['rust_note']}):",
                 f"  - SGSC `|`: `{row['segmented']}`",
-                f"  - PMD Decoded: `{row['decoded']}`",
+                f"  - {pmd_label}: `{row['decoded']}`",
             ]
         )
 
@@ -538,6 +859,25 @@ def run_visual_probe(
             f"| `{wr['label']}` | `{wr['expected']}` | `{wr['predicted']}` | `{hit_s}` | "
             f"`{wr['peak_ach']:.4f}` | `{wr['peak_beta']:.4f}` | `{wr['wug_target_bpc']:.3f}` |"
         )
+    lines.extend(
+        [
+            "",
+            "## 5. 真实自由自回归续写样本 (Free-Running Autoregressive Generation)",
+            "",
+        ]
+    )
+    if gen_rows:
+        for gr in gen_rows:
+            p_disp = gr["prompt"].replace("\n", "\\n")
+            g_disp = gr["generated"].replace("\n", "\\n").replace("`", "'")
+            t_str = "greedy" if gr["temp"] <= 0.0 else f"T={gr['temp']:.2f}"
+            eot_str = " [EOT]" if gr["stopped_eot"] else ""
+            lines.append(
+                f"- **{gr['label']}** (`{t_str}`, `+{gr['num_bytes']}B`, `{gr['num_segments']} segs`{eot_str}): "
+                f"`{p_disp}`**`{g_disp}`**"
+            )
+    else:
+        lines.append("- *Stage 1 (Autoencoder) skips free-running generation; active from Stage 2+.*")
     lines.append("")
 
     markdown = "\n".join(lines)

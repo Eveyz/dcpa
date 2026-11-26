@@ -195,3 +195,85 @@ def test_autotune_cli_dry_run_and_micro_cpu_trial(tmp_path: Path) -> None:
     assert report["best"]["status"] == "ok"
     assert report["best"]["steady_steps_measured"] == 2
     assert "--micro-batch-bytes 256" in report["recommended_extra_train_args"]
+
+
+def test_visual_probe_section5_free_running_generation(tmp_path: Path) -> None:
+    import torch
+    from dcpa.config import DCPAConfig
+    from dcpa.model import DCPAModel
+    from train.visual_probe import run_visual_probe
+
+    cfg = DCPAConfig(
+        d_s=64,
+        d_concept=128,
+        k_slots=8,
+        d_r=32,
+        d_merge=64,
+        d_h=512,
+        s_active=16,
+        d_l=64,
+        num_experts=4,
+        top_k_experts=2,
+        expert_hidden=128,
+        l_max=2,
+        window_size=32,
+        n_enc_layers=1,
+        n_dec_layers=1,
+        n_heads=4,
+        cort_expert_hidden=96,
+        shared_expert_hidden=128,
+    )
+    model = DCPAModel(cfg)
+    dummy_metrics = {
+        "loss_lang": 1.2,
+        "loss_pc_raw": 0.4,
+        "compression_ratio": 9.5,
+        "c_slow_std_mean": 1.1,
+        "c_slow_std_min": 0.9,
+        "merge_entropy_nats": 3.5,
+        "ponder_skip_rate": 0.1,
+        "avg_ponder_steps": 1.5,
+    }
+
+    # Stage 1 skips free-running generation
+    p1 = run_visual_probe(
+        model,
+        step=500,
+        total_steps=1000,
+        stage_id=1,
+        model_stage="A",
+        tau_s=0.5,
+        tau_m=1.0,
+        lr=1e-3,
+        train_metrics=dummy_metrics,
+        device=torch.device("cpu"),
+        use_bf16=False,
+        kb_per_sec=100.0,
+        max_doc_bytes=512,
+        logs_dir=tmp_path / "logs_s1",
+    )
+    assert "## 5. 真实自由自回归续写样本" in p1.markdown
+    assert "Stage 1 (Autoencoder) skips free-running generation" in p1.markdown
+
+    # Stage 2 emits real closed-loop continuations for EN / ZH / Python / JS
+    p2 = run_visual_probe(
+        model,
+        step=15000,
+        total_steps=100000,
+        stage_id=2,
+        model_stage="B",
+        tau_s=0.3,
+        tau_m=0.9,
+        lr=1e-3,
+        train_metrics=dummy_metrics,
+        device=torch.device("cpu"),
+        use_bf16=False,
+        kb_per_sec=600.0,
+        max_doc_bytes=1024,
+        logs_dir=tmp_path / "logs_s2",
+    )
+    assert "## 5. 真实自由自回归续写样本" in p2.markdown
+    for lbl in ("**EN**", "**ZH**", "**Python**", "**JS**"):
+        assert lbl in p2.markdown
+    assert "PMD 1-Byte Argmax (teacher-forced, NOT free gen)" in p2.markdown
+

@@ -21,10 +21,12 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 import contextlib
+import copy
 import json
 import math
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -147,6 +149,87 @@ def load_yaml_config(config_path: Optional[str | Path]) -> dict[str, Any]:
         raise FileNotFoundError(f"Training config YAML not found: {p}")
     data = yaml.safe_load(p.read_text(encoding="utf-8"))
     return dict(data or {})
+
+
+_SCI_FLOAT_RE = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)[eE][+-]?\d+$")
+
+
+def _parse_override_value(raw_val: str) -> Any:
+    """Parse a `--set key=val` value using YAML semantics plus YAML-1.1 scientific notation (e.g. `3e-4`)."""
+    txt = raw_val.strip()
+    if not txt:
+        return ""
+    val = yaml.safe_load(txt)
+    if isinstance(val, str) and _SCI_FLOAT_RE.match(val):
+        return float(val)
+    return val
+
+
+def apply_config_overrides(
+    cfg_dict: Mapping[str, Any],
+    overrides: Optional[Sequence[str]],
+) -> tuple[dict[str, Any], list[tuple[str, Any, Any]]]:
+    """Apply repeatable `--set key.path=val` overrides onto a deep copy of `cfg_dict`.
+
+    By default, every path segment and leaf key must already exist in `cfg_dict` to catch typos
+    immediately. Prefix a path with `+` (e.g. `+hardware.custom_flag=true`) to allow inserting
+    a brand-new key.
+    """
+    out = copy.deepcopy(dict(cfg_dict))
+    applied: list[tuple[str, Any, Any]] = []
+    if not overrides:
+        return out, applied
+
+    for raw_expr in overrides:
+        expr = str(raw_expr).strip()
+        if not expr:
+            continue
+        if "=" not in expr:
+            raise ValueError(f"Invalid --set override {raw_expr!r}: expected 'key.path=value'")
+        raw_path, raw_val = expr.split("=", 1)
+        path_str = raw_path.strip()
+        allow_create = path_str.startswith("+")
+        if allow_create:
+            path_str = path_str[1:].strip()
+        parts = [p.strip() for p in path_str.split(".") if p.strip()]
+        if not parts:
+            raise ValueError(f"Invalid --set override {raw_expr!r}: empty key path")
+
+        cur: Any = out
+        traversed: list[str] = []
+        for seg in parts[:-1]:
+            if not isinstance(cur, dict):
+                raise ValueError(
+                    f"Cannot traverse --set {path_str!r}: {'.'.join(traversed)!r} is not a mapping"
+                )
+            if seg not in cur:
+                if allow_create:
+                    cur[seg] = {}
+                else:
+                    avail = ", ".join(sorted(str(k) for k in cur.keys()))
+                    raise KeyError(
+                        f"Unknown config section {'.'.join(traversed + [seg])!r} in --set {raw_expr!r} "
+                        f"(available keys: {avail}; prefix with '+' to create a new key)"
+                    )
+            cur = cur[seg]
+            traversed.append(seg)
+
+        leaf = parts[-1]
+        if not isinstance(cur, dict):
+            raise ValueError(
+                f"Cannot set {path_str!r}: parent {'.'.join(traversed)!r} is not a mapping"
+            )
+        if leaf not in cur and not allow_create and bool(out):
+            avail = ", ".join(sorted(str(k) for k in cur.keys()))
+            raise KeyError(
+                f"Unknown config key {path_str!r} in --set {raw_expr!r} "
+                f"(available keys: {avail}; prefix with '+' to create a new key)"
+            )
+        old_val = cur.get(leaf, None)
+        new_val = _parse_override_value(raw_val)
+        cur[leaf] = new_val
+        applied.append((path_str, old_val, new_val))
+    return out, applied
 
 
 def build_dcpa_config(preset: str, yaml_cfg: Mapping[str, Any]) -> DCPAConfig:
@@ -800,6 +883,11 @@ def run_training(
     stream_carry: Optional[bool] = None,
     stream_chunk_bytes: Optional[int] = None,
     bcg_cudagraphs: Optional[bool] = None,
+    bcg_ckpt_watermark_gb: Optional[float] = None,
+    bcg_chunk_steps: Optional[int] = None,
+    bcg_tbptt_window: Optional[int] = None,
+    lr_scale: Optional[float] = None,
+    config_overrides: Optional[Sequence[str]] = None,
     use_wandb: Optional[bool] = None,
     wandb_project: Optional[str] = None,
     wandb_entity: Optional[str] = None,
@@ -820,7 +908,8 @@ def run_training(
         if is_primary:
             print(*args, **kwargs)
 
-    yaml_cfg = load_yaml_config(config_path) if config_path is not None else {}
+    yaml_cfg_raw = load_yaml_config(config_path) if config_path is not None else {}
+    yaml_cfg, applied_overrides = apply_config_overrides(yaml_cfg_raw, config_overrides)
     hw_cfg = dict(yaml_cfg.get("hardware", {}))
     opt_cfg = dict(yaml_cfg.get("optimizer", {}))
     curr_cfg = dict(yaml_cfg.get("curriculum", {}))
@@ -902,6 +991,8 @@ def run_training(
                 ),
                 flush=True,
             )
+        for ov_path, ov_old, ov_new in applied_overrides:
+            _r0_print(f"[Override] --set {ov_path}: {ov_old!r} -> {ov_new!r}", flush=True)
         # Hardware detection & GPU profile resolution (auto-detects T4/L4/A100/H100/G4 or honors `--gpu-profile`)
         eff_stream_carry_pref = bool(hw_cfg.get("stream_carry", True)) if stream_carry is None else bool(stream_carry)
         yaml_per_gpu_bytes = hw_cfg.get("per_gpu_tokens_bytes_per_step")
@@ -1061,6 +1152,22 @@ def run_training(
             cfg.lr_micro *= lr_batch_scale
             cfg.lr_concept *= lr_batch_scale
             cfg.lr_scalar_gate *= lr_batch_scale
+        eff_user_lr_scale = float(lr_scale) if lr_scale is not None else 1.0
+        if eff_user_lr_scale <= 0.0:
+            raise ValueError(f"--lr-scale must be > 0, got {eff_user_lr_scale}")
+        if eff_user_lr_scale != 1.0:
+            u_groups: dict[str, dict[str, Any]] = {}
+            for g_name, g_vals in dict(opt_cfg.get("groups", {})).items():
+                gd = dict(g_vals)
+                if "lr" in gd:
+                    gd["lr"] = float(gd["lr"]) * eff_user_lr_scale
+                u_groups[g_name] = gd
+            if u_groups:
+                opt_cfg = dict(opt_cfg)
+                opt_cfg["groups"] = u_groups
+            cfg.lr_micro *= eff_user_lr_scale
+            cfg.lr_concept *= eff_user_lr_scale
+            cfg.lr_scalar_gate *= eff_user_lr_scale
         model = DCPAModel(cfg).to(device)
         broadcast_model_state(model, dist_ctx)
         if dist_ctx.is_distributed:
@@ -1078,22 +1185,37 @@ def run_training(
                 safe_cap_wm = round(0.65 * profile.vram_gb, 1)
             else:
                 safe_cap_wm = 0.0
-            spec_wm = float(gpu_spec.bcg_ckpt_watermark_gb)
-            yaml_wm = float(hw_cfg.get("bcg_checkpoint_vram_watermark_gb", spec_wm))
-            if spec_wm <= 0.0 or safe_cap_wm <= 0.0:
-                model.bcg_checkpoint_vram_watermark_gb = 0.0
-            elif gpu_profile_explicit:
-                model.bcg_checkpoint_vram_watermark_gb = min(spec_wm, safe_cap_wm)
+            if bcg_ckpt_watermark_gb is not None:
+                req_wm = max(0.0, float(bcg_ckpt_watermark_gb))
+                if profile.vram_gb > 0.0 and req_wm > 0.85 * profile.vram_gb:
+                    _r0_print(
+                        f"[Hardware][WARN] --bcg-ckpt-watermark-gb={req_wm:.1f} exceeds 85% of detected "
+                        f"{profile.vram_gb:.1f} GB VRAM; OOM risk is elevated.",
+                        flush=True,
+                    )
+                model.bcg_checkpoint_vram_watermark_gb = req_wm
             else:
-                eff_wm = min(yaml_wm, spec_wm) if yaml_wm > 0.0 else spec_wm
-                model.bcg_checkpoint_vram_watermark_gb = min(eff_wm, safe_cap_wm)
+                spec_wm = float(gpu_spec.bcg_ckpt_watermark_gb)
+                yaml_wm = float(hw_cfg.get("bcg_checkpoint_vram_watermark_gb", spec_wm))
+                if spec_wm <= 0.0 or safe_cap_wm <= 0.0:
+                    model.bcg_checkpoint_vram_watermark_gb = 0.0
+                elif gpu_profile_explicit:
+                    model.bcg_checkpoint_vram_watermark_gb = min(spec_wm, safe_cap_wm)
+                else:
+                    eff_wm = min(yaml_wm, spec_wm) if yaml_wm > 0.0 else spec_wm
+                    model.bcg_checkpoint_vram_watermark_gb = min(eff_wm, safe_cap_wm)
 
-        yaml_bcg_chunk = int(hw_cfg.get("bcg_chunk_steps", cfg.clause_chunk_size))
+        yaml_bcg_chunk = int(
+            bcg_chunk_steps if bcg_chunk_steps is not None else hw_cfg.get("bcg_chunk_steps", cfg.clause_chunk_size)
+        )
         model.bcg_chunk_steps = max(
             1,
-            yaml_bcg_chunk if device.type == "cuda" else min(yaml_bcg_chunk, 2),
+            yaml_bcg_chunk if (device.type == "cuda" or bcg_chunk_steps is not None) else min(yaml_bcg_chunk, 2),
         )
-        model.bcg_tbptt_window = max(0, int(hw_cfg.get("bcg_tbptt_window", 0)))
+        model.bcg_tbptt_window = max(
+            0,
+            int(bcg_tbptt_window if bcg_tbptt_window is not None else hw_cfg.get("bcg_tbptt_window", 0)),
+        )
         raw_tbptt_replay = hw_cfg.get("bcg_tbptt_replay", False)
         if device.type == "cuda" and (
             gpu_profile_explicit or (isinstance(raw_tbptt_replay, str) and raw_tbptt_replay.strip().lower() == "auto")
@@ -2016,6 +2138,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="CUDA: capture the static-shape BCG-PC clause-chunk kernel with CUDA Graphs (reduce-overhead).",
     )
     ap.add_argument("--no-bcg-cudagraphs", dest="bcg_cudagraphs", action="store_false")
+    ap.add_argument(
+        "--bcg-ckpt-watermark-gb",
+        type=float,
+        default=None,
+        help="Override VRAM watermark (GB) above which BCG chunk checkpointing engages (0.0 = always checkpoint).",
+    )
+    ap.add_argument(
+        "--bcg-chunk-steps",
+        type=int,
+        default=None,
+        help="Override BCG-PC static clause-chunk unroll length (e.g. 4, 8, 16, 32).",
+    )
+    ap.add_argument(
+        "--bcg-tbptt-window",
+        type=int,
+        default=None,
+        help="Override BCG-PC truncated BPTT window length (0 = disabled).",
+    )
+    ap.add_argument(
+        "--lr-scale",
+        type=float,
+        default=None,
+        help="Global multiplicative LR scale applied across all optimizer parameter groups (e.g. 0.5, 0.8, 1.2).",
+    )
+    ap.add_argument(
+        "--set",
+        dest="config_overrides",
+        action="append",
+        default=[],
+        metavar="KEY.PATH=VAL",
+        help="Repeatable dot-path YAML override (e.g. --set hardware.prefetch_workers=4 --set curriculum.stage2.lambda_act_target=0.02). Prefix with '+' to insert a new key.",
+    )
     ap.add_argument("--data-dir", type=str, default="artifacts/data")
     ap.add_argument("--cap-data-dir", type=str, default=None, help="Optional Stage 3 capability shards dir (cap_reasoning/writing)")
     ap.add_argument("--ckpt-dir", type=str, default=None)
@@ -2127,6 +2281,11 @@ def main() -> None:
             stream_carry=args.stream_carry,
             stream_chunk_bytes=args.stream_chunk_bytes,
             bcg_cudagraphs=args.bcg_cudagraphs,
+            bcg_ckpt_watermark_gb=args.bcg_ckpt_watermark_gb,
+            bcg_chunk_steps=args.bcg_chunk_steps,
+            bcg_tbptt_window=args.bcg_tbptt_window,
+            lr_scale=args.lr_scale,
+            config_overrides=args.config_overrides,
             use_wandb=args.use_wandb,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,

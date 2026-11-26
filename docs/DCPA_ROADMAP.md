@@ -208,7 +208,42 @@ flowchart TD
 | **Phase 5** | **工程实战** | Python / JS / SQL 工程代码、AST 规范、反模式重构、调试与长文多稿写作（45% 能力炼金） | Phase 1–4 全科防遗忘 | 解冻 `Broca CQ`（将算法与逻辑落地为工程代码） |
 | **Phase 6** | **社会实践（在线学习）** | 海马体现场绑定新公理/新 SDK + v3 原生 `Episodic Memory Lookup` 翻书 + Stage 5 对话/工具 SFT | 反误写常规回放 | `Hippocampus + Episodic Lookup + Sleep Daemon`（终身学习体） |
 
+#### Phase 1 – 6 实操数据源清单（Hugging Face / 开源教材仓）
+
+| 阶段 | 英文主力数据源（开源可流式拉取） | 中文主力数据源 | 说明 |
+| :--- | :--- | :--- | :--- |
+| **Phase 1 小学启蒙** | `roneneldan/TinyStories`、`HuggingFaceTB/cosmopedia`（`stories`）、`storytracer/US-PD-Books`、`openai/gsm8k`、5% `HuggingFaceTB/smollm-corpus`（`python-edu` 短函数） | `adam89/TinyStoriesChinese`、`opencsg/Fineweb-Edu-Chinese-V2.1`（短篇清晰科普/散文筛选） | 立住双语句法与基础算术，5% 极简符号供 `SGSC` 启蒙 |
+| **Phase 2 初中思维** | `tasksource/folio`、`ProofWriter`、`LogiQA`、`HuggingFaceTB/cosmopedia`（`khanacademy`）、`HuggingFaceTB/finemath`（`finemath-4plus`）、`cosmopedia-v2` | `opencsg/Fineweb-Edu-Chinese-V3`（高分说明文与初高中数学逻辑分拣） | 逻辑推理 + 数学证明 + 清晰说明文 |
+| **Phase 3 高中理科** | `HuggingFaceTB/openstax_paragraphs`、`crumb/openstax-text`、`HuggingFaceTB/cosmopedia`（`openstax`）、`nvidia/Nemotron-Science-v1` / `Nemotron-SFT-Science-v2`、`HuggingFaceFW/fineweb-edu`（`int_score>=4` 理科筛出） | `opencsg/Fineweb-Edu-Chinese-V2.1/V3`（4–5 分桶按物理/化学/生物术语与公式密度分拣）+ 中文维基科学精选 | 真实 OpenStax 教材 + NVIDIA 科学机制推演 |
+| **Phase 4 大学 CS 理论** | `nvidia/Nemotron-Pretraining-Specialized-v1.1`（`Code-Concepts`，含 `algorithms.*`/`data-structures.*` 精确标签）、`open-phi/programming_books_llama`、`SciPhi/textbooks-are-all-you-need-lite`、`nvidia/Nemotron-CC-Math-v1` | `Fineweb-Edu-Chinese-V3`（算法/数据结构/离散数学分拣）+ 浅克隆 MIT/CC 开源算法教材仓（如 `krahets/hello-algo`、`OI-wiki/OI-wiki`） | 先懂数据结构、算法复杂度与离散数学，再写工程代码 |
+| **Phase 5 工程实战** | `tokyotech-llm/swallow-code-v2`、`b-mc2/sql-create-context` + CTE Schema、ES6+ 模块化 JS + 顶级开源工程仓、仓库自带 `data/build_cap_*.py` 520 MB 能力炼金 | 中文工程文档 + `build_cap_writing.py` 逆向提纲与反塑料文风炼金 | 完整复用现有 v2 AST 门控与能力炼金管线 |
+| **Phase 6 在线学习 & SFT** | `data/wug_generator.py`（World-Bible / 临时公理 / 陌生 SDK）、`data/build_sft_stage5.py`、新增 `100 KB` 合成大海捞针翻书样本 | 同左（中英双语） | 激活海马体快权重 + v3 翻书查找 + 工具调用 |
+
 #### TODO 实施拆解
 * [ ] **语料采集与分级标签体系（`data/build_corpus_v3_k12.py`）**：在 `.idx` 的 `source_id` 中扩充 `phase_tier ∈ {1..5}` 与学科域标签（新增自然科学 `science: physics/chem/bio` 与计算机理论 `cs_theory: algo/ds/discrete_math` 语料源，优先筛选 OpenStax / FineWeb-Edu 教科书级高分样本）。
 * [ ] **螺旋课程调度器（`train/curriculum_state_machine.py`）**：支持 `5–6` 阶段可配置边界与按阶段动态切换 `phase_tier` 滚雪球采样权重。
 * [ ] **同台基线对照实验（Benchmark Gate）**：在 `moe_210m` / `moe_650m` 上分别对比「混训 vs K-12→大学螺旋课程」以及「DCPA vs 同算力标准 Transformer」的各科 Val BPC 与推理准确率。
+
+---
+
+### 3.2 可插拔专家生态（Pluggable MoE / Expert Plugin Architecture）`[TODO]`
+
+> **愿景（“Expert App Store”）**：冻结 DCPA Base（慢皮层共享基座 + 原生 32 路由专家），允许任何社区开发者在消费级显卡/Mac 上仅用自有垂直领域数据训练 **1–4 个轻量化新专家插件（`*.dcpa_expert.safetensors`）** 并自由分享；终端用户下载 Base 后，可按需同时热挂载任意多个社区专家（如 Rust 专家 + 法律专家 + 金融专家 + 医学专家），**零重训即插即用，且因为 Top-K 稀疏激活，挂载数十个专家推理速度几乎零下降！**
+
+#### 为什么 DCPA-Turbo 天生适合 Pluggable MoE？
+* `Cortical`（`SharedAndRoutedMoE`）与 `BCG-PC`（`SparseMicroMoE`）的路由专家均为完全独立的 3D 切片（`w_gu[e]`, `w_d[e]`, `router.weight[e]`），且通用语言底色已沉淀在常驻 `Shared Expert` 中。
+* **体积极度轻量化**：在 `moe_210m` 下，**1 个完整跨层专家插件仅约 `~5.9M` 参数**（BF16 仅 `~11.8 MB`，Q4 量化仅 `~3.5 MB`），单卡 T4 / L4 / Mac 几十分钟即可训完一个高质量垂直领域专家，文件体积极易分发且完全不泄露 Base 权重。
+
+#### 必须解决的三大工程关键点
+1. **防路由劫持（Cosine Router + 温度校准）**：
+   * 不同开发者独立训练的插件 `router` 向量范数不同，直接拼接易导致某个插件抢占全部路由分数（Router Hijacking）。
+   * **解法**：插件路由键统一采用 **L2 归一化 Cosine Similarity**（`cos(norm(x), norm(k_plugin)) * scale + bias`）并配阈值/边际约束，保证仅当输入语义真正命中该插件领域时才被选中，对非本领域输入保持零干扰。
+2. **多插件无痛叠加（Zero-Init Plugin Gate + 隔离混合）**：
+   * 为每个挂载插件配备独立的零初始化残差缩放门控 `alpha_plugin`（训练起始等价于纯 Base，100% 不破坏原能力），推理期支持 `Base Top-2 + Plugin Top-1` 残差融合或显式插件权重调节（如 `--plugin rust.safetensors:0.9 --plugin legal.safetensors:1.0`）。
+3. **统一插件文件契约（`*.dcpa_expert.safetensors` + `plugin_manifest.json`）**：
+   * 仅存储新增专家的 `(router_keys, w_gu, w_d, alpha_plugin)` 张量 + `base_arch_hash`（校验 `d_concept / expert_hidden / n_layers` 匹配性），支持 Python 引擎与 Rust `dcpa-core-rs` 启动时动态拼接加载（`E_total = E_base + sum(E_plugins)`）。
+
+#### TODO 实施拆解
+* [ ] **训练脚手架（`train/train_expert_plugin.py`）**：加载冻结 Base，按 `--num-plugin-experts K` 挂载可训练专家切片 + Cosine Router 键，支持在垂直领域数据上低成本单卡训练并导出纯插件 `.safetensors`（~12 MB/专家）。
+* [ ] **热插拔推理挂载器（`dcpa/plugin_loader.py` + `dcpa-core-rs`）**：实现多插件校验、动态张量拼接、Cosine 路由隔离及按需启用/禁用开关。
+* [ ] **零退化与多插件组合验收测试**：验证单插件垂直领域 BPC 显著下降、非目标领域 BPC 退化 `< 0.5%`、以及同时挂载 3 个不同领域插件无互相干扰。

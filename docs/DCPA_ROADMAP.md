@@ -219,8 +219,18 @@ flowchart TD
 | **Phase 5 工程实战** | `tokyotech-llm/swallow-code-v2`、`b-mc2/sql-create-context` + CTE Schema、ES6+ 模块化 JS + 顶级开源工程仓、仓库自带 `data/build_cap_*.py` 520 MB 能力炼金 | 中文工程文档 + `build_cap_writing.py` 逆向提纲与反塑料文风炼金 | 完整复用现有 v2 AST 门控与能力炼金管线 |
 | **Phase 6 在线学习 & SFT** | `data/wug_generator.py`（World-Bible / 临时公理 / 陌生 SDK）、`data/build_sft_stage5.py`、新增 `100 KB` 合成大海捞针翻书样本 | 同左（中英双语） | 激活海马体快权重 + v3 翻书查找 + 工具调用 |
 
+#### 大模型教材蒸馏管线（「种子改写 + 沙箱验真」补齐稀缺学科）
+针对中文 K-12 理化生教材、中文大学数据结构/算法精讲、以及 v3 专属数据（`100 KB` 大海捞针翻书样本、Pluggable MoE 垂直专家语料），引入与现有 v2 数据底座无缝衔接的合成教材管线（`data/build_distill_textbooks.py`）：
+1. **真实种子抽取（Seed-Conditioned，严禁裸生成）**：直接复用现有语料池作为事实种子——从 `Fineweb-Edu-Chinese-V2.1/V3`（4–5 分教育桶）、`OpenStax`、`FineMath-4plus`、`Hello-Algo / OI-Wiki` 与 `swallow-code-v2` 抽取真实知识点/定理/题干，按笛卡尔网格随机指定 `(phase_tier ∈ 1..5, style_id ∈ 0..4, 教学体裁 ∈ {概念拆解, 常见误区反例, 分步推导, 对比总结})` 进行结构化重写。
+2. **反塑料文风与格式硬清洗**：全量复用 `data/cognitive_v2_sources.py` 的 `_clean_nfc` 与 `_CLICHE_BLACKLIST_RE`（零“总而言之/值得注意的是/delve into”等 AI 套话），并保留 `\x1dS..\x1dE` 慢思考草稿帧与监督 `loss_mask`（仅对干净推导/最终解答计损失）。
+3. **程序化沙箱硬验真（零老师幻觉污染）**：
+   * **数据结构与代码教材（Phase 4–5）**：强制通过 `tree-sitter` AST 语法/反模式门控 + Python/Node 隔离沙箱实跑单元测试，未通过直接丢弃；
+   * **数学与理化生计算（Phase 1–3）**：优先从带标准答案的真题/教科书例题种子出发，并用 Python / SymPy 脚本验算最终数值与量纲守恒，不一致即剔除。
+4. **防模型坍塌混配比例**：全课程严格保持 **50–70% 真实人类精品语料 + 30–50% 种子蒸馏教材**，兼顾词汇分布广度与教科书级教学梯度；支持 Batch API（Gemini Flash / DeepSeek / Qwen）或单卡 G4 本地开源模型批量离线蒸馏。
+
 #### TODO 实施拆解
 * [ ] **语料采集与分级标签体系（`data/build_corpus_v3_k12.py`）**：在 `.idx` 的 `source_id` 中扩充 `phase_tier ∈ {1..5}` 与学科域标签（新增自然科学 `science: physics/chem/bio` 与计算机理论 `cs_theory: algo/ds/discrete_math` 语料源，优先筛选 OpenStax / FineWeb-Edu 教科书级高分样本）。
+* [ ] **种子改写 + 沙箱验真蒸馏脚本（`data/build_distill_textbooks.py`）**：支持从现有 v2/v3 真实种子批量生成分龄中英理化生与算法教材，内置 `_CLICHE_BLACKLIST_RE` 清洗、`tree-sitter` + 沙箱单测验真、SymPy 验算及 `.bin/.idx/.loss_mask.bin` 直出。
 * [ ] **螺旋课程调度器（`train/curriculum_state_machine.py`）**：支持 `5–6` 阶段可配置边界与按阶段动态切换 `phase_tier` 滚雪球采样权重。
 * [ ] **同台基线对照实验（Benchmark Gate）**：在 `moe_210m` / `moe_650m` 上分别对比「混训 vs K-12→大学螺旋课程」以及「DCPA vs 同算力标准 Transformer」的各科 Val BPC 与推理准确率。
 

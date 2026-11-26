@@ -85,6 +85,7 @@ from train.watchdog_and_ckpt import (
 )
 from utils.device import (
     DEFAULT_PROD_STEP_BYTES,
+    HardwareProfile,
     amp_autocast,
     capture_rng_state,
     configure_cuda_tf32,
@@ -93,6 +94,7 @@ from utils.device import (
     get_peak_memory_gb,
     pin_batch_if_cuda,
     reset_peak_memory_stats,
+    resolve_gpu_profile,
     restore_rng_state,
     seed_everything,
     synchronize,
@@ -782,6 +784,7 @@ def run_training(
     heartbeat_seconds: float = 60.0,
     resume: str = "auto",
     device_str: str = "auto",
+    gpu_profile: Optional[str] = None,
     compile_mode: Optional[str] = None,
     allow_cpu_compile: bool = False,
     deterministic: bool = False,
@@ -899,7 +902,8 @@ def run_training(
                 ),
                 flush=True,
             )
-        # Hardware detection & auto grad-accum sharding (1 GPU <-> N GPUs unified!)
+        # Hardware detection & GPU profile resolution (auto-detects T4/L4/A100/H100/G4 or honors `--gpu-profile`)
+        eff_stream_carry_pref = bool(hw_cfg.get("stream_carry", True)) if stream_carry is None else bool(stream_carry)
         yaml_per_gpu_bytes = hw_cfg.get("per_gpu_tokens_bytes_per_step")
         yaml_target_bytes = hw_cfg.get("target_tokens_bytes_per_step")
         cuda_target_active = (
@@ -912,9 +916,7 @@ def run_training(
         if target_tokens_bytes_per_step is not None:
             explicit_target_bytes = int(target_tokens_bytes_per_step)
         elif yaml_per_gpu_bytes is not None and cuda_target_active and not eff_fixed_global:
-            explicit_target_bytes = (
-                int(yaml_per_gpu_bytes) if int(yaml_per_gpu_bytes) != DEFAULT_PROD_STEP_BYTES else None
-            )
+            explicit_target_bytes = int(yaml_per_gpu_bytes)
         elif (
             yaml_target_bytes is not None
             and int(yaml_target_bytes) != DEFAULT_PROD_STEP_BYTES
@@ -924,54 +926,92 @@ def run_training(
         else:
             explicit_target_bytes = None
 
-        profile = detect_hardware_profile(
+        raw_profile = detect_hardware_profile(
             preferred=device_str,
             deterministic=deterministic,
             target_tokens_bytes_per_step=explicit_target_bytes,
         )
-        device = profile.device
+        gpu_spec, gpu_profile_explicit = resolve_gpu_profile(
+            gpu_profile,
+            raw_profile,
+            stream_carry=eff_stream_carry_pref,
+        )
+        device = raw_profile.device
+        if (
+            gpu_profile_explicit
+            and device.type == "cuda"
+            and raw_profile.vram_gb > 0.0
+            and raw_profile.vram_gb + 2.0 < gpu_spec.min_recommended_vram_gb
+        ):
+            _r0_print(
+                f"[Hardware][WARN] --gpu-profile={gpu_spec.name} expects >={gpu_spec.min_recommended_vram_gb:.0f} GB VRAM, "
+                f"but detected {raw_profile.device_name} ({raw_profile.vram_gb:.1f} GB). "
+                "Clamping BCG checkpoint watermark safely to avoid OOM.",
+                flush=True,
+            )
+
+        # Effective target bytes: CLI > explicit --gpu-profile > YAML per_gpu/target > profile default
+        if target_tokens_bytes_per_step is not None:
+            eff_target_bytes = int(target_tokens_bytes_per_step)
+        elif gpu_profile_explicit and device.type == "cuda":
+            eff_target_bytes = int(gpu_spec.target_tokens_bytes_per_step)
+        elif explicit_target_bytes is not None:
+            eff_target_bytes = int(explicit_target_bytes)
+        elif device.type == "cuda":
+            eff_target_bytes = int(gpu_spec.target_tokens_bytes_per_step)
+        else:
+            eff_target_bytes = int(raw_profile.target_tokens_bytes_per_step)
+
+        profile_micro_bytes = int(gpu_spec.micro_batch_bytes) if device.type == "cuda" else int(raw_profile.micro_batch_bytes)
+        profile_tier = gpu_spec.tier if (device.type == "cuda" or gpu_profile_explicit) else raw_profile.tier
         allow_tf32 = False if deterministic else bool(hw_cfg.get("allow_tf32", True))
         configure_cuda_tf32(device, allow=allow_tf32)
         reset_peak_memory_stats(device)
 
-        use_bf16 = bool(profile.use_bf16 and hw_cfg.get("bf16_autocast", True) and not deterministic)
+        use_bf16 = bool(raw_profile.use_bf16 and hw_cfg.get("bf16_autocast", True) and not deterministic)
         if hw_cfg.get("use_grad_scaler", False):
             raise ValueError("Red Line #1 violation: GradScaler is strictly forbidden with bfloat16!")
 
-        eff_target_bytes = (
-            int(target_tokens_bytes_per_step)
-            if target_tokens_bytes_per_step is not None
-            else int(profile.target_tokens_bytes_per_step)
-        )
         if dist_ctx.is_distributed:
             if (
                 eff_fixed_global
                 or (
                     target_tokens_bytes_per_step is not None
-                    and eff_target_bytes >= int(profile.micro_batch_bytes) * dist_ctx.world_size
+                    and eff_target_bytes >= profile_micro_bytes * dist_ctx.world_size
                 )
                 or (
                     yaml_per_gpu_bytes is None
-                    and eff_target_bytes >= int(profile.micro_batch_bytes) * dist_ctx.world_size
+                    and eff_target_bytes >= profile_micro_bytes * dist_ctx.world_size
                 )
             ):
                 # Partition target global byte budget evenly across ranks (zero GPU starvation when >= W * micro!)
                 per_rank_target = max(64, math.ceil(eff_target_bytes / dist_ctx.world_size))
             else:
                 # Per-GPU throughput scaling: each GPU runs its full per-GPU step budget (131 KB x W GPUs!)
-                per_rank_target = max(int(profile.micro_batch_bytes), eff_target_bytes)
+                per_rank_target = max(profile_micro_bytes, eff_target_bytes)
         else:
             per_rank_target = eff_target_bytes
 
         eff_micro_bytes = (
             int(micro_batch_bytes)
             if micro_batch_bytes is not None
-            else min(int(profile.micro_batch_bytes), per_rank_target)
+            else min(profile_micro_bytes, per_rank_target)
         )
         eff_micro_bytes = max(64, eff_micro_bytes)
         grad_accum_steps = max(1, math.ceil(per_rank_target / eff_micro_bytes))
         per_rank_step_bytes = eff_micro_bytes * grad_accum_steps
         actual_step_bytes = per_rank_step_bytes * dist_ctx.world_size
+        profile = HardwareProfile(
+            device_type=raw_profile.device_type,
+            device_name=raw_profile.device_name,
+            vram_gb=raw_profile.vram_gb,
+            tier=profile_tier,
+            micro_batch_bytes=eff_micro_bytes,
+            grad_accum_steps=grad_accum_steps,
+            target_tokens_bytes_per_step=per_rank_target,
+            use_bf16=use_bf16,
+            device_index=raw_profile.device_index,
+        )
 
         # Bidirectional sqrt-batch LR scaling across 1..N GPUs relative to `lr_reference_bytes`
         eff_auto_lr = bool(auto_lr_scale and hw_cfg.get("auto_lr_scale_multi_gpu", True) and not eff_fixed_global)
@@ -1027,23 +1067,26 @@ def run_training(
             # Decorrelate per-rank Gumbel exploration noise while keeping model weights bit-identical!
             reseed_all_rngs(seed + dist_ctx.rank * 104729, device=device)
 
-        if device.type == "cuda" and profile.vram_gb >= 30.0:
-            # Tier-aware VRAM watermark:
-            #   - >=88GB (95GB Blackwell / 96-141GB H200): 74GB watermark (~78% cap -> 21GB headroom,
-            #     eliminating 100% of checkpoint recomputation overhead on 48M-210M long-doc batches!).
-            #   - 75-87GB (80GB A100/H100): 60GB watermark (~76% cap).
-            #   - 30-74GB (32GB RTX 5090 / 40GB A100 / 48GB L40S): clamped to <=0.65*VRAM (~20.8GB on 5090).
+        if device.type == "cuda":
+            # GPU-profile-aware VRAM watermark (enables zero-recompute + A2 CUDA Graphs on L4/4090/5090/A100/H100/G4,
+            # while always clamping safely against actual physical VRAM so a mismatched --gpu-profile cannot OOM):
             if profile.vram_gb >= 88.0:
-                default_wm = 70.0 if cfg.num_experts >= 32 else 74.0
                 safe_cap_wm = round(0.78 * profile.vram_gb, 1)
             elif profile.vram_gb >= 75.0:
-                default_wm = 56.0 if cfg.num_experts >= 32 else 60.0
                 safe_cap_wm = round(0.76 * profile.vram_gb, 1)
-            else:
-                default_wm = round(0.62 * profile.vram_gb, 1)
+            elif profile.vram_gb >= 20.0:
                 safe_cap_wm = round(0.65 * profile.vram_gb, 1)
-            yaml_wm = float(hw_cfg.get("bcg_checkpoint_vram_watermark_gb", default_wm))
-            model.bcg_checkpoint_vram_watermark_gb = min(yaml_wm, safe_cap_wm) if yaml_wm > 0.0 else default_wm
+            else:
+                safe_cap_wm = 0.0
+            spec_wm = float(gpu_spec.bcg_ckpt_watermark_gb)
+            yaml_wm = float(hw_cfg.get("bcg_checkpoint_vram_watermark_gb", spec_wm))
+            if spec_wm <= 0.0 or safe_cap_wm <= 0.0:
+                model.bcg_checkpoint_vram_watermark_gb = 0.0
+            elif gpu_profile_explicit:
+                model.bcg_checkpoint_vram_watermark_gb = min(spec_wm, safe_cap_wm)
+            else:
+                eff_wm = min(yaml_wm, spec_wm) if yaml_wm > 0.0 else spec_wm
+                model.bcg_checkpoint_vram_watermark_gb = min(eff_wm, safe_cap_wm)
 
         yaml_bcg_chunk = int(hw_cfg.get("bcg_chunk_steps", cfg.clause_chunk_size))
         model.bcg_chunk_steps = max(
@@ -1052,17 +1095,10 @@ def run_training(
         )
         model.bcg_tbptt_window = max(0, int(hw_cfg.get("bcg_tbptt_window", 0)))
         raw_tbptt_replay = hw_cfg.get("bcg_tbptt_replay", False)
-        if isinstance(raw_tbptt_replay, str) and raw_tbptt_replay.strip().lower() == "auto":
-            # Auto-engage O(W)-VRAM windowed replay ONLY on tight <=28GB GPUs (24GB 4090/L4) with >=100M
-            # models where 1-pass cannot fit; >=30GB GPUs (RTX 5090 32GB / A100 / H100 / Blackwell 96GB)
-            # run faster 1-pass `bcg_chunk` + clamped VRAM watermark + TBPTT!
-            total_params = int(model.count_parameters()["total"])
-            model.bcg_tbptt_replay = bool(
-                device.type == "cuda"
-                and profile.vram_gb < 28.0
-                and total_params >= 100_000_000
-                and model.bcg_tbptt_window > 0
-            )
+        if device.type == "cuda" and (
+            gpu_profile_explicit or (isinstance(raw_tbptt_replay, str) and raw_tbptt_replay.strip().lower() == "auto")
+        ):
+            model.bcg_tbptt_replay = bool(gpu_spec.bcg_tbptt_replay and model.bcg_tbptt_window > 0)
         else:
             model.bcg_tbptt_replay = bool(raw_tbptt_replay) and model.bcg_tbptt_window > 0
         optimizer = create_dcpa_optimizer(model, optimizer_cfg=opt_cfg)
@@ -1077,7 +1113,8 @@ def run_training(
                 flush=True,
             )
         _r0_print(
-            f"[Plan] preset={eff_preset} | total_steps={eff_total_steps:,} | "
+            f"[Plan] preset={eff_preset} | gpu_profile={gpu_spec.name} ({'explicit' if gpu_profile_explicit else 'auto'}) | "
+            f"total_steps={eff_total_steps:,} | "
             f"boundaries={list(eff_boundaries)} | micro_batch_bytes={eff_micro_bytes:,} | "
             f"grad_accum_steps={grad_accum_steps} | effective_bytes_per_step={actual_step_bytes:,} | "
             f"bf16={use_bf16} | grad_scaler=False | "
@@ -1093,7 +1130,12 @@ def run_training(
             if compile_mode is not None
             else str(hw_cfg.get("compile_mode", "none"))
         )
-        eff_bcg_cudagraphs = bool(hw_cfg.get("bcg_cudagraphs", True)) if bcg_cudagraphs is None else bool(bcg_cudagraphs)
+        if bcg_cudagraphs is not None:
+            eff_bcg_cudagraphs = bool(bcg_cudagraphs)
+        elif device.type == "cuda":
+            eff_bcg_cudagraphs = bool(gpu_spec.bcg_cudagraphs and hw_cfg.get("bcg_cudagraphs", True))
+        else:
+            eff_bcg_cudagraphs = bool(hw_cfg.get("bcg_cudagraphs", True))
         compile_report = configure_model_compile(
             model,
             compile_mode=req_compile_mode,
@@ -1992,6 +2034,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--resume", type=str, default="auto")
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument(
+        "--gpu-profile",
+        type=str,
+        default="auto",
+        help="GPU execution profile: 'auto' (default, auto-detects live GPU), or explicit name: "
+        "t4, l4, 4090, 5090, a100_40g, a100, h100, g4, g4_256k.",
+    )
+    ap.add_argument(
         "--gpus",
         type=str,
         default="auto",
@@ -2065,6 +2114,7 @@ def main() -> None:
             heartbeat_seconds=args.heartbeat_seconds,
             resume=args.resume,
             device_str=args.device,
+            gpu_profile=args.gpu_profile,
             compile_mode=args.compile_mode,
             deterministic=args.deterministic,
             seed=args.seed,

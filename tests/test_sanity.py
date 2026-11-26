@@ -29,6 +29,7 @@ from utils.device import (
     is_cuda_available,
     resolve_micro_batch_plan,
     restore_rng_state,
+    resolve_gpu_profile,
     select_hardware_tier,
 )
 
@@ -518,6 +519,42 @@ def test_device_abstraction_and_four_tier_hardware_contract():
 
     l4 = select_hardware_tier("cuda", vram_gb=24.0, device_name="NVIDIA L4")
     assert (l4.micro_batch_bytes, l4.grad_accum_steps, l4.use_bf16) == (32_768, 4, True)
+
+    # Verify named + auto `--gpu-profile` resolution (L4 stream-carry unlocks 64KBx2 + 14GB watermark + A2 CUDA Graphs;
+    # G4 locks 128KBx1 + 72GB watermark by default for seamless mid-run L4 -> G4 resume, with g4_256k opt-in).
+    l4_auto, l4_exp = resolve_gpu_profile("auto", l4, stream_carry=True)
+    assert (l4_auto.name, l4_exp, l4_auto.micro_batch_bytes, l4_auto.bcg_ckpt_watermark_gb, l4_auto.bcg_cudagraphs) == (
+        "l4",
+        False,
+        65_536,
+        14.0,
+        True,
+    )
+    l4_nocarry, _ = resolve_gpu_profile("auto", l4, stream_carry=False)
+    assert l4_nocarry.micro_batch_bytes == 32_768 and l4_nocarry.bcg_ckpt_watermark_gb == 12.0
+
+    g4_hw = select_hardware_tier("cuda", vram_gb=95.0, device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition")
+    g4_auto, g4_exp = resolve_gpu_profile("auto", g4_hw, stream_carry=True)
+    assert (g4_auto.name, g4_exp, g4_auto.micro_batch_bytes, g4_auto.target_tokens_bytes_per_step, g4_auto.bcg_ckpt_watermark_gb) == (
+        "g4",
+        False,
+        131_072,
+        131_072,
+        72.0,
+    )
+    g4_named, is_exp = resolve_gpu_profile("G4", l4, stream_carry=True)
+    assert (g4_named.name, is_exp, g4_named.micro_batch_bytes, g4_named.bcg_ckpt_watermark_gb) == ("g4", True, 131_072, 72.0)
+    g4_big, _ = resolve_gpu_profile("g4-256k", g4_hw, stream_carry=True)
+    assert (g4_big.name, g4_big.micro_batch_bytes, g4_big.target_tokens_bytes_per_step) == ("g4_256k", 262_144, 262_144)
+    t4_named, _ = resolve_gpu_profile("t4", l4, stream_carry=True)
+    assert (t4_named.name, t4_named.micro_batch_bytes, t4_named.bcg_ckpt_watermark_gb, t4_named.bcg_cudagraphs) == (
+        "t4",
+        16_384,
+        0.0,
+        False,
+    )
+    a100_named, _ = resolve_gpu_profile("a100", l4, stream_carry=True)
+    assert (a100_named.name, a100_named.micro_batch_bytes, a100_named.bcg_ckpt_watermark_gb) == ("a100_80g", 131_072, 58.0)
 
     mps_local = select_hardware_tier("mps", vram_gb=0.0, target_tokens_bytes_per_step=8192)
     assert (mps_local.micro_batch_bytes, mps_local.grad_accum_steps, mps_local.use_bf16) == (8192, 1, False)

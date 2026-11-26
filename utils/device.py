@@ -63,6 +63,231 @@ class HardwareProfile:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class GPUProfileSpec:
+    """Named GPU execution profile (auto-detected or explicitly chosen via `--gpu-profile`)."""
+
+    name: str
+    tier: str
+    micro_batch_bytes: int
+    target_tokens_bytes_per_step: int
+    bcg_ckpt_watermark_gb: float
+    bcg_cudagraphs: bool
+    bcg_tbptt_replay: bool
+    min_recommended_vram_gb: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+# Canonical named GPU profiles tuned for DCPA-Turbo (with A1 Stream Carry enabled by default).
+# All standard profiles lock target_tokens_bytes_per_step=131_072 so resuming mid-run across
+# T4 -> L4 -> A100 -> H100 -> G4 preserves the exact step byte budget & LR schedule.
+GPU_PROFILES: dict[str, GPUProfileSpec] = {
+    "t4": GPUProfileSpec(
+        name="t4",
+        tier="cuda_compact",
+        micro_batch_bytes=16_384,
+        target_tokens_bytes_per_step=DEFAULT_PROD_STEP_BYTES,
+        bcg_ckpt_watermark_gb=0.0,
+        bcg_cudagraphs=False,
+        bcg_tbptt_replay=True,
+        min_recommended_vram_gb=12.0,
+    ),
+    "l4": GPUProfileSpec(
+        name="l4",
+        tier="l4_or_4090",
+        micro_batch_bytes=65_536,
+        target_tokens_bytes_per_step=DEFAULT_PROD_STEP_BYTES,
+        bcg_ckpt_watermark_gb=14.0,
+        bcg_cudagraphs=True,
+        bcg_tbptt_replay=False,
+        min_recommended_vram_gb=20.0,
+    ),
+    "rtx_5090": GPUProfileSpec(
+        name="rtx_5090",
+        tier="rtx_5090_32g",
+        micro_batch_bytes=65_536,
+        target_tokens_bytes_per_step=DEFAULT_PROD_STEP_BYTES,
+        bcg_ckpt_watermark_gb=20.8,
+        bcg_cudagraphs=True,
+        bcg_tbptt_replay=False,
+        min_recommended_vram_gb=28.0,
+    ),
+    "a100_40g": GPUProfileSpec(
+        name="a100_40g",
+        tier="a100_40g",
+        micro_batch_bytes=65_536,
+        target_tokens_bytes_per_step=DEFAULT_PROD_STEP_BYTES,
+        bcg_ckpt_watermark_gb=26.0,
+        bcg_cudagraphs=True,
+        bcg_tbptt_replay=False,
+        min_recommended_vram_gb=36.0,
+    ),
+    "a100_80g": GPUProfileSpec(
+        name="a100_80g",
+        tier="h100_or_a100_80g",
+        micro_batch_bytes=131_072,
+        target_tokens_bytes_per_step=DEFAULT_PROD_STEP_BYTES,
+        bcg_ckpt_watermark_gb=58.0,
+        bcg_cudagraphs=True,
+        bcg_tbptt_replay=False,
+        min_recommended_vram_gb=72.0,
+    ),
+    "h100": GPUProfileSpec(
+        name="h100",
+        tier="h100_or_a100_80g",
+        micro_batch_bytes=131_072,
+        target_tokens_bytes_per_step=DEFAULT_PROD_STEP_BYTES,
+        bcg_ckpt_watermark_gb=58.0,
+        bcg_cudagraphs=True,
+        bcg_tbptt_replay=False,
+        min_recommended_vram_gb=72.0,
+    ),
+    "g4": GPUProfileSpec(
+        name="g4",
+        tier="blackwell_or_h200_96g",
+        micro_batch_bytes=131_072,
+        target_tokens_bytes_per_step=DEFAULT_PROD_STEP_BYTES,
+        bcg_ckpt_watermark_gb=72.0,
+        bcg_cudagraphs=True,
+        bcg_tbptt_replay=False,
+        min_recommended_vram_gb=88.0,
+    ),
+    "g4_256k": GPUProfileSpec(
+        name="g4_256k",
+        tier="blackwell_or_h200_96g",
+        micro_batch_bytes=DEFAULT_BLACKWELL_96G_STEP_BYTES,
+        target_tokens_bytes_per_step=DEFAULT_BLACKWELL_96G_STEP_BYTES,
+        bcg_ckpt_watermark_gb=72.0,
+        bcg_cudagraphs=True,
+        bcg_tbptt_replay=False,
+        min_recommended_vram_gb=88.0,
+    ),
+    "local": GPUProfileSpec(
+        name="local",
+        tier="cpu_local",
+        micro_batch_bytes=DEFAULT_LOCAL_STEP_BYTES,
+        target_tokens_bytes_per_step=DEFAULT_LOCAL_STEP_BYTES,
+        bcg_ckpt_watermark_gb=0.0,
+        bcg_cudagraphs=False,
+        bcg_tbptt_replay=False,
+        min_recommended_vram_gb=0.0,
+    ),
+}
+
+GPU_PROFILE_ALIASES: dict[str, str] = {
+    "t4": "t4",
+    "t4_16g": "t4",
+    "tesla_t4": "t4",
+    "cuda_compact": "t4",
+    "l4": "l4",
+    "l4_24g": "l4",
+    "nvidia_l4": "l4",
+    "4090": "l4",
+    "rtx4090": "l4",
+    "rtx_4090": "l4",
+    "l4_or_4090": "l4",
+    "5090": "rtx_5090",
+    "rtx5090": "rtx_5090",
+    "rtx_5090": "rtx_5090",
+    "rtx_5090_32g": "rtx_5090",
+    "a100_40": "a100_40g",
+    "a100_40g": "a100_40g",
+    "l40": "a100_40g",
+    "l40s": "a100_40g",
+    "a6000": "a100_40g",
+    "a100": "a100_80g",
+    "a100_80": "a100_80g",
+    "a100_80g": "a100_80g",
+    "h100_or_a100_80g": "a100_80g",
+    "h100": "h100",
+    "h100_80g": "h100",
+    "h100_sxm": "h100",
+    "g4": "g4",
+    "g4_96g": "g4",
+    "blackwell": "g4",
+    "blackwell_96g": "g4",
+    "rtx_pro_6000": "g4",
+    "pro6000": "g4",
+    "h200": "g4",
+    "blackwell_or_h200_96g": "g4",
+    "g4_256k": "g4_256k",
+    "blackwell_256k": "g4_256k",
+    "h200_256k": "g4_256k",
+    "local": "local",
+    "cpu": "local",
+    "mps": "local",
+    "mac": "local",
+}
+
+
+def resolve_gpu_profile(
+    gpu_profile: Optional[str],
+    detected: HardwareProfile,
+    *,
+    stream_carry: bool = True,
+) -> tuple[GPUProfileSpec, bool]:
+    """Resolve a `--gpu-profile` name (or `"auto"`) into `(GPUProfileSpec, is_explicit)`.
+
+    When `"auto"` (or `None`), maps the live detected GPU cleanly so switching between
+    T4 / L4 / A100 / H100 / G4 adapts automatically without editing configs; when an explicit
+    name is given (e.g. `l4`, `g4`, `g4_256k`, `a100`, `h100`, `t4`), returns that exact preset.
+    """
+    raw = (gpu_profile or "auto").strip().lower().replace("-", "_").replace(" ", "_")
+    if raw and raw != "auto":
+        canon = GPU_PROFILE_ALIASES.get(raw)
+        if canon is None:
+            valid = ", ".join(["auto", *sorted(GPU_PROFILES.keys())])
+            raise ValueError(f"Unknown --gpu-profile={gpu_profile!r}. Supported values: {valid}")
+        return GPU_PROFILES[canon], True
+
+    if detected.device_type != "cuda":
+        base = GPU_PROFILES["local"]
+        return (
+            GPUProfileSpec(
+                name=base.name,
+                tier=detected.tier,
+                micro_batch_bytes=detected.micro_batch_bytes,
+                target_tokens_bytes_per_step=detected.target_tokens_bytes_per_step,
+                bcg_ckpt_watermark_gb=0.0,
+                bcg_cudagraphs=False,
+                bcg_tbptt_replay=False,
+                min_recommended_vram_gb=0.0,
+            ),
+            False,
+        )
+
+    vram = float(detected.vram_gb)
+    dname = str(detected.device_name or "").lower()
+    if vram >= 88.0:
+        return GPU_PROFILES["g4"], False
+    if vram >= 75.0:
+        return (GPU_PROFILES["h100"] if "h100" in dname else GPU_PROFILES["a100_80g"]), False
+    if vram >= 38.0:
+        return GPU_PROFILES["a100_40g"], False
+    if vram >= 30.0:
+        return GPU_PROFILES["rtx_5090"], False
+    if vram >= 20.0:
+        if stream_carry:
+            return GPU_PROFILES["l4"], False
+        # Without A1 stream-carry, full 4096B doc batches need more activation headroom on 22-24GB cards.
+        return (
+            GPUProfileSpec(
+                name="l4",
+                tier="l4_or_4090",
+                micro_batch_bytes=32_768,
+                target_tokens_bytes_per_step=DEFAULT_PROD_STEP_BYTES,
+                bcg_ckpt_watermark_gb=12.0,
+                bcg_cudagraphs=True,
+                bcg_tbptt_replay=False,
+                min_recommended_vram_gb=20.0,
+            ),
+            False,
+        )
+    return GPU_PROFILES["t4"], False
+
+
 def is_cuda_available() -> bool:
     return bool(torch.cuda.is_available())
 

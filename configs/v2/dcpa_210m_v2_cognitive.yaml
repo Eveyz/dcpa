@@ -182,8 +182,8 @@ hardware:
       grad_accum_steps: 2
     l4_or_4090:
       min_vram_gb: 20.0
-      micro_batch_bytes: 32768
-      grad_accum_steps: 4
+      micro_batch_bytes: 65536
+      grad_accum_steps: 2
     local_mps_or_cpu:
       min_vram_gb: 0.0
       target_tokens_bytes_per_step: 8192

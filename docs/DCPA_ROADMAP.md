@@ -257,3 +257,37 @@ flowchart TD
 * [ ] **训练脚手架（`train/train_expert_plugin.py`）**：加载冻结 Base，按 `--num-plugin-experts K` 挂载可训练专家切片 + Cosine Router 键，支持在垂直领域数据上低成本单卡训练并导出纯插件 `.safetensors`（~12 MB/专家）。
 * [ ] **热插拔推理挂载器（`dcpa/plugin_loader.py` + `dcpa-core-rs`）**：实现多插件校验、动态张量拼接、Cosine 路由隔离及按需启用/禁用开关。
 * [ ] **零退化与多插件组合验收测试**：验证单插件垂直领域 BPC 显著下降、非目标领域 BPC 退化 `< 0.5%`、以及同时挂载 3 个不同领域插件无互相干扰。
+
+---
+
+### 3.3 仿生多模态视觉前端（`Visual SGSC`：2D 惊奇度扫视与 O(1) 视频事件流）`[TODO]`
+
+> **核心原则**：绝不将原始 RGB/PNG 字节直接以 1D 方式送入文本 `SGSC`（会破坏 2D 空间邻域且冗余度过高）；而是新增与文本 `SGSC` 对偶的 **Visual SGSC（仿生视网膜 + 中心凹扫视压缩器）**，将 2D 图像 / 3D 视频压缩为同维度 `(c_vis [D], f_vis [d_s])` 概念流，直接汇入共享的 `Cortical + BCG-PC + Hippocampus` 大脑！
+
+#### 核心机制
+1. **成熟视网膜特征提取**：接入冻结的轻量 2D 视觉主干（如 `SigLIP-2` / `DINOv2`），免去从零重训底层视觉表征的巨额成本。
+2. **2D 视觉惊奇度压缩（Fovea / Saccade 中心凹扫视）**：
+   * 计算 2D patch 空间预测误差（**Visual Surprisal**）：纯色背景与重复纹理（低惊奇）合并为极少粗概念；文字、图表、物体边缘、关键细节（高惊奇）保留高密度概念；
+   * 将常规 `1024+` 视觉 tokens 压缩至 **`30–120` 个高纯度视觉概念**，附带 2D 空间坐标 `(x, y)`，直接复用 `Cortical` 多维 `Concept-RoPE`。
+3. **O(1) 显存视频事件流（Temporal Surprisal）**：
+   * 模仿生物视网膜与事件相机（Event Camera），连续视频仅对**帧间变化高惊奇区域**发放视觉脉冲更新 `BCG-PC` 与 `ring_kv`；静态画面近乎零算力，推理显存严格保持 O(1)。
+4. **零损伤三步接入（无需重训语言大脑）**：
+   * [ ] **Step 1 视觉投影对齐**：冻结视觉主干与 DCPA 语言底座，仅训练 `~5M` 参数的 `VisualProjector + SurprisalCompressor`（Caption / OCR 图文配对），将视觉概念对齐至文本 `c_slow` 语义空间。
+   * [ ] **Step 2 视觉专家插件（结合 3.2 Pluggable MoE）**：冻结语言底座，挂载 `2–4` 个视觉路由专家插件（`~24 MB`），在 VQA、图表推理、网页截图转 HTML/JS 代码数据上微调，零损伤纯文本能力。
+   * [ ] **Step 3 跨模态海马体“一眼认物”**：验证 One-Shot Visual Fast-Mapping（展示新物体/新角色照片并命名 → 海马体快权重绑定视觉概念与词干 → 换角度再识别准确率）。
+
+---
+
+## 4. 分阶段实验与验证总路径（一步一验证，绝不盲目扩规模）
+
+> **统一指导思想（*Surprisal Is All You Need*）**：用统一的预测惊奇度信号（`Surprisal`）贯通感官切分（SGSC）、深度思考（Pondering）、快权重写入（Hippocampus）、外部翻书（Episodic Lookup）与视觉扫视（Visual SGSC）。每一阶段先拿硬数据验收，再解锁下一阶段：
+
+| 里程碑 | 阶段目标 | 核心实验与验收标准 | 状态 |
+| :--- | :--- | :--- | :---: |
+| **M0** | **v1 `48M` 原理跑通** | 验证 4 模块前向/反向、因果律、BF16 精度岛、Watchdog 自愈闭环 | ✅ 已结项归档 |
+| **M1** | **v2 `moe_210m` 全科完训与体检** | 完成 100k 底座 + Stage 5 SFT；验收 4 域 `Val_BPC`、第 5 节真实自由续写、Gates 7–10（逻辑/写作/代码/海马体绑定） | 🔄 **当前主线进行中** |
+| **M2** | **同算力基线盲测（Scaling 锚点）** | **同一份 5.3 GB 语料 + 相同 GPU 耗时**，对比 `DCPA-210M` vs 同参数/同激活标准 Transformer 的 `Val_BPC`、端侧内存与吞吐 | ⏳ 待 M1 完成后启动 |
+| **M3** | **210M 低成本原型验证三大新能力** | 基于冻结 210M 底座低成本分别验证：① `Episodic Memory Lookup`（翻书 + Gate 11 大海捞针）；② 首个 `~12 MB` `Pluggable MoE` 专家插件；③ `Visual SGSC` 视觉插件 | ⏳ 待 M2 后启动 |
+| **M4** | **v3 全龄螺旋课程 + 教材蒸馏验证** | 实现 `build_corpus_v3_k12.py` + `build_distill_textbooks.py`（种子改写 + 沙箱验真），做「混训 vs K-12→物化生→算法→代码螺旋课程」消融实验 | ⏳ 规划完成 |
+| **M5** | **v3 架构升级与中尺度缩放（`650M → 3.5B`）** | 升级 Log-Space 并行图 SSM、多头读出、FSDP/EP 分布式；扩去重语料至 `20–100 GB`，画出 `210M → 650M → 3.5B` Scaling Law 曲线 | ⏳ 远期储备 |
+| **M6** | **高阶大模型（`7B → 70B+`）与生态发布** | 基于已验证的 Scaling Law 拓展 FSDP+EP+FP8 集群训练；发布端侧 Rust 引擎 + 开源 Pluggable MoE 专家生态 + *Surprisal Is All You Need* 技术报告 | ⏳ 远期愿景 |

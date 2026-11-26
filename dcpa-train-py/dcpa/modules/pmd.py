@@ -33,6 +33,7 @@ from dcpa.ops.ragged import ragged_local_offsets, ragged_segment_cumsum
 from dcpa.ops.rmsnorm import RMSNorm
 from dcpa.ops.rope import apply_holographic_rope
 from dcpa.ops.scan import parallel_diag_scan, parallel_stack_scan
+from dcpa.stream_carry import RowLayout, from_rows, pad_entries, to_rows
 
 
 def _compute_multi_frame_stack_reset(
@@ -144,11 +145,13 @@ class PMD(nn.Module):
             persistent=False,
         )
         self._compiled_motor_scan = None
+        self._compiled_motor_rows_scan = None
         self._init_weights()
 
     def enable_compiled_motor_scan(self, **compile_kwargs) -> None:
         """Compile Hotspot B2: 128B C=256 parallel stack scan + motor diagonal scan + byte logit head."""
         self._compiled_motor_scan = torch.compile(self._motor_scan_impl, **compile_kwargs)
+        self._compiled_motor_rows_scan = torch.compile(self._motor_scan_rows_impl, **compile_kwargs)
 
     def _motor_scan_impl(
         self,
@@ -193,6 +196,43 @@ class PMD(nn.Module):
 
         # Shared output classification head (float32 logits)
         byte_logits = F.linear(m_seq.float(), self.w_out.weight.float())  # [B, T, 256] fp32
+        return byte_logits, stack_xi, m_seq
+
+    def _motor_scan_rows_impl(
+        self,
+        u_prev: torch.Tensor,
+        d_drive: torch.Tensor,
+        l_reg_bt: torch.Tensor,
+        m_start: torch.Tensor,
+        xi0: torch.Tensor,
+        stack_reset_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Stream-carry Hotspot B2 on a right-padded `[R, L]` row layout with per-row initial states.
+
+        By linearity of the pushdown recurrence in `Xi` (actions depend only on `u_prev`/`l_reg`):
+          Xi_t = scan(zero init, frame resets)_t + 1[t < first frame reset] * (M_t ... M_0) xi0,
+        so mid-row frame resets still reset to an EMPTY stack while row starts continue from `xi0`.
+        """
+        R, L, _ = u_prev.shape
+        act_probs = F.softmax(self.w_act(torch.cat([u_prev, l_reg_bt], dim=-1)).float(), dim=-1)
+        p_push = act_probs[..., 0]
+        p_pop = act_probs[..., 1]
+        p_hold = act_probs[..., 2]
+        v_tag = torch.tanh(self.w_tag(u_prev).float())
+
+        xi_main = parallel_stack_scan(p_push, p_pop, p_hold, v_tag, xi_init=None, reset_mask=stack_reset_mask)
+        xi_hom = parallel_stack_scan(
+            p_push, p_pop, p_hold, torch.zeros_like(v_tag), xi_init=xi0.float(), reset_mask=None
+        )
+        before_first_reset = torch.cumsum(stack_reset_mask.to(torch.int32), dim=1) == 0  # [R, L]
+        stack_xi = xi_main + before_first_reset.to(xi_hom.dtype)[..., None, None] * xi_hom
+        xi_top2 = stack_xi[:, :, :2, :].reshape(R, L, 2 * self.cfg.stack_tag_dim).to(u_prev.dtype)
+
+        x_in = u_prev + d_drive + self.w_st(xi_top2)
+        alpha_mot = torch.sigmoid(self.w_alpha_mot(x_in))
+        b_mot = (1.0 - alpha_mot) * F.silu(self.w_m(x_in))
+        m_seq = parallel_diag_scan(alpha_mot, b_mot, h0=m_start, reset_mask=None)
+        byte_logits = F.linear(m_seq.float(), self.w_out.weight.float())
         return byte_logits, stack_xi, m_seq
 
     def _init_weights(self) -> None:
@@ -486,18 +526,29 @@ class PMD(nn.Module):
         xi_init: Optional[torch.Tensor] = None,
         doc_cu_seqlens: Optional[torch.Tensor] = None,
         known_max_seg_len: Optional[int] = None,
+        row_layout: Optional[RowLayout] = None,
+        entry_cont: Optional[torch.Tensor] = None,
+        entry_m0: Optional[torch.Tensor] = None,
+        entry_xi0: Optional[torch.Tensor] = None,
+        entry_prev_byte: Optional[torch.Tensor] = None,
     ) -> PMDDecodeOutput:
         """Fully parallel O(log T) teacher-forced byte decoding across all segments in a batch!
 
         Zero Python loops over sequence length T (Commandment #3) and zero segment padding (Commandment #4).
         Supports optional packed varlen `doc_cu_seqlens` (resetting BOS byte, pushdown stack Xi, and
         motor micro-core hidden state m cleanly at every document boundary).
+
+        Stream-carry mode (`row_layout` given): every packed entry starts from its own `entry_m0 [V, d_s]`,
+        `entry_xi0 [V, 16, 4]` and previous byte `entry_prev_byte [V]` (continuations) instead of BOS/reset.
         """
         B, T = target_bytes.shape
         device = target_bytes.device
         d_s = self.cfg.d_s
         N = B * T
-        use_compiled_motor = self._compiled_motor_scan is not None and T > 0 and xi_init is None
+        carry_rows = row_layout is not None
+        if carry_rows and (doc_cu_seqlens is None or B != 1):
+            raise ValueError("PMD row_layout (stream carry) requires packed varlen doc_cu_seqlens with B=1")
+        use_compiled_motor = self._compiled_motor_scan is not None and T > 0 and xi_init is None and not carry_rows
 
         doc_reset_mask: Optional[torch.Tensor] = None
         doc_max_span: Optional[int] = None
@@ -511,7 +562,7 @@ class PMD(nn.Module):
             num_docs = doc_lens.numel()
             if num_docs > 0:
                 doc_reset_mask[0, doc_starts] = True
-                if not use_compiled_motor:
+                if not use_compiled_motor and not carry_rows:
                     doc_max_span = int(doc_lens.max().item())
             doc_id_flat = torch.repeat_interleave(
                 torch.arange(num_docs, device=device, dtype=torch.int64),
@@ -525,6 +576,12 @@ class PMD(nn.Module):
         prev_bytes = torch.cat([bos, target_bytes[:, :-1].long()], dim=1)  # [B, T]
         if doc_reset_mask is not None:
             prev_bytes = torch.where(doc_reset_mask, torch.zeros_like(prev_bytes), prev_bytes)
+        if carry_rows and entry_prev_byte is not None and row_layout.n_entries > 0:
+            st = row_layout.starts
+            pb0 = entry_prev_byte.to(device=device, dtype=torch.long)
+            if entry_cont is not None:
+                pb0 = torch.where(entry_cont.bool(), pb0, torch.zeros_like(pb0))
+            prev_bytes = prev_bytes.index_put((torch.zeros_like(st), st), pb0)
         u_prev = self.embed(prev_bytes)  # [B, T, d_s]
 
         # Ragged local step tau in {1..l_m} & segment ID for every byte in [0..N-1]
@@ -565,7 +622,43 @@ class PMD(nn.Module):
 
         l_reg_bt = l_reg[doc_id_flat].view(B, T, self.cfg.d_l)
         m_start = self.m0 if m_init is None else m_init
-        if use_compiled_motor:
+        if carry_rows:
+            assert row_layout is not None and doc_reset_mask is not None
+            V = row_layout.n_entries
+            st = row_layout.starts
+            # Mid-entry frame resets only (entry starts are handled by the per-row initial stack `xi0`).
+            frame_reset = stack_reset_mask & ~doc_reset_mask
+            if entry_m0 is None:
+                m0_ent = self.m0.unsqueeze(0).expand(V, d_s)
+            else:
+                m0_ent = entry_m0
+            if entry_xi0 is None:
+                xi0_ent = torch.zeros((V, self.cfg.stack_depth, self.cfg.stack_tag_dim), device=device, dtype=torch.float32)
+            else:
+                xi0_ent = entry_xi0.float()
+                start_frame = (
+                    (prev_bytes[0, st] == 0x04) | (prev_bytes[0, st] == 0x13) | (prev_bytes[0, st] == 0x1E)
+                )
+                keep_xi = ~start_frame
+                if entry_cont is not None:
+                    keep_xi = keep_xi & entry_cont.bool()
+                xi0_ent = torch.where(keep_xi.view(V, 1, 1), xi0_ent, torch.zeros_like(xi0_ent))
+            u_rows = to_rows(u_prev[0], row_layout, 0.0)
+            d_rows = to_rows(d_drive[0], row_layout, 0.0)
+            l_rows = to_rows(l_reg_bt[0], row_layout, 0.0)
+            srm_rows = to_rows(frame_reset[0], row_layout, False)
+            m_rows = pad_entries(m0_ent.to(u_prev.dtype), row_layout.n_rows, 0.0)
+            xi_rows = pad_entries(xi0_ent, row_layout.n_rows, 0.0)
+            rows_fn = (
+                self._compiled_motor_rows_scan
+                if self._compiled_motor_rows_scan is not None
+                else self._motor_scan_rows_impl
+            )
+            logits_r, xi_r, m_r = rows_fn(u_rows, d_rows, l_rows, m_rows, xi_rows, srm_rows)
+            byte_logits = from_rows(logits_r, row_layout).unsqueeze(0)
+            stack_xi = from_rows(xi_r, row_layout).unsqueeze(0)
+            m_seq = from_rows(m_r, row_layout).unsqueeze(0)
+        elif use_compiled_motor:
             align_b = 16384 if T >= 16384 else (4096 if T >= 4096 else 256)
             pad = (align_b - (T % align_b)) % align_b
             if pad > 0:

@@ -31,6 +31,7 @@ from dcpa.ops.ragged import (
 from dcpa.ops.rmsnorm import RMSNorm
 from dcpa.ops.rope import apply_holographic_rope
 from dcpa.ops.scan import lif_membrane_scan, parallel_diag_scan
+from dcpa.stream_carry import RowLayout, from_rows, pad_entries, to_rows
 
 
 @dataclass
@@ -170,37 +171,16 @@ class SGSC(nn.Module):
     def theta(self) -> torch.Tensor:
         return self.cfg.lif_theta_min + F.softplus(self.cfg.lif_theta_scale * self.theta_raw.float())
 
-    def forward(
+    def _byte_scan_dispatch(
         self,
         raw_bytes: torch.Tensor,
-        tau_s: float = 1.0,
-        forced_spikes: Optional[torch.Tensor] = None,
-        h_init: Optional[torch.Tensor] = None,
-        doc_cu_seqlens: Optional[torch.Tensor] = None,
-    ) -> SGSCOutput:
-        """Run SGSC on raw UTF-8 bytes [B, T] (uint8), with optional packed varlen doc_cu_seqlens."""
-        if raw_bytes.ndim != 2:
-            raise ValueError(f"raw_bytes must be 2D [B, T], got {tuple(raw_bytes.shape)}")
+        h_start: torch.Tensor,
+        doc_reset_mask: Optional[torch.Tensor],
+        doc_max_span: Optional[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run Hotspot B1 through the static-shape compiled kernel (when enabled) or eagerly."""
         B, T = raw_bytes.shape
         device = raw_bytes.device
-        d_s = self.cfg.d_s
-
-        doc_reset_mask: Optional[torch.Tensor] = None
-        doc_max_span: Optional[int] = None
-        if doc_cu_seqlens is not None:
-            if B != 1:
-                raise ValueError(f"Packed varlen doc_cu_seqlens requires B=1, got B={B}")
-            doc_reset_mask = torch.zeros((1, T), device=device, dtype=torch.bool)
-            starts = doc_cu_seqlens[:-1].to(dtype=torch.int64, device=device)
-            ends = doc_cu_seqlens[1:].to(dtype=torch.int64, device=device)
-            if starts.numel() > 0:
-                doc_reset_mask[0, starts] = True
-                # Skip GPU->CPU sync when compiled byte scan ignores max_span
-                if self._compiled_byte_scan is None:
-                    doc_max_span = int((ends - starts).max().item())
-
-        h_start = self.h0 if h_init is None else h_init
-        # 1-3. Hotspot B1: per-byte projections + O(log T) diagonal scan + strictly causal prior
         if self._compiled_byte_scan is not None and T > 0:
             # Align T up to 16KB for prod batches >=16KB (4KB for 4-16KB, 256B for tiny tests)
             # strictly inside Hotspot B1 so 100% of 64KB/128KB/256KB ragged batches hit ONE static
@@ -229,13 +209,79 @@ class SGSC(nn.Module):
             h_seq_p, prior_logits_p, prior_probs_p, info_p, delta_info_p = self._compiled_byte_scan(
                 rb_in, h_start, rm_in, None
             )
-            h_seq = h_seq_p[:, :T, :]
-            prior_logits = prior_logits_p[:, :T, :]
-            prior_probs = prior_probs_p[:, :T, :]
-            info = info_p[:, :T]
-            delta_info = delta_info_p[:, :T]
+            return (
+                h_seq_p[:, :T, :],
+                prior_logits_p[:, :T, :],
+                prior_probs_p[:, :T, :],
+                info_p[:, :T],
+                delta_info_p[:, :T],
+            )
+        return self._byte_scan_impl(raw_bytes, h_start, doc_reset_mask, doc_max_span)
+
+    def forward(
+        self,
+        raw_bytes: torch.Tensor,
+        tau_s: float = 1.0,
+        forced_spikes: Optional[torch.Tensor] = None,
+        h_init: Optional[torch.Tensor] = None,
+        doc_cu_seqlens: Optional[torch.Tensor] = None,
+        row_layout: Optional[RowLayout] = None,
+        entry_cont: Optional[torch.Tensor] = None,
+        entry_last_info: Optional[torch.Tensor] = None,
+    ) -> SGSCOutput:
+        """Run SGSC on raw UTF-8 bytes [B, T] (uint8), with optional packed varlen doc_cu_seqlens.
+
+        Stream-carry mode (`row_layout` given): `h_init [V, d_s]` is the per-entry initial hidden state and
+        `entry_cont`/`entry_last_info [V]` restore the exact cross-chunk surprisal delta at continuations.
+        """
+        if raw_bytes.ndim != 2:
+            raise ValueError(f"raw_bytes must be 2D [B, T], got {tuple(raw_bytes.shape)}")
+        B, T = raw_bytes.shape
+        device = raw_bytes.device
+        d_s = self.cfg.d_s
+
+        doc_reset_mask: Optional[torch.Tensor] = None
+        doc_max_span: Optional[int] = None
+        if doc_cu_seqlens is not None:
+            if B != 1:
+                raise ValueError(f"Packed varlen doc_cu_seqlens requires B=1, got B={B}")
+            doc_reset_mask = torch.zeros((1, T), device=device, dtype=torch.bool)
+            starts = doc_cu_seqlens[:-1].to(dtype=torch.int64, device=device)
+            ends = doc_cu_seqlens[1:].to(dtype=torch.int64, device=device)
+            if starts.numel() > 0:
+                doc_reset_mask[0, starts] = True
+                # Skip GPU->CPU sync when compiled byte scan ignores max_span
+                if self._compiled_byte_scan is None:
+                    doc_max_span = int((ends - starts).max().item())
+
+        h_start = self.h0 if h_init is None else h_init
+        # 1-3. Hotspot B1: per-byte projections + O(log T) diagonal scan + strictly causal prior
+        if row_layout is not None:
+            # Stream-carry mode: per-entry initial hidden states `h_init [V, d_s]` injected exactly via a
+            # right-padded `[n_rows, row_len]` row layout (causal scans are exact under right padding).
+            if doc_cu_seqlens is None or B != 1:
+                raise ValueError("SGSC row_layout (stream carry) requires packed varlen doc_cu_seqlens with B=1")
+            if h_start.ndim != 2 or int(h_start.shape[0]) != row_layout.n_entries:
+                raise ValueError(
+                    f"stream-carry h_init must be [V={row_layout.n_entries}, d_s], got {tuple(h_start.shape)}"
+                )
+            rb_rows = to_rows(raw_bytes[0], row_layout, 0)
+            h_rows = pad_entries(h_start, row_layout.n_rows, 0.0)
+            h_r, pl_r, pp_r, info_r, dinfo_r = self._byte_scan_dispatch(rb_rows, h_rows, None, row_layout.row_len)
+            h_seq = from_rows(h_r, row_layout).unsqueeze(0)
+            prior_logits = from_rows(pl_r, row_layout).unsqueeze(0)
+            prior_probs = from_rows(pp_r, row_layout).unsqueeze(0)
+            info = from_rows(info_r, row_layout).unsqueeze(0)
+            delta_info = from_rows(dinfo_r, row_layout).unsqueeze(0)
+            if entry_cont is not None and entry_last_info is not None and row_layout.n_entries > 0:
+                # Exact cross-chunk `delta_info` at continuation starts (fresh entries keep 0 = doc reset).
+                st = row_layout.starts
+                with fp32_island(device):
+                    d0 = F.relu(info[0, st].float() - entry_last_info.float())
+                    d0 = torch.where(entry_cont.bool(), d0, torch.zeros_like(d0))
+                delta_info = delta_info.index_put((torch.zeros_like(st), st), d0.to(delta_info.dtype))
         else:
-            h_seq, prior_logits, prior_probs, info, delta_info = self._byte_scan_impl(
+            h_seq, prior_logits, prior_probs, info, delta_info = self._byte_scan_dispatch(
                 raw_bytes, h_start, doc_reset_mask, doc_max_span
             )
 

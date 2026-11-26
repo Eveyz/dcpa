@@ -21,7 +21,7 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from dcpa.config import DCPAConfig
 from dcpa.modules.bcg_pc import BCGPC, ConceptGraphState, _DampedBoundedCarry
-from dcpa.modules.cortical import CorticalCarryState, CorticalSandwich
+from dcpa.modules.cortical import CorticalCarryState, CorticalSandwich, RingMemory
 from dcpa.modules.hippocampus import (
     ColumnMajorFastWeights,
     CompactHouseholderState,
@@ -33,8 +33,19 @@ from dcpa.modules.pmd import PMD, PMDDecodeOutput
 from dcpa.modules.sgsc import SGSC, SGSCOutput
 from dcpa.ops.fp32 import fp32_island
 from dcpa.ops.ragged import ragged_local_offsets, ragged_segment_sum
-from dcpa.ops.rope import compute_segment_scope_depths
+from dcpa.ops.rope import compute_causal_byte_scope_depth, compute_segment_scope_depths
 from dcpa.ops.scan import parallel_diag_scan
+from dcpa.stream_carry import (
+    DocCarryState,
+    RowLayout,
+    advance_ring,
+    bucket_multiple,
+    bucket_pow2,
+    build_row_layout,
+    from_rows,
+    pad_entries,
+    to_rows,
+)
 
 try:
     from utils.device import get_allocated_memory_gb as _get_allocated_memory_gb
@@ -166,6 +177,7 @@ class DCPAForwardOutput:
     loss_moe_bal: Optional[torch.Tensor] = None
     metrics_tensor: Optional[torch.Tensor] = None
     cortical_state: Optional[CorticalCarryState] = None
+    doc_carry_out: Optional[DocCarryState] = None
 
     def materialize_metrics(self) -> dict[str, float]:
         if not self.metrics and self.metrics_tensor is not None:
@@ -464,18 +476,63 @@ class DCPAModel(nn.Module):
         ach_override: Optional[float] = None,
         record_traces: bool = True,
         sync_metrics: bool = True,
+        doc_carry: Optional[DocCarryState] = None,
     ) -> DCPAForwardOutput:
-        """Execute full-stack DCPA-Turbo forward pass (`[B, T]` or packed varlen `doc_cu_seqlens`)."""
+        """Execute full-stack DCPA-Turbo forward pass (`[B, T]` or packed varlen `doc_cu_seqlens`).
+
+        Stream-carry mode (`doc_carry` given, Stages B/C, packed varlen `B=1`): every packed entry is one
+        stream chunk; continuation entries (`doc_carry.cont_mask`) resume SGSC/PMD/scope/graph/cortical-ring
+        state carried (detached) from the previous optimizer step, and `out.doc_carry_out` returns the
+        per-entry state at the end of this chunk.
+        """
         stage = stage.upper()
         B, T = raw_bytes.shape
         device = raw_bytes.device
         zero = torch.tensor(0.0, device=device, dtype=torch.float32)
         bcg_raw = getattr(self.bcg_pc, "_orig_mod", self.bcg_pc)
 
+        carry_mode = doc_carry is not None
+        row_layout: Optional[RowLayout] = None
+        carry_cont: Optional[torch.Tensor] = None
+        if carry_mode:
+            assert doc_carry is not None
+            if doc_cu_seqlens is None or B != 1:
+                raise ValueError("doc_carry (stream carry) requires packed varlen doc_cu_seqlens with B=1")
+            if stage not in ("B", "C"):
+                raise ValueError(f"doc_carry (stream carry) is only supported in Stages B/C, got stage={stage}")
+            if fast_state is not None or elig_state is not None or graph_state is not None:
+                raise ValueError("doc_carry is mutually exclusive with explicit graph/fast/elig state carry")
+            row_len = bucket_multiple(max(int(doc_carry.max_entry_bytes), 1), 64)
+            row_layout = build_row_layout(doc_cu_seqlens.to(device), T, row_len)
+            torch._assert_async(
+                ((row_layout.ends - row_layout.starts) <= row_len).all(),
+                "stream-carry entry longer than doc_carry.max_entry_bytes",
+            )
+            carry_cont = doc_carry.cont_mask.to(device=device).bool()
+            n_ent = row_layout.n_entries
+            h0_vec = self.sgsc.h0 if h_init is None else h_init.reshape(-1)
+            h0_ent = torch.where(
+                carry_cont.unsqueeze(-1),
+                doc_carry.sgsc_h.to(device=device, dtype=h0_vec.dtype),
+                h0_vec.unsqueeze(0).expand(n_ent, -1),
+            )
+
         # 1. Module 1: SGSC sensory causal scan + LIF spiking + Ragged RoPE phase-bound stems
-        sgsc_out = self.sgsc(
-            raw_bytes, tau_s=tau_s, h_init=h_init, doc_cu_seqlens=doc_cu_seqlens
-        )
+        if carry_mode:
+            assert doc_carry is not None
+            sgsc_out = self.sgsc(
+                raw_bytes,
+                tau_s=tau_s,
+                h_init=h0_ent,
+                doc_cu_seqlens=doc_cu_seqlens,
+                row_layout=row_layout,
+                entry_cont=carry_cont,
+                entry_last_info=doc_carry.last_info.to(device=device),
+            )
+        else:
+            sgsc_out = self.sgsc(
+                raw_bytes, tau_s=tau_s, h_init=h_init, doc_cu_seqlens=doc_cu_seqlens
+            )
         m_total = sgsc_out.f_stem.shape[0]
         l_reg = self.pmd.get_lang_vec(lang_ids, style_ids)
 
@@ -583,6 +640,7 @@ class DCPAModel(nn.Module):
         beta_max_trace: Optional[torch.Tensor] = None
         slot0_pinned_trace: Optional[torch.Tensor] = None
         out_cortical: Optional[CorticalCarryState] = cortical_state
+        doc_carry_out: Optional[DocCarryState] = None
 
         if stage == "A":
             if m_total > 0:
@@ -640,18 +698,52 @@ class DCPAModel(nn.Module):
 
             # Causal segment-level bracket/frame scope depths (`seg_start_depth` strictly `< cu_seqlens[m]`)
             init_ast = cortical_state.ast_depth if cortical_state is not None else None
-            seg_start_depth, seg_end_depth, final_ast_depth = compute_segment_scope_depths(
-                raw_bytes=raw_bytes,
-                cu_seqlens=sgsc_out.cu_seqlens,
-                seg_doc_start=seg_doc_start,
-                doc_reset_mask=doc_reset_mask,
-                init_depth=init_ast,
-            )
-            pos_in_doc = (
+            carry_entry_depth: Optional[torch.Tensor] = None
+            if carry_mode:
+                assert doc_carry is not None and row_layout is not None and carry_cont is not None
+                init_d = torch.where(
+                    carry_cont,
+                    doc_carry.scope_depth.to(device=device, dtype=torch.int32).clamp_min(0),
+                    torch.zeros_like(doc_carry.scope_depth, dtype=torch.int32, device=device),
+                )
+                raw_rows = compute_causal_byte_scope_depth(
+                    to_rows(raw_bytes[0], row_layout, 0),
+                    doc_reset_mask=None,
+                    init_depth=pad_entries(init_d, row_layout.n_rows, 0),
+                    max_depth=31,
+                    clamp_output=False,
+                )
+                raw_flat_d = from_rows(raw_rows, row_layout)  # [T] unclamped depth after each byte
+                seg_end_byte = (sgsc_out.cu_seqlens[1:].to(torch.int64) - 1).clamp(0, max(T - 1, 0))
+                seg_end_depth = raw_flat_d[seg_end_byte].clamp(0, 31)
+                seg_start_depth = torch.zeros_like(seg_end_depth)
+                if m_total > 1:
+                    seg_start_depth[1:] = seg_end_depth[:-1]
+                seg_start_depth = torch.where(
+                    seg_doc_start, init_d[seg_doc_ids].clamp(0, 31).to(seg_start_depth.dtype), seg_start_depth
+                )
+                carry_entry_depth = raw_flat_d[(row_layout.ends - 1).clamp_min(0)].to(torch.int32)
+                final_ast_depth = carry_entry_depth
+            else:
+                seg_start_depth, seg_end_depth, final_ast_depth = compute_segment_scope_depths(
+                    raw_bytes=raw_bytes,
+                    cu_seqlens=sgsc_out.cu_seqlens,
+                    seg_doc_start=seg_doc_start,
+                    doc_reset_mask=doc_reset_mask,
+                    init_depth=init_ast,
+                )
+            seg_local = (
                 torch.arange(m_total, device=device, dtype=torch.int64) - seg_offsets[seg_doc_ids].to(torch.int64)
                 if m_total > 0
                 else torch.zeros((0,), device=device, dtype=torch.int64)
             )
+            pos_in_doc = seg_local
+            if carry_mode:
+                assert doc_carry is not None and carry_cont is not None
+                doc_pos_in = torch.where(
+                    carry_cont, doc_carry.doc_pos.to(device=device, dtype=torch.int64), torch.zeros_like(seg_counts, dtype=torch.int64)
+                )
+                pos_in_doc = seg_local + doc_pos_in[seg_doc_ids]
 
             # -----------------------------------------------------------------
             # Mode I: O(1) Stateful Streaming Chunk (`cortical_state` provided)
@@ -897,7 +989,13 @@ class DCPAModel(nn.Module):
             # -----------------------------------------------------------------
             # Mode II: Eval Isolated Per-Document Path (`Test 1C` zero crosstalk)
             # -----------------------------------------------------------------
-            elif (doc_cu_seqlens is not None) and (not self.training) and (graph_state is None) and (V <= 8):
+            elif (
+                (doc_cu_seqlens is not None)
+                and (not self.training)
+                and (graph_state is None)
+                and (V <= 8)
+                and (not carry_mode)
+            ):
                 f_out_flat = torch.zeros((m_total, d_s), device=device, dtype=sgsc_out.f_stem.dtype)
                 delta_syn_flat = torch.zeros((m_total, d_s), device=device, dtype=sgsc_out.f_stem.dtype)
                 z_star_flat = torch.zeros((m_total, D), device=device, dtype=sgsc_out.c_slow.dtype)
@@ -1294,11 +1392,75 @@ class DCPAModel(nn.Module):
                     fam_mask_eff = fam_mask_ord
 
                 # === STEP 2: Full-Batch `[M_total, D]` Lower Cortical Encoder ===
+                ring_mem: Optional[RingMemory] = None
+                carry_q_pad = 0
+                carry_seg_pad_pos: Optional[torch.Tensor] = None
+                carry_ring_valid: Optional[torch.Tensor] = None
+                if carry_mode and m_total > 0:
+                    assert doc_carry is not None and carry_cont is not None
+                    sc_cpu_list = [int(x) for x in seg_counts.detach().to(torch.int64).to("cpu").tolist()]
+                    carry_q_pad = bucket_pow2(max(sc_cpu_list) if sc_cpu_list else 1, 16)
+                    carry_seg_pad_pos = seg_doc_ids * carry_q_pad + seg_local
+                    carry_ring_valid = doc_carry.ring_valid.to(device=device).bool() & carry_cont.unsqueeze(-1)
+                    ring_rows = bucket_pow2(V, 16)  # static-shape ring width for the compiled cortical kernels
+                    ring_mem = RingMemory(
+                        ring_kv=pad_entries(doc_carry.ring_kv.to(device=device, dtype=sgsc_out.f_stem.dtype), ring_rows, 0.0),
+                        ring_pos=pad_entries(doc_carry.ring_pos.to(device=device, dtype=torch.int64), ring_rows, 0),
+                        ring_depth=pad_entries(doc_carry.ring_depth.to(device=device), ring_rows, 0),
+                        ring_valid=pad_entries(carry_ring_valid, ring_rows, False),
+                        seg_pad_pos=carry_seg_pad_pos,
+                        q_pad_len=carry_q_pad,
+                    )
                 h_enc_all, c_kv_all, bal_enc = self.cortical.encode_parallel(
-                    sgsc_out.c_slow, sgsc_out.f_stem, seg_doc_ids, pos_in_doc, seg_end_depth
+                    sgsc_out.c_slow, sgsc_out.f_stem, seg_doc_ids, pos_in_doc, seg_end_depth, ring=ring_mem
                 )
 
-                g_state = bcg_raw.init_state(V_eff, device=device, dtype=h_enc_all.dtype) if graph_state is None else graph_state
+                if carry_mode:
+                    # Per-entry initial graph: carried (detached) state for continuations, learned G_0 otherwise.
+                    assert doc_carry is not None and carry_cont is not None
+                    g_init = bcg_raw.init_state(V, device=device, dtype=h_enc_all.dtype)
+                    cm = carry_cont
+                    g_full = ConceptGraphState(
+                        slots=torch.where(
+                            cm.view(V, 1, 1), doc_carry.slots.to(device=device, dtype=g_init.slots.dtype), g_init.slots
+                        ),
+                        edges=torch.where(
+                            cm.view(V, 1, 1, 1), doc_carry.edges.to(device=device, dtype=g_init.edges.dtype), g_init.edges
+                        ),
+                        salience=torch.where(
+                            cm.view(V, 1), doc_carry.salience.to(device=device, dtype=torch.float32), g_init.salience.float()
+                        ),
+                        slot0_pinned=torch.where(
+                            cm, doc_carry.slot0_pinned.to(device=device, dtype=torch.float32), g_init.slot0_pinned.float()
+                        ),
+                        phase=torch.where(
+                            cm.view(V, 1), doc_carry.phase.to(device=device, dtype=torch.float32), g_init.phase.float()
+                        ),
+                    )
+                    if use_prefix_shrink:
+                        g_full = ConceptGraphState(
+                            slots=g_full.slots[doc_order],
+                            edges=g_full.edges[doc_order],
+                            salience=g_full.salience[doc_order],
+                            slot0_pinned=g_full.slot0_pinned[doc_order],
+                            phase=g_full.phase[doc_order],
+                        )
+                    if pad_v > 0:
+                        g_pad = bcg_raw.init_state(pad_v, device=device, dtype=h_enc_all.dtype)
+                        g_full = ConceptGraphState(
+                            slots=torch.cat([g_full.slots, g_pad.slots], dim=0),
+                            edges=torch.cat([g_full.edges, g_pad.edges], dim=0),
+                            salience=torch.cat([g_full.salience, g_pad.salience.float()], dim=0),
+                            slot0_pinned=torch.cat([g_full.slot0_pinned, g_pad.slot0_pinned.float()], dim=0),
+                            phase=torch.cat([g_full.phase, g_pad.phase.float()], dim=0),
+                        )
+                    g_state = g_full
+                else:
+                    g_state = (
+                        bcg_raw.init_state(V_eff, device=device, dtype=h_enc_all.dtype)
+                        if graph_state is None
+                        else graph_state
+                    )
                 if g_state.slot0_pinned is None:
                     g_state = ConceptGraphState(
                         slots=g_state.slots,
@@ -1430,6 +1592,10 @@ class DCPAModel(nn.Module):
                 if use_chunked_bcg:
                     assert pi_cort_all is not None
                     K_c = int(self.bcg_chunk_steps)
+                    # A2: replay the static-shape chunk kernel through CUDA Graphs (outside checkpointing).
+                    use_cg_chunks = bool(device.type == "cuda" and bcg_raw.has_cudagraph_chunk_kernel)
+                    if use_cg_chunks and hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                        torch.compiler.cudagraph_mark_step_begin()
                     k_offs_c = torch.arange(K_c, device=device, dtype=torch.int64)
                     ach_zeros_flat = torch.zeros((K_c * V_eff,), device=device, dtype=torch.float32)
                     m_ema_val = float(bcg_raw.cfg.c0_ema_momentum)
@@ -1558,6 +1724,7 @@ class DCPAModel(nn.Module):
                                 gumbel_u_seq=gumbel_u_seq,
                                 use_gumbel=self.training,
                                 check_pin=True,
+                                use_cudagraph=use_cg_chunks,
                             )
 
                         (
@@ -1954,11 +2121,20 @@ class DCPAModel(nn.Module):
 
                     # Step 5: Causal `< m` shift (`bos_concept` at doc start, `z_refined[m-1]` for `m > doc_start`)
                     bos_vec = self.cortical.bos_concept.to(device=device, dtype=z_refined_flat.dtype).unsqueeze(0).expand(m_total, -1)
+                    start_vec = bos_vec
+                    if carry_mode:
+                        # Continuation entries shift in the carried `z_refined` of the previous chunk's last segment.
+                        assert doc_carry is not None and carry_cont is not None
+                        start_vec = torch.where(
+                            carry_cont[seg_doc_ids].unsqueeze(-1),
+                            doc_carry.prev_z_ref.to(device=device, dtype=z_refined_flat.dtype)[seg_doc_ids],
+                            bos_vec,
+                        )
                     if m_total > 1:
-                        shifted_z = torch.cat([bos_vec[:1], z_refined_flat[:-1]], dim=0)
-                        z_ref_prev = torch.where(seg_doc_start.unsqueeze(-1), bos_vec, shifted_z)
+                        shifted_z = torch.cat([start_vec[:1], z_refined_flat[:-1]], dim=0)
+                        z_ref_prev = torch.where(seg_doc_start.unsqueeze(-1), start_vec, shifted_z)
                     else:
-                        z_ref_prev = bos_vec
+                        z_ref_prev = start_vec
 
                     z_dec_flat, copy_stem_flat, bal_dec = self.cortical.decode_parallel(
                         z_ref_prev=z_ref_prev,
@@ -1972,6 +2148,7 @@ class DCPAModel(nn.Module):
                         pre_edges=pre_edges_flat,
                         pre_salience=pre_sal_flat,
                         pre_phase=pre_phase_flat,
+                        ring=ring_mem,
                     )
 
                     if use_cq:
@@ -2152,20 +2329,98 @@ class DCPAModel(nn.Module):
             if beta_count > 0:
                 mean_beta_t = (beta_sum_t / float(beta_count)).detach()
 
-            pmd_out = self.pmd.decode_teacher_forced(
-                target_bytes=raw_bytes,
-                cu_seqlens=sgsc_out.cu_seqlens,
-                f_out_seg=f_out_flat,
-                delta_syn_seg=delta_syn_flat,
-                l_reg=l_reg,
-                m_init=m_init,
-                xi_init=xi_init,
-                doc_cu_seqlens=doc_cu_seqlens,
-                known_max_seg_len=self.cfg.max_seg_len + 4,
-            )
+            if carry_mode:
+                assert doc_carry is not None and carry_cont is not None and row_layout is not None
+                m0_vec = self.pmd.m0 if m_init is None else m_init.reshape(-1)
+                pmd_m0_ent = torch.where(
+                    carry_cont.unsqueeze(-1),
+                    doc_carry.pmd_m.to(device=device, dtype=m0_vec.dtype),
+                    m0_vec.unsqueeze(0).expand(row_layout.n_entries, -1),
+                )
+                pmd_out = self.pmd.decode_teacher_forced(
+                    target_bytes=raw_bytes,
+                    cu_seqlens=sgsc_out.cu_seqlens,
+                    f_out_seg=f_out_flat,
+                    delta_syn_seg=delta_syn_flat,
+                    l_reg=l_reg,
+                    doc_cu_seqlens=doc_cu_seqlens,
+                    known_max_seg_len=self.cfg.max_seg_len + 4,
+                    row_layout=row_layout,
+                    entry_cont=carry_cont,
+                    entry_m0=pmd_m0_ent,
+                    entry_xi0=doc_carry.pmd_xi.to(device=device),
+                    entry_prev_byte=doc_carry.last_byte.to(device=device),
+                )
+            else:
+                pmd_out = self.pmd.decode_teacher_forced(
+                    target_bytes=raw_bytes,
+                    cu_seqlens=sgsc_out.cu_seqlens,
+                    f_out_seg=f_out_flat,
+                    delta_syn_seg=delta_syn_flat,
+                    l_reg=l_reg,
+                    m_init=m_init,
+                    xi_init=xi_init,
+                    doc_cu_seqlens=doc_cu_seqlens,
+                    known_max_seg_len=self.cfg.max_seg_len + 4,
+                )
             out_graph = g_state
             out_fast = f_state
             out_elig = e_state
+
+            if carry_mode and m_total > 0:
+                # Per-entry end-of-chunk carry (detached) for the next optimizer step.
+                assert doc_carry is not None and carry_cont is not None and row_layout is not None
+                assert carry_seg_pad_pos is not None and carry_ring_valid is not None and out_graph is not None
+                assert z_star_flat is not None and carry_entry_depth is not None
+                with torch.no_grad():
+                    end_b = (row_layout.ends - 1).clamp_min(0)
+                    last_seg = (seg_offsets.to(torch.int64) + seg_counts.to(torch.int64) - 1).clamp_min(0)
+                    new_kv, new_pos, new_dep, new_val = advance_ring(
+                        doc_carry.ring_kv.to(device=device, dtype=torch.float32),
+                        doc_carry.ring_pos.to(device=device, dtype=torch.int64),
+                        doc_carry.ring_depth.to(device=device, dtype=torch.int32),
+                        carry_ring_valid,
+                        c_kv_all.detach().float(),
+                        pos_in_doc,
+                        seg_end_depth.to(torch.int32),
+                        carry_seg_pad_pos,
+                        carry_q_pad,
+                        seg_counts,
+                    )
+                    doc_pos_prev = torch.where(
+                        carry_cont,
+                        doc_carry.doc_pos.to(device=device, dtype=torch.int64),
+                        torch.zeros_like(seg_counts, dtype=torch.int64),
+                    )
+                    doc_carry_out = DocCarryState(
+                        cont_mask=torch.ones_like(carry_cont),
+                        sgsc_h=sgsc_out.h_seq[0, end_b].float(),
+                        last_info=sgsc_out.info[0, end_b].float(),
+                        pmd_m=pmd_out.m_seq[0, end_b].float(),
+                        pmd_xi=pmd_out.stack_xi[0, end_b].float(),
+                        last_byte=raw_bytes[0, end_b].long(),
+                        scope_depth=carry_entry_depth,
+                        slots=out_graph.slots.float(),
+                        edges=out_graph.edges.float(),
+                        salience=out_graph.salience.float(),
+                        slot0_pinned=(
+                            out_graph.slot0_pinned.float()
+                            if out_graph.slot0_pinned is not None
+                            else torch.zeros((V,), device=device, dtype=torch.float32)
+                        ),
+                        phase=(
+                            out_graph.phase.float()
+                            if out_graph.phase is not None
+                            else torch.zeros((V, K), device=device, dtype=torch.float32)
+                        ),
+                        ring_kv=new_kv,
+                        ring_pos=new_pos,
+                        ring_depth=new_dep,
+                        ring_valid=new_val,
+                        doc_pos=doc_pos_prev + seg_counts.to(torch.int64),
+                        prev_z_ref=z_star_flat[last_seg].float(),
+                        max_entry_bytes=int(doc_carry.max_entry_bytes),
+                    ).detached()
 
         with fp32_island(device):
             ce_per_byte = F.cross_entropy(
@@ -2266,6 +2521,7 @@ class DCPAModel(nn.Module):
             loss_moe_bal=loss_moe_bal,
             metrics_tensor=metrics_tensor,
             cortical_state=out_cortical,
+            doc_carry_out=doc_carry_out,
         )
 
     def forward_and_backward_tbptt(
@@ -2305,6 +2561,7 @@ class DCPAModel(nn.Module):
         sync_metrics: bool = True,
         loss_scale: float = 1.0,
         tbptt_window: Optional[int] = None,
+        doc_carry: Optional[DocCarryState] = None,
     ) -> DCPAForwardOutput:
         """Window-bounded TBPTT forward + backward for DCPA-Turbo.
 
@@ -2353,6 +2610,7 @@ class DCPAModel(nn.Module):
                 ach_override=ach_override,
                 record_traces=record_traces,
                 sync_metrics=sync_metrics,
+                doc_carry=doc_carry,
             )
         finally:
             self.bcg_tbptt_window = prev_w

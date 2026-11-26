@@ -134,6 +134,16 @@ hardware:
   bcg_chunk_steps: 16                      # Pack 16 zero-MoE contractive clause steps per compiled graph (8x less Python/chunk dispatch)
   bcg_tbptt_window: 32
   bcg_tbptt_replay: auto
+  # A1 stream carry (Stages B/C, default ON on feat/dcpa-turbo-parallel): S parallel byte streams x `stream_chunk_bytes`
+  # per micro-step with detached recurrent state (SGSC/PMD scans, scope depth, BCG-PC graph, cortical W-ring, causal shift)
+  # carried across optimizer steps -> serial BCG depth ~chunk/rho instead of ~max_doc_bytes/rho, BCG width ~S streams.
+  # Disable with `stream_carry: false` or `--no-stream-carry`.
+  stream_carry: true
+  stream_chunk_bytes: 512
+  stream_min_piece_bytes: 64
+  # A2 (CUDA only, default ON on feat/dcpa-turbo-parallel): CUDA-Graph (`reduce-overhead`) capture of the static-shape
+  # BCG-PC clause-chunk kernel (used when chunk activation checkpointing is not engaged; auto-falls back on capture errors).
+  bcg_cudagraphs: true
   prefetch_depth: 3
   prefetch_workers: 2
   auto_sharding_tiers:

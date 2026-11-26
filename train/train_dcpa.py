@@ -51,12 +51,14 @@ for _p in (str(_REPO_ROOT), str(_TRAIN_PY)):
         sys.path.insert(0, _p)
 
 from data.ragged_dataloader import RaggedByteDataset
+from data.stream_carry_packer import StreamCarryPacker
 from data.wug_generator import sample_wug_episode_fast
 from dcpa.compile_utils import configure_model_compile, unwrap_compiled_module
 from dcpa.config import DCPAConfig
 from dcpa.data.synthetic import generate_dyck_sequence, generate_grid_physics_episode
 from dcpa.export import extract_flat_state_dict
 from dcpa.model import DCPAModel, materialize_metric_vec
+from dcpa.stream_carry import StreamCarryBank
 from train.colab_drive_sync import (
     ABDriveSyncManager,
     CheckpointTrigger,
@@ -792,6 +794,9 @@ def run_training(
     auto_lr_scale: bool = True,
     length_bucketing: bool = True,
     bf16_grad_comm: bool = True,
+    stream_carry: Optional[bool] = None,
+    stream_chunk_bytes: Optional[int] = None,
+    bcg_cudagraphs: Optional[bool] = None,
     use_wandb: Optional[bool] = None,
     wandb_project: Optional[str] = None,
     wandb_entity: Optional[str] = None,
@@ -1088,6 +1093,7 @@ def run_training(
             if compile_mode is not None
             else str(hw_cfg.get("compile_mode", "none"))
         )
+        eff_bcg_cudagraphs = bool(hw_cfg.get("bcg_cudagraphs", True)) if bcg_cudagraphs is None else bool(bcg_cudagraphs)
         compile_report = configure_model_compile(
             model,
             compile_mode=req_compile_mode,
@@ -1096,6 +1102,7 @@ def run_training(
             cache_size_limit=int(hw_cfg.get("compile_cache_size_limit", 128)),
             allow_cpu_compile=allow_cpu_compile,
             cache_dir=local_cache / "compile_cache",
+            bcg_cudagraphs=eff_bcg_cudagraphs,
         )
         _r0_print(
             f"[Compile] requested={compile_report.requested_mode} -> effective={compile_report.effective_mode} "
@@ -1205,6 +1212,40 @@ def run_training(
                 f"{[p[0].name for p in stream._cap_shards]}",
                 flush=True,
             )
+
+        # A1: cross-step stateful stream carry for Stages B/C (serial BCG depth ~chunk/rho instead of ~doc/rho)
+        eff_stream_carry = bool(hw_cfg.get("stream_carry", True)) if stream_carry is None else bool(stream_carry)
+        eff_stream_chunk = int(
+            stream_chunk_bytes if stream_chunk_bytes is not None else hw_cfg.get("stream_chunk_bytes", 512)
+        )
+        carry_packer: Optional[StreamCarryPacker] = None
+        carry_bank: Optional[StreamCarryBank] = None
+        carry_active_stage: Optional[int] = None
+        if eff_stream_carry:
+            eff_stream_chunk = max(64, min(eff_stream_chunk, eff_micro_bytes))
+            raw_rows = max(1, eff_micro_bytes // eff_stream_chunk)
+            entry_cap = 1 << (raw_rows.bit_length() - 1)  # static power-of-two BCG batch width
+            n_carry_streams = max(1, entry_cap - entry_cap // 8)  # leave 1/8 headroom for same-step refills
+            carry_packer = StreamCarryPacker(
+                n_carry_streams,
+                eff_stream_chunk,
+                min_piece_bytes=int(hw_cfg.get("stream_min_piece_bytes", 64)),
+                max_entries=entry_cap,
+            )
+            carry_bank = StreamCarryBank.from_config(cfg, n_carry_streams, device)
+            _r0_print(
+                f"[StreamCarry] enabled for Stages B/C | streams={n_carry_streams} | chunk={eff_stream_chunk}B | "
+                f"entry_cap={entry_cap} | bcg_cudagraphs={eff_bcg_cudagraphs}",
+                flush=True,
+            )
+
+        def _reset_stream_carry() -> None:
+            nonlocal carry_active_stage
+            if carry_packer is not None:
+                carry_packer.reset()
+            if carry_bank is not None:
+                carry_bank.reset()
+            carry_active_stage = None
 
         # Resume handling (auto: Colab A/B Ping-Pong first if configured, else local CheckpointManager)
         start_step = 0
@@ -1400,7 +1441,21 @@ def run_training(
                 step_loss_finite = True
 
                 for _micro_idx in range(grad_accum_steps):
-                    batch = stream.next_batch(target_batch_bytes=eff_micro_bytes, state=sc)
+                    use_carry = carry_packer is not None and carry_bank is not None and sc.model_stage in ("B", "C")
+                    doc_carry = None
+                    if use_carry:
+                        assert carry_packer is not None and carry_bank is not None
+                        if carry_active_stage != sc.stage_id:
+                            _reset_stream_carry()
+                            carry_active_stage = sc.stage_id
+                        batch = carry_packer.next_batch(
+                            lambda: stream.next_batch(target_batch_bytes=eff_micro_bytes, state=sc)
+                        )
+                        doc_carry = carry_bank.gather(batch["carry_from"], max_entry_bytes=eff_stream_chunk)
+                    else:
+                        if carry_active_stage is not None:
+                            _reset_stream_carry()
+                        batch = stream.next_batch(target_batch_bytes=eff_micro_bytes, state=sc)
                     # Check Stage-2 loss_mask homogeneity on CPU before async H2D DMA (zero CUDA sync!)
                     loss_mask_all_ones: Optional[bool] = (
                         bool(batch["loss_mask"].all()) if sc.stage_id == 2 else None
@@ -1467,6 +1522,7 @@ def run_training(
                                 record_traces=False,
                                 sync_metrics=False,
                                 loss_scale=1.0 / float(grad_accum_steps),
+                                doc_carry=doc_carry,
                             )
                         else:
                             out = model(
@@ -1492,12 +1548,15 @@ def run_training(
                                 doc_cu_seqlens=cu_seqlens,
                                 record_traces=False,
                                 sync_metrics=False,
+                                doc_carry=doc_carry,
                             )
 
                     # Launch backward IMMEDIATELY with zero pre-backward GPU->CPU sync bubbles!
                     if not use_tbptt_replay_step:
                         scaled_loss = out.loss_total / float(grad_accum_steps)
                         scaled_loss.backward()
+                    if use_carry and carry_bank is not None:
+                        carry_bank.store(out.doc_carry_out, batch["carry_save"])
 
                     if out.metrics_tensor is not None:
                         m_vec = torch.cat(
@@ -1554,6 +1613,7 @@ def run_training(
                 )
                 if action.triggered:
                     optimizer.zero_grad(set_to_none=True)
+                    _reset_stream_carry()
                     rollback_events.append(action.event_record)
                     if wb_tracker is not None:
                         wb_tracker.log_watchdog_rollback(
@@ -1897,6 +1957,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--fixed-global-batch", action="store_true", help="Keep exact global step bytes across ranks instead of saturating per-GPU micro-batch.")
     ap.add_argument("--no-auto-lr-scale", action="store_true", help="Disable automatic sqrt(batch) LR scaling when multi-GPU expands global batch.")
     ap.add_argument("--no-length-bucketing", action="store_true", help="Disable length-homogeneous Ragged batch packing.")
+    ap.add_argument(
+        "--stream-carry",
+        dest="stream_carry",
+        action="store_true",
+        default=None,
+        help="Stages B/C: stream-TBPTT across steps (parallel byte streams + carried detached state).",
+    )
+    ap.add_argument("--no-stream-carry", dest="stream_carry", action="store_false", help="Disable stream carry.")
+    ap.add_argument("--stream-chunk-bytes", type=int, default=None, help="Bytes per stream per micro-step (default 512).")
+    ap.add_argument(
+        "--bcg-cudagraphs",
+        dest="bcg_cudagraphs",
+        action="store_true",
+        default=None,
+        help="CUDA: capture the static-shape BCG-PC clause-chunk kernel with CUDA Graphs (reduce-overhead).",
+    )
+    ap.add_argument("--no-bcg-cudagraphs", dest="bcg_cudagraphs", action="store_false")
     ap.add_argument("--data-dir", type=str, default="artifacts/data")
     ap.add_argument("--cap-data-dir", type=str, default=None, help="Optional Stage 3 capability shards dir (cap_reasoning/writing)")
     ap.add_argument("--ckpt-dir", type=str, default=None)
@@ -1997,6 +2074,9 @@ def main() -> None:
             fixed_global_batch=args.fixed_global_batch,
             auto_lr_scale=not args.no_auto_lr_scale,
             length_bucketing=not args.no_length_bucketing,
+            stream_carry=args.stream_carry,
+            stream_chunk_bytes=args.stream_chunk_bytes,
+            bcg_cudagraphs=args.bcg_cudagraphs,
             use_wandb=args.use_wandb,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,

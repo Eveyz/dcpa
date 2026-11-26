@@ -573,8 +573,13 @@ def main() -> None:
     ap.add_argument("--target-mb", type=float, default=100.0)
     ap.add_argument("--smoke-quota", action="store_true")
     ap.add_argument("--offline", action="store_true")
+    ap.add_argument("--hf-token", type=str, default=None, help="Optional HF Hub token (overrides HF_TOKEN/local.env/Colab Secrets)")
     ap.add_argument("--seed", type=int, default=202614)
     args = ap.parse_args()
+    if not args.offline:
+        from data.hf_auth import configure_hf_auth
+
+        configure_hf_auth(args.hf_token)
 
     res = build_cap_instruct_corpus(
         out_dir=args.out_dir,

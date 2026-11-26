@@ -221,8 +221,9 @@ def stream_en_finephrase_s1() -> Iterator[tuple[bytes, int]]:
     """Stage 1 (`64..512 B`): `HuggingFaceFW/finephrase` high-clarity rephrased paragraphs."""
     try:
         from datasets import load_dataset
+        from data.hf_auth import hf_token_kwargs
 
-        ds = load_dataset("HuggingFaceFW/finephrase", split="train", streaming=True)
+        ds = load_dataset("HuggingFaceFW/finephrase", split="train", streaming=True, **hf_token_kwargs())
         for row in ds:
             raw = row.get("text") or row.get("rephrased_text") or row.get("content") or ""
             for chunk in _chunk_bounded_paragraphs(str(raw), min_b=80, max_b=500):
@@ -237,8 +238,9 @@ def stream_en_us_pd_books_s1() -> Iterator[tuple[bytes, int]]:
     """Stage 1 (`90..512 B`): `storytracer/US-PD-Books` literary & classic non-fiction paragraphs."""
     try:
         from datasets import load_dataset
+        from data.hf_auth import hf_token_kwargs
 
-        ds = load_dataset("storytracer/US-PD-Books", split="train", streaming=True)
+        ds = load_dataset("storytracer/US-PD-Books", split="train", streaming=True, **hf_token_kwargs())
         for row in ds:
             raw = row.get("text") or ""
             if not isinstance(raw, str) or len(raw) < 200:
@@ -257,8 +259,9 @@ def stream_en_cosmopedia_s2() -> Iterator[tuple[bytes, int]]:
     """Stage 2/3 (`600..3600 B`): `HuggingFaceTB/cosmopedia-v2` rhetoric, philosophy, history & STEM."""
     try:
         from datasets import load_dataset
+        from data.hf_auth import hf_token_kwargs
 
-        ds = load_dataset("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2", split="train", streaming=True)
+        ds = load_dataset("HuggingFaceTB/cosmopedia-v2", "cosmopedia-v2", split="train", streaming=True, **hf_token_kwargs())
         for row in ds:
             raw = row.get("text") or ""
             for chunk in _chunk_bounded_paragraphs(str(raw), min_b=560, max_b=3600):
@@ -273,8 +276,9 @@ def stream_zh_cci3_hq_s2() -> Iterator[tuple[bytes, int]]:
     """Stage 2/3 (`600..3800 B`): `BAAI/CCI3-HQ` when HF_TOKEN authorized (silent fallback if gated)."""
     try:
         from datasets import load_dataset
+        from data.hf_auth import hf_token_kwargs
 
-        ds = load_dataset("BAAI/CCI3-HQ", split="train", streaming=True)
+        ds = load_dataset("BAAI/CCI3-HQ", split="train", streaming=True, **hf_token_kwargs())
         for row in ds:
             raw = row.get("text") or row.get("content") or ""
             for chunk in _chunk_bounded_paragraphs(str(raw), min_b=560, max_b=3800):
@@ -292,11 +296,14 @@ def stream_formal_folio_and_logic_s2(max_folio_epochs: int = 3) -> Iterator[tupl
     """Stage 2 (`lang_id=2`): `tasksource/folio` (`<= 3 epochs`), `tasksource/proofwriter`, `lucasmccabe/logiqa`."""
     try:
         from datasets import load_dataset
+        from data.hf_auth import hf_token_kwargs
+
+        tok_kw = hf_token_kwargs()
 
         # 1. FOLIO (strictly capped at <= 3 epochs to prevent memorization)
         folio_rows: list[bytes] = []
         try:
-            ds_f = load_dataset("tasksource/folio", split="train", streaming=True)
+            ds_f = load_dataset("tasksource/folio", split="train", streaming=True, **tok_kw)
             for row in ds_f:
                 prem = str(row.get("premises") or "").strip()
                 fol = str(row.get("premises-FOL") or "").strip()
@@ -323,7 +330,7 @@ def stream_formal_folio_and_logic_s2(max_folio_epochs: int = 3) -> Iterator[tupl
 
         # 2. ProofWriter deductive chains
         try:
-            ds_pw = load_dataset("tasksource/proofwriter", split="train", streaming=True)
+            ds_pw = load_dataset("tasksource/proofwriter", split="train", streaming=True, **tok_kw)
             for row in ds_pw:
                 theory = str(row.get("theory") or row.get("context") or "").strip()
                 q = str(row.get("question") or "").strip()
@@ -345,7 +352,7 @@ def stream_formal_folio_and_logic_s2(max_folio_epochs: int = 3) -> Iterator[tupl
 
         # 3. LogiQA deductive arguments
         try:
-            ds_lq = load_dataset("lucasmccabe/logiqa", split="train", streaming=True)
+            ds_lq = load_dataset("lucasmccabe/logiqa", split="train", streaming=True, **tok_kw)
             for row in ds_lq:
                 ctx = str(row.get("context") or "").strip()
                 query = str(row.get("query") or "").strip()
@@ -372,8 +379,9 @@ def stream_formal_finemath_s2_s3() -> Iterator[tuple[bytes, int]]:
     """Stage 2/3 (`lang_id=2`): `HuggingFaceTB/finemath` (`finemath-4plus`) mathematical proofs."""
     try:
         from datasets import load_dataset
+        from data.hf_auth import hf_token_kwargs
 
-        ds = load_dataset("HuggingFaceTB/finemath", "finemath-4plus", split="train", streaming=True)
+        ds = load_dataset("HuggingFaceTB/finemath", "finemath-4plus", split="train", streaming=True, **hf_token_kwargs())
         for row in ds:
             raw = str(row.get("text") or "")
             for chunk in _chunk_bounded_paragraphs(raw, min_b=160, max_b=3600):
@@ -389,9 +397,11 @@ def stream_python_edu_and_swallow() -> Iterator[tuple[str, int]]:
     """Stage 1 `smollm-corpus (python-edu)` (`sid=24`) + Stage 2 `tokyotech-llm/swallow-code-v2` (`sid=32`)."""
     try:
         from datasets import load_dataset
+        from data.hf_auth import hf_token_kwargs
 
+        tok_kw = hf_token_kwargs()
         try:
-            ds_edu = load_dataset("HuggingFaceTB/smollm-corpus", "python-edu", split="train", streaming=True)
+            ds_edu = load_dataset("HuggingFaceTB/smollm-corpus", "python-edu", split="train", streaming=True, **tok_kw)
             for row in ds_edu:
                 code = str(row.get("text") or row.get("content") or "").strip()
                 if 64 <= len(code.encode("utf-8", errors="ignore")) <= 512:
@@ -401,7 +411,7 @@ def stream_python_edu_and_swallow() -> Iterator[tuple[str, int]]:
 
         for repo in ("tokyotech-llm/swallow-code-v2", "tokyotech-llm/swallow-code"):
             try:
-                ds_sw = load_dataset(repo, split="train", streaming=True)
+                ds_sw = load_dataset(repo, split="train", streaming=True, **tok_kw)
                 for row in ds_sw:
                     code = str(row.get("text") or row.get("code") or row.get("content") or "").strip()
                     if 160 <= len(code.encode("utf-8", errors="ignore")) <= 4096:
@@ -419,8 +429,9 @@ def stream_sql_create_context_s2() -> Iterator[tuple[bytes, int]]:
     """Stage 1/2 (`lang_id=4`): `b-mc2/sql-create-context` schema-grounded SQL queries."""
     try:
         from datasets import load_dataset
+        from data.hf_auth import hf_token_kwargs
 
-        ds = load_dataset("b-mc2/sql-create-context", split="train", streaming=True)
+        ds = load_dataset("b-mc2/sql-create-context", split="train", streaming=True, **hf_token_kwargs())
         for row in ds:
             ctx = str(row.get("context") or "").strip()
             q = str(row.get("question") or "").strip()

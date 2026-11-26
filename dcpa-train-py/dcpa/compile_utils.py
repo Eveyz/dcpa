@@ -334,10 +334,13 @@ def configure_model_compile(
     allow_cpu_compile: bool = False,
     cpu_backend: str = "aot_eager",
     cache_dir: Optional[str | Path] = None,
+    bcg_cudagraphs: bool = True,
 ) -> CompileReport:
     """Selectively compile ONLY static-shape Hotspot A (BCG step) & Hotspot B (SGSC/PMD byte scans).
 
     NEVER wraps the outer `DCPAModel` root in `fullgraph=True`.
+    `bcg_cudagraphs=True` (CUDA only) additionally captures the static-shape BCG-PC clause-chunk kernel
+    with CUDA Graphs (`mode="reduce-overhead"`), removing per-chunk launch overhead of the serial loop.
     """
     eff_mode, reason = resolve_compile_mode(compile_mode, device, allow_cpu_compile=allow_cpu_compile)
 
@@ -419,6 +422,9 @@ def configure_model_compile(
         if hasattr(bcg_raw, "enable_compiled_chunk_kernel"):
             bcg_raw.enable_compiled_chunk_kernel(**compile_kwargs)
             hotspots.append("bcg_chunk_kernel")
+        if bcg_cudagraphs and use_cuda_inductor and hasattr(bcg_raw, "enable_cudagraph_chunk_kernel"):
+            bcg_raw.enable_cudagraph_chunk_kernel(**compile_kwargs)
+            hotspots.append("bcg_chunk_cudagraph")
         if hasattr(bcg_raw, "enable_compiled_ponder_parallel"):
             bcg_raw.enable_compiled_ponder_parallel(**compile_kwargs)
             hotspots.append("bcg_ponder_parallel_kernel")

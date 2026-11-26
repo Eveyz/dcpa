@@ -14,6 +14,7 @@ Implements Engineering Blueprint Section 2.3 & Theory Doc Part 2.II:
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -790,6 +791,7 @@ class BCGPC(nn.Module):
         self._compiled_chunk_fn: Optional[Callable[..., Any]] = None
         self._compiled_clause_chunk_fn: Optional[Callable[..., Any]] = None
         self._compiled_ponder_parallel: Optional[Callable[..., Any]] = None
+        self._cudagraph_chunk_fn: Optional[Callable[..., Any]] = None
 
         self._init_weights()
 
@@ -802,6 +804,27 @@ class BCGPC(nn.Module):
         compiled_fn = torch.compile(self._forward_clause_chunk_impl, **compile_kwargs)
         self._compiled_chunk_fn = compiled_fn
         self._compiled_clause_chunk_fn = compiled_fn
+
+    def _forward_clause_chunk_cudagraph_impl(self, *args: Any) -> tuple[torch.Tensor, ...]:
+        """Distinct code object for the CUDA-Graph (`reduce-overhead`) compiled clause-chunk kernel."""
+        return self._forward_clause_chunk_impl(*args)
+
+    def enable_cudagraph_chunk_kernel(self, **compile_kwargs: Any) -> None:
+        """A2: capture the static-shape clause-chunk kernel with CUDA Graphs (cudagraph trees, fwd + bwd).
+
+        Shapes depend only on the (power-of-two bucketed) batch width and the fixed `K_chunk`, so a handful
+        of graphs are recorded once and then replayed with ~zero kernel-launch overhead per serial chunk.
+        Only used outside activation checkpointing (recompute under cudagraphs is not supported).
+        """
+        kw = dict(compile_kwargs)
+        kw.pop("backend", None)
+        kw["mode"] = "reduce-overhead"
+        kw["dynamic"] = False
+        self._cudagraph_chunk_fn = torch.compile(self._forward_clause_chunk_cudagraph_impl, **kw)
+
+    @property
+    def has_cudagraph_chunk_kernel(self) -> bool:
+        return self._cudagraph_chunk_fn is not None
 
     def enable_compiled_ponder_parallel(self, **compile_kwargs: Any) -> None:
         """Compile zero-sync static-bucketed `ponder_parallel` into a single Inductor graph."""
@@ -827,6 +850,7 @@ class BCGPC(nn.Module):
         self._compiled_chunk_fn = None
         self._compiled_clause_chunk_fn = None
         self._compiled_ponder_parallel = None
+        self._cudagraph_chunk_fn = None
 
     def _init_weights(self) -> None:
         # Initialize f_prec bias so Softplus(bias) ~ 1.0 and w_gen near identity so pondering
@@ -1716,7 +1740,35 @@ class BCGPC(nn.Module):
         gumbel_u_seq: Optional[torch.Tensor] = None,
         use_gumbel: bool = True,
         check_pin: bool = True,
+        use_cudagraph: bool = False,
     ) -> tuple[torch.Tensor, ...]:
+        if use_cudagraph and self._cudagraph_chunk_fn is not None:
+            try:
+                return self._cudagraph_chunk_fn(
+                    slots,
+                    edges,
+                    salience,
+                    phase,
+                    slot0_pinned,
+                    c_fused_seq,
+                    prec_bu_seq,
+                    ach_seq,
+                    active_mask_seq,
+                    trig_seq,
+                    unpin_seq,
+                    tau_m,
+                    mix_t,
+                    gumbel_u_seq,
+                    use_gumbel,
+                    check_pin,
+                )
+            except Exception as exc:  # pragma: no cover - CUDA-only safety net
+                warnings.warn(
+                    f"[BCG-PC] CUDA-Graph clause-chunk kernel failed ({type(exc).__name__}: {exc}); "
+                    "permanently falling back to the regular compiled kernel.",
+                    RuntimeWarning,
+                )
+                self._cudagraph_chunk_fn = None
         fn = (
             self._compiled_chunk_fn
             if self._compiled_chunk_fn is not None

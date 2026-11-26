@@ -560,7 +560,9 @@ def _stream_hf_toolcalls(max_items: int, rng: random.Random) -> Iterator[tuple[l
     # 2. Optional gated Salesforce/xlam-function-calling-60k only if HF_TOKEN is explicitly provided
     if yielded < max_items and os.environ.get("HF_TOKEN"):
         try:
-            ds_xl = load_dataset("Salesforce/xlam-function-calling-60k", split="train", streaming=True)
+            from data.hf_auth import hf_token_kwargs
+
+            ds_xl = load_dataset("Salesforce/xlam-function-calling-60k", split="train", streaming=True, **hf_token_kwargs())
             for row in ds_xl:
                 if yielded >= max_items:
                     break
@@ -746,8 +748,13 @@ def main() -> None:
     ap.add_argument("--target-mb", type=float, default=60.0)
     ap.add_argument("--smoke-quota", action="store_true", help="Build 2 MB local smoke quota")
     ap.add_argument("--offline", action="store_true", help="Zero-network deterministic synthesis")
+    ap.add_argument("--hf-token", type=str, default=None, help="Optional HF Hub token (overrides HF_TOKEN/local.env/Colab Secrets)")
     ap.add_argument("--seed", type=int, default=202613)
     args = ap.parse_args()
+    if not args.offline:
+        from data.hf_auth import configure_hf_auth
+
+        configure_hf_auth(args.hf_token)
     res = build_cap_toolcall_corpus(
         out_dir=args.out_dir,
         target_mb=args.target_mb,

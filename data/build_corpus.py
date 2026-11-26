@@ -44,6 +44,7 @@ for _p in (str(_REPO_ROOT), str(_TRAIN_PY)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from data.hf_auth import configure_hf_auth, hf_auth_headers, hf_token_kwargs
 from data.cognitive_v2_sources import (
     COGNITIVE_V2_DOMAIN_IDS,
     COGNITIVE_V2_DOMAIN_NAMES,
@@ -535,7 +536,7 @@ def _stream_en_babylm() -> Iterator[tuple[bytes, int]]:
     from datasets import load_dataset
 
     sid = SOURCE_IDS["nilq/babylm-10M"]
-    ds = load_dataset("nilq/babylm-10M", split="train", streaming=True)
+    ds = load_dataset("nilq/babylm-10M", split="train", streaming=True, **hf_token_kwargs())
     it = iter(ds)
     buf_lines: list[str] = []
     buf_bytes = 0
@@ -577,7 +578,7 @@ def _stream_en_tinystories() -> Iterator[tuple[bytes, int]]:
     from datasets import load_dataset
 
     sid = SOURCE_IDS["roneneldan/TinyStories"]
-    ds = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
+    ds = load_dataset("roneneldan/TinyStories", split="train", streaming=True, **hf_token_kwargs())
     it = iter(ds)
     try:
         for row in it:
@@ -600,7 +601,8 @@ def _stream_zh_fineweb_v21(max_shards: int) -> Iterator[tuple[bytes, int]]:
     from huggingface_hub import HfApi
 
     sid = SOURCE_IDS["opencsg/Fineweb-Edu-Chinese-V2.1:4_5"]
-    api = HfApi()
+    tok_kw = hf_token_kwargs()
+    api = HfApi(**tok_kw)
     all_files = api.list_repo_files("opencsg/Fineweb-Edu-Chinese-V2.1", repo_type="dataset")
     parquet_45 = sorted(
         f for f in all_files if f.startswith(("4_5/", "4-5/")) and f.endswith(".parquet")
@@ -614,6 +616,7 @@ def _stream_zh_fineweb_v21(max_shards: int) -> Iterator[tuple[bytes, int]]:
         data_files=selected,
         split="train",
         streaming=True,
+        **tok_kw,
     )
     it = iter(ds)
     try:
@@ -638,7 +641,7 @@ def _stream_zh_fineweb_v3() -> Iterator[tuple[bytes, int]]:
     from huggingface_hub import HfApi, hf_hub_url
 
     sid = SOURCE_IDS["opencsg/Fineweb-Edu-Chinese-V3"]
-    api = HfApi()
+    api = HfApi(**hf_token_kwargs())
     files = api.list_repo_files("opencsg/Fineweb-Edu-Chinese-V3", repo_type="dataset")
     # Prioritize Chinese-dense technical/textbook tarballs first
     preferred = [
@@ -659,7 +662,7 @@ def _stream_zh_fineweb_v3() -> Iterator[tuple[bytes, int]]:
 
     for tar_name in tar_files:
         url = hf_hub_url("opencsg/Fineweb-Edu-Chinese-V3", tar_name, repo_type="dataset")
-        req = urllib.request.Request(url, headers={"User-Agent": "dcpa-corpus-builder/1.0"})
+        req = urllib.request.Request(url, headers=hf_auth_headers())
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 with tarfile.open(fileobj=resp, mode="r|gz") as tf:
@@ -739,7 +742,7 @@ def _stream_ja_opus(mode: str) -> Iterator[tuple[bytes, int]]:
         src_k, tgt_k = "en", "zh"
         sid = SOURCE_IDS["Helsinki-NLP/opus-100:en-zh(pair)"]
 
-    ds = load_dataset("Helsinki-NLP/opus-100", name=cfg_name, split="train", streaming=True)
+    ds = load_dataset("Helsinki-NLP/opus-100", name=cfg_name, split="train", streaming=True, **hf_token_kwargs())
     it = iter(ds)
     buf: list[str] = []
     buf_bytes = 0
@@ -805,7 +808,7 @@ def _stream_tiny_codes(lang: str) -> Iterator[tuple[str, int]]:
         ds = None
         it = None
         try:
-            ds = load_dataset(repo, split="train", streaming=True)
+            ds = load_dataset(repo, split="train", streaming=True, **hf_token_kwargs())
             it = iter(ds)
             first = next(it)
         except Exception as exc:
@@ -861,7 +864,7 @@ def _stream_en_fineweb_edu_stem() -> Iterator[tuple[bytes, int]]:
     ds = None
     it = None
     try:
-        ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True, **hf_token_kwargs())
         it = iter(ds)
         for row in it:
             int_sc = row.get("int_score")
@@ -895,7 +898,7 @@ def _stream_en_open_web_math() -> Iterator[tuple[bytes, int]]:
     ds = None
     it = None
     try:
-        ds = load_dataset("open-web-math/open-web-math", split="train", streaming=True)
+        ds = load_dataset("open-web-math/open-web-math", split="train", streaming=True, **hf_token_kwargs())
         it = iter(ds)
         for row in it:
             raw = row.get("text")
@@ -921,7 +924,7 @@ def _stream_ja_wikipedia() -> Iterator[tuple[bytes, int]]:
     ds = None
     it = None
     try:
-        ds = load_dataset("wikimedia/wikipedia", name="20231101.ja", split="train", streaming=True)
+        ds = load_dataset("wikimedia/wikipedia", name="20231101.ja", split="train", streaming=True, **hf_token_kwargs())
         it = iter(ds)
         for row in it:
             raw = row.get("text")
@@ -1614,8 +1617,11 @@ def build_corpus(
     workers: int = 1,
     cognitive_v2: bool = False,
     offline: bool = False,
+    hf_token: Optional[str] = None,
 ) -> dict[str, Any]:
     """Stream, filter, deduplicate, and write DCPA `.bin/.idx/.meta.json` shards."""
+    if not offline:
+        configure_hf_auth(hf_token)
     out_path = Path(out_dir)
     if not allow_drive_output:
         _assert_local_output_dir(out_path)
@@ -1969,6 +1975,12 @@ def main() -> None:
         action="store_true",
         help="Skip external network downloads and synthesize deterministic multi-tier shards locally.",
     )
+    ap.add_argument(
+        "--hf-token",
+        type=str,
+        default=None,
+        help="Optional Hugging Face Hub token (overrides HF_TOKEN env / local.env / Colab Secrets).",
+    )
     ap.add_argument("--seed", type=int, default=2026)
     args = ap.parse_args()
 
@@ -1981,6 +1993,7 @@ def main() -> None:
         workers=args.workers,
         cognitive_v2=args.cognitive_v2,
         offline=args.offline,
+        hf_token=args.hf_token,
     )
 
 

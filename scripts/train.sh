@@ -80,6 +80,7 @@ for arg in "$@"; do
     --skip-sft) SKIP_SFT=1 ;;
     --git-pull) GIT_PULL=1 ;;
     --git-branch=*) GIT_PULL=1; GIT_BRANCH="${arg#*=}" ;;
+    --hf-token=*) export HF_TOKEN="${arg#*=}"; export HUGGING_FACE_HUB_TOKEN="${arg#*=}" ;;
     --wandb|--no-wandb) WANDB_ARGS+=("${arg}"); WANDB_SFT_ARGS+=("${arg}") ;;
     --wandb-project=*|--wandb-entity=*|--wandb-mode=*|--wandb-tags=*|--wandb-log-every=*)
       WANDB_ARGS+=("${arg}")

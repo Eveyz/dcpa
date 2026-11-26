@@ -681,8 +681,13 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=2026)
     ap.add_argument("--force", action="store_true", help="Rebuild even if valid shards already exist.")
     ap.add_argument("--offline-synthetic", action="store_true", help="Pass --offline to capability/SFT builders.")
+    ap.add_argument("--hf-token", type=str, default=None, help="Optional HF Hub token (overrides HF_TOKEN/local.env/Colab Secrets).")
     ap.add_argument("--dry-run", action="store_true", help="Print execution plan JSON without downloading data.")
     args = ap.parse_args()
+    if not args.dry_run and not args.offline_synthetic:
+        from data.hf_auth import configure_hf_auth
+
+        configure_hf_auth(args.hf_token)
 
     res = prepare_vast_corpus(
         profile=args.profile,

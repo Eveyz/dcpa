@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 import torch.nn as nn
@@ -28,6 +28,73 @@ from dcpa.modules.bcg_pc import _device_supports_grouped_mm
 from dcpa.ops.fp32 import fp32_island
 from dcpa.ops.rmsnorm import RMSNorm
 from dcpa.ops.rope import apply_concept_rope_2d
+
+
+class RingMemory(NamedTuple):
+    """Stream-carry cross-chunk window memory (previous chunk's last `W` segments per packed entry).
+
+    `seg_pad_pos [M]` maps every (possibly tile-padded) segment row to `entry * q_pad_len + local`
+    (padded rows map to the dump slot `V * q_pad_len`).
+    """
+
+    ring_kv: torch.Tensor  # [V, W, d_s]
+    ring_pos: torch.Tensor  # [V, W] int64
+    ring_depth: torch.Tensor  # [V, W] int
+    ring_valid: torch.Tensor  # [V, W] bool
+    seg_pad_pos: torch.Tensor  # [M] int64
+    q_pad_len: int
+
+
+def _ring_memory_attention(
+    q_rot: torch.Tensor,
+    w_uk: nn.Linear,
+    w_uv: nn.Linear,
+    ring: RingMemory,
+    pos_q: torch.Tensor,
+    cfg: DCPAConfig,
+    lo: int,
+    hi: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Attend each segment query to its entry's carried ring keys (`lo <= pos_q - ring_pos <= hi`).
+
+    Returns `(ctx [M, H, Dh] fp32, lse [M, H] fp32, probs [V, H, Qp, W] fp32)`; fully-masked rows get
+    `lse ~ -1e9` so their log-sum-exp merge weight is exactly 0.
+    """
+    M, H, Dh = q_rot.shape
+    V, W = ring.ring_pos.shape
+    Qp = int(ring.q_pad_len)
+    n_slots = V * Qp + 1
+    dev = q_rot.device
+
+    k = w_uk(ring.ring_kv.to(w_uk.weight.dtype)).view(V, W, H, Dh)
+    v = w_uv(ring.ring_kv.to(w_uv.weight.dtype)).view(V, W, H, Dh)
+    k_rot = apply_concept_rope_2d(
+        k, ring.ring_pos, ring.ring_depth, theta_base=cfg.rope_theta_concept, scope_period=cfg.rope_period
+    )
+    q_pad = q_rot.new_zeros((n_slots, H, Dh)).index_copy(0, ring.seg_pad_pos, q_rot)[: V * Qp].view(V, Qp, H, Dh)
+    pos_pad = torch.zeros((n_slots,), device=dev, dtype=torch.int64).index_copy(
+        0, ring.seg_pad_pos, pos_q.to(torch.int64)
+    )[: V * Qp].view(V, Qp)
+    with fp32_island(dev):
+        scores = torch.einsum("vqhd,vwhd->vhqw", q_pad.float(), k_rot.float()) * scale  # [V, H, Qp, W]
+        diff = pos_pad.unsqueeze(-1) - ring.ring_pos.to(torch.int64).unsqueeze(1)  # [V, Qp, W]
+        valid = ring.ring_valid.bool().unsqueeze(1) & (diff >= int(lo)) & (diff <= int(hi))
+        scores = torch.where(valid.unsqueeze(1), scores, torch.full_like(scores, -1.0e9))
+        lse = torch.logsumexp(scores, dim=-1)  # [V, H, Qp]
+        probs = torch.exp(scores - lse.unsqueeze(-1))
+        ctx = torch.einsum("vhqw,vwhd->vqhd", probs, v.float())  # [V, Qp, H, Dh]
+        ctx_flat = torch.cat([ctx.reshape(V * Qp, H, Dh), ctx.new_zeros((1, H, Dh))], dim=0)[ring.seg_pad_pos]
+        lse_flat = torch.cat(
+            [lse.permute(0, 2, 1).reshape(V * Qp, H), lse.new_full((1, H), -1.0e9)], dim=0
+        )[ring.seg_pad_pos]
+    return ctx_flat, lse_flat, probs
+
+
+def _lse_merge_weights(lse_a: torch.Tensor, lse_b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact joint-softmax merge weights `(exp(lse_a - L), exp(lse_b - L))` with `L = logaddexp(lse_a, lse_b)`."""
+    L = torch.logaddexp(lse_a, lse_b)
+    return torch.exp(lse_a - L), torch.exp(lse_b - L)
 
 
 @dataclass
@@ -302,6 +369,7 @@ class CorticalEncoderLayer(nn.Module):
         pos_in_doc: torch.Tensor,
         scope_depth: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
+        ring: Optional[RingMemory] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Tiled O(M * W) causal sliding-window attention (`0 <= m - n < W`) across `[M_total, D]`."""
         M, D = x.shape
@@ -365,7 +433,23 @@ class CorticalEncoderLayer(nn.Module):
         valid_safe = (valid | diag_fallback).unsqueeze(1)                    # [Nt, 1, W, 2W]
 
         scale = 1.0 / math.sqrt(float(Dh))
-        if device.type == "cuda" or (self.training and orig_dtype != torch.float32):
+        if ring is not None:
+            # Stream-carry: exact joint softmax over (in-chunk window ∪ carried ring) via log-sum-exp merge.
+            with fp32_island(device):
+                scores = torch.matmul(q_tiles.float(), k_2w.float().transpose(-2, -1)) * scale
+                scores = torch.where(valid_safe, scores, torch.full_like(scores, -1.0e9))
+                lse_in = torch.logsumexp(scores, dim=-1)  # [Nt, H, W]
+                attn = torch.exp(scores - lse_in.unsqueeze(-1))
+                ctx_tiles = torch.matmul(attn, v_2w.float())  # [Nt, H, W, Dh]
+                ctx_in = ctx_tiles.permute(0, 2, 1, 3).reshape(M_pad, H, Dh)[:M]
+                lse_in_f = lse_in.permute(0, 2, 1).reshape(M_pad, H)[:M]
+            ctx_mem, lse_mem, _ = _ring_memory_attention(
+                q_rot, self.w_uk, self.w_uv, ring, pos_in_doc, self.cfg, lo=1, hi=W - 1, scale=scale
+            )
+            with fp32_island(device):
+                a_in, a_mem = _lse_merge_weights(lse_in_f, lse_mem)
+                ctx = (a_in.unsqueeze(-1) * ctx_in + a_mem.unsqueeze(-1) * ctx_mem).reshape(M, D).to(orig_dtype)
+        elif device.type == "cuda" or (self.training and orig_dtype != torch.float32):
             ctx_tiles = F.scaled_dot_product_attention(
                 q_tiles.to(orig_dtype),
                 k_2w.to(orig_dtype),
@@ -507,6 +591,7 @@ class CorticalDecoderLayer(nn.Module):
         pre_salience: torch.Tensor,
         pre_phase: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
+        ring: Optional[RingMemory] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Strictly `< m` causal attention over `(W=128 RoPE Window ∪ K=8 Graph Slots)`.
 
@@ -607,12 +692,43 @@ class CorticalDecoderLayer(nn.Module):
             ctx_graph = torch.einsum("nhwk,nhwkd->nhwd", attn_graph, gv_t.float())
             ctx_tot = ctx_win + ctx_graph
 
-            # Head-averaged pointer-copy weights over shared `c_kv` latent stems `[Nt, W, d_s]`
-            copy_weights = attn_win.mean(dim=1)                             # [Nt, W, 2W]
-            f_copy_tiles = torch.matmul(copy_weights, ckv_2w.float())       # [Nt, W, d_s]
+            if ring is None:
+                # Head-averaged pointer-copy weights over shared `c_kv` latent stems `[Nt, W, d_s]`
+                copy_weights = attn_win.mean(dim=1)                         # [Nt, W, 2W]
+                f_copy_tiles = torch.matmul(copy_weights, ckv_2w.float())   # [Nt, W, d_s]
 
-        ctx_flat = ctx_tot.permute(0, 2, 1, 3).reshape(M_pad, D)[:M].to(orig_dtype)
-        f_copy = f_copy_tiles.reshape(M_pad, d_s)[:M].to(orig_dtype)
+        if ring is None:
+            ctx_flat = ctx_tot.permute(0, 2, 1, 3).reshape(M_pad, D)[:M].to(orig_dtype)
+            f_copy = f_copy_tiles.reshape(M_pad, d_s)[:M].to(orig_dtype)
+        else:
+            # Stream-carry: merge (in-chunk window ∪ graph) with the carried strict-past ring (`1 <= diff <= W`).
+            ctx_mem, lse_mem, p_mem = _ring_memory_attention(
+                q_rot, self.w_uk, self.w_uv, ring, pos_in_doc, self.cfg, lo=1, hi=W, scale=scale
+            )
+            V_r, _W_r = ring.ring_pos.shape
+            Qp = int(ring.q_pad_len)
+            with fp32_island(device):
+                lse_in = torch.logsumexp(all_scores, dim=-1)  # [Nt, H, W]
+                lse_in_f = lse_in.permute(0, 2, 1).reshape(M_pad, H)[:M]
+                ctx_in = ctx_tot.permute(0, 2, 1, 3).reshape(M_pad, H, Dh)[:M]
+                a_in, a_mem = _lse_merge_weights(lse_in_f, lse_mem)  # [M, H]
+                ctx_flat = (
+                    (a_in.unsqueeze(-1) * ctx_in + a_mem.unsqueeze(-1) * ctx_mem).reshape(M, D).to(orig_dtype)
+                )
+                a_in_tiles = torch.cat([a_in, a_in.new_zeros((M_pad - M, H))], dim=0).view(n_tiles, W, H)
+                copy_in = (attn_win * a_in_tiles.permute(0, 2, 1).unsqueeze(-1)).mean(dim=1)  # [Nt, W, 2W]
+                f_copy_in = torch.matmul(copy_in, ckv_2w.float()).reshape(M_pad, d_s)[:M]
+                a_mem_pad = (
+                    a_mem.new_zeros((V_r * Qp + 1, H)).index_copy(0, ring.seg_pad_pos, a_mem)[: V_r * Qp]
+                    .view(V_r, Qp, H)
+                    .permute(0, 2, 1)
+                )  # [V, H, Qp]
+                copy_mem = (p_mem * a_mem_pad.unsqueeze(-1)).mean(dim=1)  # [V, Qp, W]
+                f_copy_mem = torch.matmul(copy_mem, ring.ring_kv.float())  # [V, Qp, d_s]
+                f_copy_mem = torch.cat(
+                    [f_copy_mem.reshape(V_r * Qp, d_s), f_copy_mem.new_zeros((1, d_s))], dim=0
+                )[ring.seg_pad_pos]
+                f_copy = (f_copy_in + f_copy_mem).to(orig_dtype)
         x_mid = x + self.w_o(ctx_flat)
         x_out, aux_bal = self.moe(x_mid, sample_mask=valid_token_mask)
         return x_out, f_copy, aux_bal
@@ -769,18 +885,30 @@ class CorticalSandwich(nn.Module):
         pos_in_doc: torch.Tensor,
         seg_end_depth: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
+        ring: Optional[RingMemory] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         c_kv = self.build_shared_kv(f_stem, c_slow)
         x = c_slow
         bal_sum = torch.zeros((), device=c_slow.device, dtype=torch.float32)
         for layer in self.enc_layers:
             x, bal_l = layer.forward_parallel(
-                x, c_kv, doc_ids, pos_in_doc, seg_end_depth, valid_token_mask=valid_token_mask
+                x, c_kv, doc_ids, pos_in_doc, seg_end_depth, valid_token_mask=valid_token_mask, ring=ring
             )
             bal_sum = bal_sum + bal_l
         h_enc = self.norm_enc_out(x)
         bal_mean = bal_sum / float(max(len(self.enc_layers), 1))
         return h_enc, c_kv, bal_mean
+
+    @staticmethod
+    def _pad_ring(ring: Optional[RingMemory], pad: int) -> Optional[RingMemory]:
+        """Map `pad` extra tile-padding rows onto the ring's dump slot `V * q_pad_len`."""
+        if ring is None or pad <= 0:
+            return ring
+        V = int(ring.ring_pos.shape[0])
+        dump = torch.full(
+            (pad,), V * int(ring.q_pad_len), device=ring.seg_pad_pos.device, dtype=ring.seg_pad_pos.dtype
+        )
+        return ring._replace(seg_pad_pos=torch.cat([ring.seg_pad_pos, dump], dim=0))
 
     def encode_parallel(
         self,
@@ -789,6 +917,7 @@ class CorticalSandwich(nn.Module):
         doc_ids: torch.Tensor,
         pos_in_doc: torch.Tensor,
         seg_end_depth: torch.Tensor,
+        ring: Optional[RingMemory] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run Shared KV compression + Lower Cortical Encoder across all `[M_total, D]` segments."""
         M, D = c_slow.shape
@@ -801,7 +930,7 @@ class CorticalSandwich(nn.Module):
                 torch.zeros((), device=dev, dtype=torch.float32),
             )
         if self._compiled_encode is None:
-            return self._encode_tiled_impl(c_slow, f_stem, doc_ids, pos_in_doc, seg_end_depth, None)
+            return self._encode_tiled_impl(c_slow, f_stem, doc_ids, pos_in_doc, seg_end_depth, None, ring)
 
         W = self.cfg.window_size
         n_tiles = self._bucket_cortical_tiles((M + W - 1) // W)
@@ -817,7 +946,9 @@ class CorticalSandwich(nn.Module):
         else:
             c_p, f_p, doc_p, pos_p, dep_p = c_slow, f_stem, doc_ids, pos_in_doc, seg_end_depth
 
-        h_enc_p, c_kv_p, bal_mean = self._compiled_encode(c_p, f_p, doc_p, pos_p, dep_p, valid_mask)
+        h_enc_p, c_kv_p, bal_mean = self._compiled_encode(
+            c_p, f_p, doc_p, pos_p, dep_p, valid_mask, self._pad_ring(ring, pad)
+        )
         return h_enc_p[:M], c_kv_p[:M], bal_mean
 
     def _decode_tiled_impl(
@@ -834,6 +965,7 @@ class CorticalSandwich(nn.Module):
         pre_salience: torch.Tensor,
         pre_phase: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
+        ring: Optional[RingMemory] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = z_ref_prev + self.w_lang_dec(l_reg_seg.to(z_ref_prev.dtype))
         f_copy_last = torch.zeros((x.shape[0], self.cfg.d_s), device=x.device, dtype=x.dtype)
@@ -851,6 +983,7 @@ class CorticalSandwich(nn.Module):
                 pre_salience=pre_salience,
                 pre_phase=pre_phase,
                 valid_token_mask=valid_token_mask,
+                ring=ring,
             )
             bal_sum = bal_sum + bal_l
         z_dec = self.norm_dec_out(x)
@@ -871,6 +1004,7 @@ class CorticalSandwich(nn.Module):
         pre_edges: torch.Tensor,
         pre_salience: torch.Tensor,
         pre_phase: torch.Tensor,
+        ring: Optional[RingMemory] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run Upper Cortical Decoder across all `[M_total, D]` segments strictly from `< m` inputs."""
         M, D = z_ref_prev.shape
@@ -896,6 +1030,7 @@ class CorticalSandwich(nn.Module):
                 pre_salience,
                 pre_phase,
                 None,
+                ring,
             )
 
         W = self.cfg.window_size
@@ -930,7 +1065,7 @@ class CorticalSandwich(nn.Module):
             )
 
         z_dec_p, copy_p, bal_mean = self._compiled_decode(
-            zr_p, lr_p, ckv_p, doc_p, pos_p, sd_p, ed_p, ps_p, pe_p, pw_p, pp_p, valid_mask
+            zr_p, lr_p, ckv_p, doc_p, pos_p, sd_p, ed_p, ps_p, pe_p, pw_p, pp_p, valid_mask, self._pad_ring(ring, pad)
         )
         return z_dec_p[:M], copy_p[:M], bal_mean
 

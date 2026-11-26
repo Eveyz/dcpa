@@ -11,8 +11,8 @@
 #   - 6x5 Grid     : lang_id = [0:en, 1:zh, 2:formal, 3:python, 4:sql_struct, 5:javascript]
 #                    style_id = [0:rigorous, 1:concise_memo, 2:expository, 3:literary, 4:strict_eng]
 #   - Stage Guards : Stage 1 forces `max_stage_tier=1` + `anchor_doc_start=true`;
-#                    Stage 2 keeps Slot-0 `\x1dS..\x1dE` at 0% for first 12k steps (`7.2k..19.2k`), warming in 15% at `19.2k..25.2k`;
-#                    Stage 4 expands window to 3072B + `householder_max_writes=64` for World-Bible, Temporary Axioms & Multi-API SDKs.
+#                    Stage 2 keeps Slot-0 `\x1dS..\x1dE` at 0% for first ~15.2k steps (`7.2k..22.4k`), warming in 15% at `22.4k..30k`;
+#                    Stage 4 (`56.4k..60k`, 3.6k steps) expands window to 3072B + `householder_max_writes=64` for World-Bible, Temporary Axioms & Multi-API SDKs.
 #
 # Launch Commands:
 #   - Single-GPU (primary) : bash scripts/train.sh --v2-cognitive-48m --gpus=1
@@ -188,10 +188,10 @@ optimizer:
       weight_decay: 0.0
 
 # 6-slot domain_weights order: [0:en, 1:zh, 2:formal, 3:python, 4:sql_struct, 5:javascript] (ZERO Rust)
-# Proportional [12%, 30%, 36%, 22%] boundaries over 60k steps -> Exact 35.0% Logic : 35.0% Writing : 30.0% Code integral!
+# Proportional [12%, 38%, 44%, 6%] boundaries over 60k steps -> Exact ~35% Logic : ~35% Writing : ~30% Code integral!
 curriculum:
   total_steps: 60000
-  stage_boundaries: [0, 7200, 25200, 46800, 60000]
+  stage_boundaries: [0, 7200, 30000, 56400, 60000]
   cap_shard_weights:
     cap_reasoning: 35
     cap_writing: 35
@@ -223,11 +223,11 @@ curriculum:
     local_warmup_start_factor: 0.01
     window_schedule:
       - [7200, 512]
-      - [13200, 1024]
-      - [19200, 2048]
+      - [15000, 1024]
+      - [22800, 2048]
     max_stage_tier: 2
     anchor_doc_start: false
-    # Keep Slot-0 unpinned for first 12k steps (7.2k..19.2k) so all 72 merge pairs train freely; warm in 15% at 19.2k..25.2k
+    # Keep Slot-0 unpinned for first 2/3 of Stage 2 (7.2k..~22.4k) so all 72 merge pairs train freely; warm in 15% at ~22.4k..30k
     cap_warmup_start_progress: 0.6667
     cap_mix_ratio: 0.15
     # 37% Logic + 31% Writing (68% across en/zh/formal) + 32% Modular Code (py=17%, sql=5%, js=10%)
@@ -270,7 +270,7 @@ curriculum:
   stage4:
     name: hippocampal_world_bible_temporary_axioms_and_sdk_binding
     model_stage: D
-    hip_local_warmup_steps: 400
+    hip_local_warmup_steps: 300
     local_warmup_start_factor: 0.01
     lr_scale: 0.25
     max_doc_bytes: 3072

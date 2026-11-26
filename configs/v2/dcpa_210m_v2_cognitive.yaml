@@ -6,8 +6,8 @@
 #   - 6x5 Grid     : lang_id = [0:en, 1:zh, 2:formal, 3:python, 4:sql_struct, 5:javascript]
 #                    style_id = [0:rigorous, 1:concise_memo, 2:expository, 3:literary, 4:strict_eng]
 #   - Stage Guards : Stage 1 forces `max_stage_tier=1` + `anchor_doc_start=true` (zero mid-code/mid-sentence cuts);
-#                    Stage 2 keeps Slot-0 `\x1dS..\x1dE` at 0% for first 20k steps to train all 72 merge pairs, warming in 15% at 32k..42k;
-#                    Stage 4 expands window to 3072B + `householder_max_writes=64` for World-Bible, Temporary Axioms & Multi-API SDKs.
+#                    Stage 2 keeps Slot-0 `\x1dS..\x1dE` at 0% for first ~25.3k steps to train all 72 merge pairs, warming in 15% at ~37.3k..50k;
+#                    Stage 4 (94k..100k, 6k steps) expands window to 3072B + `householder_max_writes=64` for World-Bible, Temporary Axioms & Multi-API SDKs.
 #
 # Launch Commands:
 #   - Single-GPU (primary) : bash scripts/train.sh --config=configs/v2/dcpa_210m_v2_cognitive.yaml --gpus=1 --preset=moe_210m --data-profile=v2_cognitive_5g
@@ -211,7 +211,7 @@ optimizer:
 # Step-weighted 0..100k & 0..115k integrals converge strictly to 35.0% Logic : 35.0% Writing : 30.0% Code.
 curriculum:
   total_steps: 100000
-  stage_boundaries: [0, 12000, 42000, 78000, 100000]
+  stage_boundaries: [0, 12000, 50000, 94000, 100000]
   cap_shard_weights:
     cap_reasoning: 35
     cap_writing: 35
@@ -243,11 +243,11 @@ curriculum:
     local_warmup_start_factor: 0.01
     window_schedule:
       - [12000, 512]
-      - [22000, 1024]
-      - [32000, 2048]
+      - [25000, 1024]
+      - [38000, 2048]
     max_stage_tier: 2
     anchor_doc_start: false
-    # Keep Slot-0 unpinned for first 20k steps (12k..32k) so all 72 merge pairs train freely; warm in 15% at 32k..42k
+    # Keep Slot-0 unpinned for first 2/3 of Stage 2 (12k..~37.3k) so all 72 merge pairs train freely; warm in 15% at ~37.3k..50k
     cap_warmup_start_progress: 0.6667
     cap_mix_ratio: 0.15
     # 37% Logic + 31% Writing (68% across en/zh/formal) + 32% Modular Code (py=17%, sql=5%, js=10%)

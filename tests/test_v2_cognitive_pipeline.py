@@ -3,9 +3,9 @@
 Covers (100% offline — zero network downloads):
   1. `configs/v2/dcpa_210m_v2_cognitive.yaml`:
        - `moe_210m` config & `W_max=64`, `householder_write_threshold=0.08`, `num_lang_domains=6`
-       - Stage boundaries `[0, 12000, 42000, 78000, 100000]`
+       - Stage boundaries `[0, 12000, 50000, 94000, 100000]`
        - Stage 1 `max_stage_tier == 1` & `anchor_doc_start is True`
-       - Stage 2 `Slot-0` starvation guard (`cap_mix_prob == 0.0` at step 15000, `0.15` at step 35000)
+       - Stage 2 `Slot-0` starvation guard (`cap_mix_prob == 0.0` at step 15000, `0.15` at step 42000)
        - Stage 4 `wug_mode == "cognitive_v2"` & `wug_ratio == 0.55`
        - Exact 6-slot `35:35:30` holistic domain weight sum == 1.0 across all stages
   2. Offline 6-domain staged corpus (`build_corpus(..., cognitive_v2=True, offline=True)`):
@@ -76,7 +76,11 @@ def test_v2_cognitive_yaml_and_curriculum_schedule() -> None:
     assert 195_000_000 <= total_params <= 225_000_000
 
     csm = CurriculumController(raw_yaml.get("curriculum", {}))
-    assert csm.boundaries == (0, 12000, 42000, 78000, 100000)
+    assert csm.boundaries == (0, 12000, 50000, 94000, 100000)
+
+    # Verify resuming a checkpoint saved with old boundaries still adopts updated YAML boundaries
+    csm.load_state_dict({"boundaries": [0, 12000, 42000, 78000, 100000], "last_step": 12000, "last_stage_id": 1})
+    assert csm.boundaries == (0, 12000, 50000, 94000, 100000)
 
     # Stage 1: tier-1 syntax/rhythm filter + doc-start anchoring + zero cap_mix
     s1 = csm.get(1000)
@@ -86,27 +90,32 @@ def test_v2_cognitive_yaml_and_curriculum_schedule() -> None:
     assert s1.cap_mix_prob == 0.0
     assert abs(sum(s1.domain_weights.values()) - 1.0) < 1e-5
 
-    # Stage 2 early (step 15000 < 32000): Slot-0 unpinned (`cap_mix_prob == 0.0`) so all 72 pairs train!
+    # Stage 2 early (step 15000 < 37333): Slot-0 unpinned (`cap_mix_prob == 0.0`) so all 72 pairs train!
     s2_early = csm.get(15000)
     assert s2_early.stage_id == 2
     assert s2_early.max_stage_tier == 2
     assert s2_early.anchor_doc_start is False
     assert s2_early.cap_mix_prob == 0.0
+    assert s2_early.max_doc_bytes == 512
 
-    # Stage 2 late (step 35000 >= 32000): gentle Slot-0 outline warmup (`cap_mix_prob == 0.15`)
-    s2_late = csm.get(35000)
+    # Stage 2 mid (step 26000): window escalates to 1024B
+    assert csm.get(26000).max_doc_bytes == 1024
+
+    # Stage 2 late (step 42000 >= 38000): window escalates to 2048B + gentle Slot-0 outline warmup (`cap_mix_prob == 0.15`)
+    s2_late = csm.get(42000)
     assert s2_late.stage_id == 2
+    assert s2_late.max_doc_bytes == 2048
     assert abs(s2_late.cap_mix_prob - 0.15) < 1e-6
 
-    # Stage 3 (step 60000): full alchemy burst (`cap_mix_prob == 0.45`, tier 3)
-    s3 = csm.get(60000)
+    # Stage 3 (step 70000): full alchemy burst (`cap_mix_prob == 0.45`, tier 3)
+    s3 = csm.get(70000)
     assert s3.stage_id == 3
     assert s3.max_stage_tier == 3
     assert abs(s3.cap_mix_prob - 0.45) < 1e-6
     assert abs(sum(s3.domain_weights.values()) - 1.0) < 1e-5
 
-    # Stage 4 (step 85000): World-Bible & Micro-SDK fast-weight consolidation (`cognitive_v2`)
-    s4 = csm.get(85000)
+    # Stage 4 (step 96000): World-Bible & Micro-SDK fast-weight consolidation (`cognitive_v2`)
+    s4 = csm.get(96000)
     assert s4.stage_id == 4
     assert s4.wug_mode == "cognitive_v2"
     assert abs(s4.wug_ratio - 0.55) < 1e-6
@@ -372,17 +381,18 @@ def test_v2_cognitive_48m_config_profile_and_launcher(tmp_path: Path) -> None:
     assert 14_000_000 <= counts["active_per_step"] <= 17_500_000
 
     csm = CurriculumController(raw_yaml.get("curriculum", {}))
-    assert csm.boundaries == (0, 7200, 25200, 46800, 60000)
+    assert csm.boundaries == (0, 7200, 30000, 56400, 60000)
 
     s1 = csm.get(500)
     assert s1.stage_id == 1 and s1.max_stage_tier == 1 and s1.anchor_doc_start is True and s1.cap_mix_prob == 0.0
     s2_early = csm.get(10000)
-    assert s2_early.stage_id == 2 and s2_early.max_stage_tier == 2 and s2_early.cap_mix_prob == 0.0
-    s2_late = csm.get(21000)
-    assert s2_late.stage_id == 2 and abs(s2_late.cap_mix_prob - 0.15) < 1e-6
-    s3 = csm.get(35000)
+    assert s2_early.stage_id == 2 and s2_early.max_stage_tier == 2 and s2_early.cap_mix_prob == 0.0 and s2_early.max_doc_bytes == 512
+    assert csm.get(16000).max_doc_bytes == 1024
+    s2_late = csm.get(25000)
+    assert s2_late.stage_id == 2 and s2_late.max_doc_bytes == 2048 and abs(s2_late.cap_mix_prob - 0.15) < 1e-6
+    s3 = csm.get(40000)
     assert s3.stage_id == 3 and s3.max_stage_tier == 3 and abs(s3.cap_mix_prob - 0.45) < 1e-6
-    s4 = csm.get(52000)
+    s4 = csm.get(58000)
     assert s4.stage_id == 4 and s4.wug_mode == "cognitive_v2" and abs(s4.wug_ratio - 0.55) < 1e-6
     assert s4.max_doc_bytes == 3072
 

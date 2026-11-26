@@ -58,6 +58,7 @@ def ragged_local_offsets(
     seg_id = torch.repeat_interleave(
         torch.arange(m_total, device=device, dtype=torch.int64),
         seg_lens,
+        output_size=int(total_tokens),
     )
     global_idx = torch.arange(total_tokens, device=device, dtype=torch.int64)
     tau = (global_idx - starts[seg_id]) + 1

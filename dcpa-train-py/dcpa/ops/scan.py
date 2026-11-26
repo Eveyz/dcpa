@@ -299,6 +299,159 @@ if HAS_TRITON:
         ).to(tl.float32)
         tl.store(GA_out_ptr + ptrs, gb_tile * h_prev, mask=mask_2d)
 
+    @triton.jit
+    def _triton_diag_interchunk_scan_kernel(
+        A_sum_ptr,
+        B_sum_ptr,
+        Carry_out_ptr,
+        stride_b,
+        stride_k,
+        stride_d,
+        stride_cb,
+        stride_ck,
+        stride_cd,
+        N_CHUNKS,
+        D,
+        BLOCK_K: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Pass 2 (Single-CTA Triton): Parallel scan over chunk summaries -> exclusive Carry_out.
+        Replaces `log2(N_CHUNKS)` Python-level PyTorch Kogge-Stone launches + `torch.cat` with 1 launch.
+        """
+        pid_b = tl.program_id(0)
+        pid_d = tl.program_id(1)
+
+        k_offs = tl.arange(0, BLOCK_K)
+        d_offs = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_k = k_offs < N_CHUNKS
+        mask_d = d_offs < D
+        mask_2d = mask_k[:, None] & mask_d[None, :]
+
+        in_ptrs = pid_b * stride_b + k_offs[:, None] * stride_k + d_offs[None, :] * stride_d
+        a_tile = tl.load(A_sum_ptr + in_ptrs, mask=mask_2d, other=1.0).to(tl.float32)
+        b_tile = tl.load(B_sum_ptr + in_ptrs, mask=mask_2d, other=0.0).to(tl.float32)
+
+        _, b_pref = tl.associative_scan((a_tile, b_tile), axis=0, combine_fn=_combine_affine)
+
+        # Exclusive carry: carry[:, 0] = 0, carry[:, k + 1] = b_pref[:, k] for k + 1 < N_CHUNKS
+        tl.store(
+            Carry_out_ptr + pid_b * stride_cb + d_offs * stride_cd,
+            tl.zeros((BLOCK_D,), dtype=tl.float32),
+            mask=mask_d,
+        )
+        dst_k = k_offs + 1
+        mask_dst = (dst_k < N_CHUNKS)[:, None] & mask_d[None, :]
+        tl.store(
+            Carry_out_ptr + pid_b * stride_cb + dst_k[:, None] * stride_ck + d_offs[None, :] * stride_cd,
+            b_pref,
+            mask=mask_dst,
+        )
+
+    @triton.jit
+    def _triton_diag_single_pass_fwd_kernel(
+        A_ptr,
+        B_ptr,
+        H_out_ptr,
+        stride_b,
+        stride_t,
+        stride_d,
+        T,
+        D,
+        N_CHUNKS,
+        BLOCK_T: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Single-pass register-carried chunked diagonal scan (1 HBM read + 1 HBM write).
+        Optimal when `B * cdiv(D, BLOCK_D)` already saturates GPU SMs (e.g., stream_carry rows).
+        """
+        pid_b = tl.program_id(0)
+        pid_d = tl.program_id(1)
+
+        t_local = tl.arange(0, BLOCK_T)
+        d_offs = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = d_offs < D
+        is_first = (t_local == 0)[:, None]
+        is_last = (t_local == (BLOCK_T - 1))[:, None]
+
+        base = pid_b * stride_b
+        h_carry = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+        for k in range(0, N_CHUNKS):
+            t_offs = k * BLOCK_T + t_local
+            mask_t = t_offs < T
+            mask_2d = mask_t[:, None] & mask_d[None, :]
+            ptrs = base + t_offs[:, None] * stride_t + d_offs[None, :] * stride_d
+
+            a_tile = tl.load(A_ptr + ptrs, mask=mask_2d, other=1.0).to(tl.float32)
+            b_tile = tl.load(B_ptr + ptrs, mask=mask_2d, other=0.0).to(tl.float32)
+            b_folded = tl.where(is_first, a_tile * h_carry[None, :] + b_tile, b_tile)
+
+            _, h_tile = tl.associative_scan((a_tile, b_folded), axis=0, combine_fn=_combine_affine)
+            tl.store(H_out_ptr + ptrs, h_tile, mask=mask_2d)
+
+            h_carry = tl.sum(tl.where(is_last, h_tile, 0.0), axis=0)
+
+    @triton.jit
+    def _triton_diag_single_pass_bwd_kernel(
+        A_ptr,
+        H_ptr,
+        GH_ptr,
+        GA_out_ptr,
+        GB_out_ptr,
+        stride_b,
+        stride_t,
+        stride_d,
+        T,
+        D,
+        N_CHUNKS,
+        BLOCK_T: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Single-pass register-carried reverse chunked diagonal backward scan (1 HBM read + 1 HBM write)."""
+        pid_b = tl.program_id(0)
+        pid_d = tl.program_id(1)
+
+        offs_local = tl.arange(0, BLOCK_T)
+        d_offs = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = d_offs < D
+        is_first = (offs_local == 0)[:, None]
+        is_last = (offs_local == (BLOCK_T - 1))[:, None]
+
+        base = pid_b * stride_b
+        g_carry = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+        for rev_k in range(0, N_CHUNKS):
+            rev_t = (T - 1) - (rev_k * BLOCK_T + offs_local)
+            mask_t = rev_t >= 0
+            mask_2d = mask_t[:, None] & mask_d[None, :]
+            ptrs = base + rev_t[:, None] * stride_t + d_offs[None, :] * stride_d
+
+            gh_tile = tl.load(GH_ptr + ptrs, mask=mask_2d, other=0.0).to(tl.float32)
+
+            next_t = rev_t + 1
+            mask_next = mask_t & (next_t < T)
+            a_next_loaded = tl.load(
+                A_ptr + base + next_t[:, None] * stride_t + d_offs[None, :] * stride_d,
+                mask=mask_next[:, None] & mask_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            a_next_tile = tl.where(mask_t[:, None], a_next_loaded, 1.0)
+
+            gh_folded = tl.where(is_first, a_next_tile * g_carry[None, :] + gh_tile, gh_tile)
+            _, gb_tile = tl.associative_scan((a_next_tile, gh_folded), axis=0, combine_fn=_combine_affine)
+            tl.store(GB_out_ptr + ptrs, gb_tile, mask=mask_2d)
+
+            prev_t = rev_t - 1
+            has_prev = mask_t & (prev_t >= 0)
+            h_prev = tl.load(
+                H_ptr + base + prev_t[:, None] * stride_t + d_offs[None, :] * stride_d,
+                mask=has_prev[:, None] & mask_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            tl.store(GA_out_ptr + ptrs, gb_tile * h_prev, mask=mask_2d)
+
+            g_carry = tl.sum(tl.where(is_last, gb_tile, 0.0), axis=0)
+
     # =========================================================================
     # 3-Pass Chunked Fused Tridiagonal Triton Stack Scan (L = 16, d_tag <= 16)
     # =========================================================================
@@ -337,6 +490,7 @@ if HAS_TRITON:
         D_TAG: tl.constexpr,
         HAS_RESET: tl.constexpr,
         HAS_XI_INIT: tl.constexpr,
+        RESET_TO_ZERO: tl.constexpr,
     ):
         """Pass 1: Register-resident tridiagonal recurrence over CHUNK_SIZE steps -> (M_sum, B_sum).
         Eliminates all `[B, T, 16, 16]` HBM allocations completely!
@@ -371,13 +525,20 @@ if HAS_TRITON:
 
         t = chunk_start
         while t < chunk_end:
-            is_reset = t == 0
             if HAS_RESET:
-                rm_val = tl.load(reset_ptr + base_r + t * stride_rt)
-                is_reset = is_reset | (rm_val != 0)
-
-            M_acc = tl.where(is_reset, zero_16x16, M_acc)
-            B_acc = tl.where(is_reset, xi0_tile, B_acc)
+                rm_t = tl.load(reset_ptr + base_r + t * stride_rt) != 0
+                is_t0 = t == 0
+                is_reset = is_t0 | rm_t
+                M_acc = tl.where(is_reset, zero_16x16, M_acc)
+                if RESET_TO_ZERO:
+                    rst_val = tl.where(is_t0 & (~rm_t), xi0_tile, zero_16x16)
+                else:
+                    rst_val = xi0_tile
+                B_acc = tl.where(is_reset, rst_val, B_acc)
+            else:
+                is_t0 = t == 0
+                M_acc = tl.where(is_t0, zero_16x16, M_acc)
+                B_acc = tl.where(is_t0, xi0_tile, B_acc)
 
             pp = tl.load(p_push_ptr + base_p + t * stride_pt).to(tl.float32)
             po = tl.load(p_pop_ptr + base_p + t * stride_pt).to(tl.float32)
@@ -433,6 +594,7 @@ if HAS_TRITON:
         D_TAG: tl.constexpr,
         HAS_RESET: tl.constexpr,
         HAS_XI_INIT: tl.constexpr,
+        RESET_TO_ZERO: tl.constexpr,
     ):
         """Pass 3: Propagate exclusive chunk carry through CHUNK_SIZE steps in registers -> Xi_out."""
         pid = tl.program_id(0)
@@ -467,12 +629,17 @@ if HAS_TRITON:
 
         t = chunk_start
         while t < chunk_end:
-            is_reset = t == 0
             if HAS_RESET:
-                rm_val = tl.load(reset_ptr + base_r + t * stride_rt)
-                is_reset = is_reset | (rm_val != 0)
-
-            xi = tl.where(is_reset, xi0_tile, xi)
+                rm_t = tl.load(reset_ptr + base_r + t * stride_rt) != 0
+                is_t0 = t == 0
+                is_reset = is_t0 | rm_t
+                if RESET_TO_ZERO:
+                    rst_val = tl.where(is_t0 & (~rm_t), xi0_tile, zero_16x16)
+                else:
+                    rst_val = xi0_tile
+                xi = tl.where(is_reset, rst_val, xi)
+            else:
+                xi = tl.where(t == 0, xi0_tile, xi)
 
             pp = tl.load(p_push_ptr + base_p + t * stride_pt).to(tl.float32)
             po = tl.load(p_pop_ptr + base_p + t * stride_pt).to(tl.float32)
@@ -609,6 +776,7 @@ if HAS_TRITON:
         D_TAG: tl.constexpr,
         HAS_RESET: tl.constexpr,
         HAS_XI_INIT: tl.constexpr,
+        RESET_TO_ZERO: tl.constexpr,
     ):
         """Backward Pass 3: Reverse chunk loop from adj_out[b, k] -> exact analytical parameter gradients."""
         pid = tl.program_id(0)
@@ -646,10 +814,17 @@ if HAS_TRITON:
 
         t = chunk_end - 1
         while t >= chunk_start:
-            is_reset = t == 0
+            is_t0 = t == 0
             if HAS_RESET:
-                rm_val = tl.load(reset_ptr + base_r + t * stride_rt)
-                is_reset = is_reset | (rm_val != 0)
+                rm_t = tl.load(reset_ptr + base_r + t * stride_rt) != 0
+                is_reset = is_t0 | rm_t
+                if RESET_TO_ZERO:
+                    use_xi0 = is_t0 & (~rm_t)
+                else:
+                    use_xi0 = is_reset
+            else:
+                is_reset = is_t0
+                use_xi0 = is_t0
 
             g_out = tl.load(grad_xi_ptr + base_g + t * stride_gt + g_tile_offs, mask=mask_2d_tag, other=0.0).to(
                 tl.float32
@@ -660,7 +835,11 @@ if HAS_TRITON:
             xi_prev_mem = tl.load(Xi_ptr + base_x + t_prev * stride_xt + x_tile_offs, mask=mask_2d_tag, other=0.0).to(
                 tl.float32
             )
-            xi_in = tl.where(is_reset, xi0_tile, xi_prev_mem)
+            if RESET_TO_ZERO:
+                rst_val = tl.where(use_xi0, xi0_tile, zero_16x16)
+                xi_in = tl.where(is_reset, rst_val, xi_prev_mem)
+            else:
+                xi_in = tl.where(is_reset, xi0_tile, xi_prev_mem)
 
             pp = tl.load(p_push_ptr + base_p + t * stride_pt).to(tl.float32)
             po = tl.load(p_pop_ptr + base_p + t * stride_pt).to(tl.float32)
@@ -688,7 +867,7 @@ if HAS_TRITON:
             g_in = tl.dot(M_raw_T, g_tot, input_precision="ieee")
 
             if HAS_XI_INIT:
-                d_xi0_acc = tl.where(is_reset, d_xi0_acc + g_in, d_xi0_acc)
+                d_xi0_acc = tl.where(use_xi0, d_xi0_acc + g_in, d_xi0_acc)
             adj = tl.where(is_reset, zero_16x16, g_in)
             t -= 1
 
@@ -953,6 +1132,24 @@ def _chunked_diag_scan_fwd_op(
             )
             return h_out
 
+        # Regime 1: Batch * feature tiles already saturate SMs (e.g. stream_carry rows):
+        # run single-pass register-carried scan (1 HBM read + 1 HBM write, zero Pass 2 scratch).
+        if (B * grid_d) >= 64 and n_chunks <= 64:
+            _triton_diag_single_pass_fwd_kernel[(B, grid_d)](
+                a_f32,
+                b_f32,
+                h_out,
+                a_f32.stride(0),
+                a_f32.stride(1),
+                a_f32.stride(2),
+                T,
+                D,
+                n_chunks,
+                BLOCK_T=C,
+                BLOCK_D=block_d,
+            )
+            return h_out
+
         a_sum = torch.empty((B, n_chunks, D), device=a_f32.device, dtype=torch.float32)
         b_sum = torch.empty((B, n_chunks, D), device=a_f32.device, dtype=torch.float32)
         _triton_diag_chunk_summary_kernel[grid](
@@ -975,12 +1172,34 @@ def _chunked_diag_scan_fwd_op(
             STORE_H_DIRECT=False,
         )
 
-        levels = (n_chunks - 1).bit_length()
-        _, b_pref = _kogge_stone_diag(a_sum, b_sum, levels)
-        carry = torch.cat(
-            [torch.zeros((B, 1, D), device=a_f32.device, dtype=torch.float32), b_pref[:, :-1, :]],
-            dim=1,
-        ).contiguous()
+        # Regime 2: Single-CTA Triton Pass 2 replacing Python log2(N_chunks) PyTorch launches + torch.cat.
+        if n_chunks <= 1024:
+            block_k = max(16, 1 << (n_chunks - 1).bit_length())
+            block_d_p2 = 1 if D <= 1 else (4 if block_k >= 512 else (8 if block_k >= 256 else 16))
+            grid_d_p2 = (D + block_d_p2 - 1) // block_d_p2
+            carry = torch.empty((B, n_chunks, D), device=a_f32.device, dtype=torch.float32)
+            _triton_diag_interchunk_scan_kernel[(B, grid_d_p2)](
+                a_sum,
+                b_sum,
+                carry,
+                a_sum.stride(0),
+                a_sum.stride(1),
+                a_sum.stride(2),
+                carry.stride(0),
+                carry.stride(1),
+                carry.stride(2),
+                n_chunks,
+                D,
+                BLOCK_K=block_k,
+                BLOCK_D=block_d_p2,
+            )
+        else:
+            levels = (n_chunks - 1).bit_length()
+            _, b_pref = _kogge_stone_diag(a_sum, b_sum, levels)
+            carry = torch.cat(
+                [torch.zeros((B, 1, D), device=a_f32.device, dtype=torch.float32), b_pref[:, :-1, :]],
+                dim=1,
+            ).contiguous()
 
         _triton_diag_chunk_apply_kernel[grid](
             a_f32,
@@ -1063,6 +1282,24 @@ def _chunked_diag_scan_bwd_op(
             )
             return ga, gb
 
+        if (B * grid_d) >= 64 and n_chunks <= 64:
+            _triton_diag_single_pass_bwd_kernel[(B, grid_d)](
+                a_f32,
+                h_f32,
+                gh_f32,
+                ga,
+                gb,
+                a_f32.stride(0),
+                a_f32.stride(1),
+                a_f32.stride(2),
+                T,
+                D,
+                n_chunks,
+                BLOCK_T=C,
+                BLOCK_D=block_d,
+            )
+            return ga, gb
+
         a_sum = torch.empty((B, n_chunks, D), device=a_f32.device, dtype=torch.float32)
         g_sum = torch.empty((B, n_chunks, D), device=a_f32.device, dtype=torch.float32)
         _triton_diag_bwd_rev_summary_kernel[grid](
@@ -1087,12 +1324,33 @@ def _chunked_diag_scan_bwd_op(
             STORE_DIRECT=False,
         )
 
-        levels = (n_chunks - 1).bit_length()
-        _, g_pref = _kogge_stone_diag(a_sum, g_sum, levels)
-        carry = torch.cat(
-            [torch.zeros((B, 1, D), device=a_f32.device, dtype=torch.float32), g_pref[:, :-1, :]],
-            dim=1,
-        ).contiguous()
+        if n_chunks <= 1024:
+            block_k = max(16, 1 << (n_chunks - 1).bit_length())
+            block_d_p2 = 1 if D <= 1 else (4 if block_k >= 512 else (8 if block_k >= 256 else 16))
+            grid_d_p2 = (D + block_d_p2 - 1) // block_d_p2
+            carry = torch.empty((B, n_chunks, D), device=a_f32.device, dtype=torch.float32)
+            _triton_diag_interchunk_scan_kernel[(B, grid_d_p2)](
+                a_sum,
+                g_sum,
+                carry,
+                a_sum.stride(0),
+                a_sum.stride(1),
+                a_sum.stride(2),
+                carry.stride(0),
+                carry.stride(1),
+                carry.stride(2),
+                n_chunks,
+                D,
+                BLOCK_K=block_k,
+                BLOCK_D=block_d_p2,
+            )
+        else:
+            levels = (n_chunks - 1).bit_length()
+            _, g_pref = _kogge_stone_diag(a_sum, g_sum, levels)
+            carry = torch.cat(
+                [torch.zeros((B, 1, D), device=a_f32.device, dtype=torch.float32), g_pref[:, :-1, :]],
+                dim=1,
+            ).contiguous()
 
         _triton_diag_bwd_rev_apply_kernel[grid](
             a_f32,
@@ -1412,6 +1670,7 @@ def _tridiag_stack_scan_3pass_fwd_torch(
     reset_mask: Optional[torch.Tensor],
     xi_init: Optional[torch.Tensor],
     chunk_size: int,
+    reset_to_zero: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Exact pure-PyTorch reference of the 3-pass chunked tridiagonal forward algorithm (used on CPU/MPS)."""
     B, T, d_tag = v_tag.shape
@@ -1421,11 +1680,8 @@ def _tridiag_stack_scan_3pass_fwd_torch(
     device = v_tag.device
 
     eye = torch.eye(L, device=device, dtype=torch.float32).unsqueeze(0).expand(B, L, L).clone()
-    xi0 = (
-        torch.zeros((B, L, d_tag), device=device, dtype=torch.float32)
-        if xi_init is None
-        else xi_init.float()
-    )
+    zero_xi = torch.zeros((B, L, d_tag), device=device, dtype=torch.float32)
+    xi0 = zero_xi if xi_init is None else xi_init.float()
 
     M_sum = torch.empty((B, n_chunks, L, L), device=device, dtype=torch.float32)
     B_sum = torch.empty((B, n_chunks, L, d_tag), device=device, dtype=torch.float32)
@@ -1438,14 +1694,16 @@ def _tridiag_stack_scan_3pass_fwd_torch(
         B_acc = torch.zeros((B, L, d_tag), device=device, dtype=torch.float32)
         for step_t in range(t0, t1):
             if step_t == 0:
-                is_rst = torch.ones((B, 1, 1), device=device, dtype=torch.bool)
+                M_acc = torch.zeros_like(M_acc)
+                if reset_to_zero and reset_mask is not None:
+                    rm_0 = reset_mask[:, 0].bool().view(B, 1, 1)
+                    B_acc = torch.where(rm_0, zero_xi, xi0)
+                else:
+                    B_acc = xi0.clone()
             elif reset_mask is not None:
                 is_rst = reset_mask[:, step_t].bool().view(B, 1, 1)
-            else:
-                is_rst = None
-            if is_rst is not None:
                 M_acc = torch.where(is_rst, torch.zeros_like(M_acc), M_acc)
-                B_acc = torch.where(is_rst, xi0, B_acc)
+                B_acc = torch.where(is_rst, zero_xi if reset_to_zero else xi0, B_acc)
             pp = p_push[:, step_t].view(B, 1, 1)
             po = p_pop[:, step_t].view(B, 1, 1)
             ph = p_hold[:, step_t].view(B, 1, 1)
@@ -1474,13 +1732,14 @@ def _tridiag_stack_scan_3pass_fwd_torch(
         xi = carry[:, k].clone()
         for step_t in range(t0, t1):
             if step_t == 0:
-                is_rst = torch.ones((B, 1, 1), device=device, dtype=torch.bool)
+                if reset_to_zero and reset_mask is not None:
+                    rm_0 = reset_mask[:, 0].bool().view(B, 1, 1)
+                    xi = torch.where(rm_0, zero_xi, xi0)
+                else:
+                    xi = xi0.clone()
             elif reset_mask is not None:
                 is_rst = reset_mask[:, step_t].bool().view(B, 1, 1)
-            else:
-                is_rst = None
-            if is_rst is not None:
-                xi = torch.where(is_rst, xi0, xi)
+                xi = torch.where(is_rst, zero_xi if reset_to_zero else xi0, xi)
             pp = p_push[:, step_t].view(B, 1, 1)
             po = p_pop[:, step_t].view(B, 1, 1)
             ph = p_hold[:, step_t].view(B, 1, 1)
@@ -1501,6 +1760,7 @@ def _tridiag_stack_scan_3pass_bwd_torch(
     xi_out: torch.Tensor,
     m_sum: torch.Tensor,
     chunk_size: int,
+    reset_to_zero: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Exact pure-PyTorch reference of the 3-pass chunked tridiagonal backward algorithm."""
     B, T, d_tag = v_tag.shape
@@ -1509,11 +1769,8 @@ def _tridiag_stack_scan_3pass_bwd_torch(
     n_chunks = (T + C - 1) // C
     device = v_tag.device
 
-    xi0 = (
-        torch.zeros((B, L, d_tag), device=device, dtype=torch.float32)
-        if xi_init is None
-        else xi_init.float()
-    )
+    zero_xi = torch.zeros((B, L, d_tag), device=device, dtype=torch.float32)
+    xi0 = zero_xi if xi_init is None else xi_init.float()
 
     # Backward Pass 1: Local chunk adjoints
     g_local = torch.empty((B, n_chunks, L, d_tag), device=device, dtype=torch.float32)
@@ -1566,12 +1823,23 @@ def _tridiag_stack_scan_3pass_bwd_torch(
             g_tot = grad_xi[:, step_t] + adj
             if step_t == 0:
                 is_rst = torch.ones((B, 1, 1), device=device, dtype=torch.bool)
-                xi_in = xi0
+                if reset_to_zero and reset_mask is not None:
+                    use_xi0: Optional[torch.Tensor] = ~reset_mask[:, 0].bool().view(B, 1, 1)
+                    xi_in = torch.where(use_xi0, xi0, zero_xi)
+                else:
+                    use_xi0 = is_rst
+                    xi_in = xi0
             elif reset_mask is not None:
                 is_rst = reset_mask[:, step_t].bool().view(B, 1, 1)
-                xi_in = torch.where(is_rst, xi0, xi_out[:, step_t - 1])
+                if reset_to_zero:
+                    use_xi0 = None
+                    xi_in = torch.where(is_rst, zero_xi, xi_out[:, step_t - 1])
+                else:
+                    use_xi0 = is_rst
+                    xi_in = torch.where(is_rst, xi0, xi_out[:, step_t - 1])
             else:
                 is_rst = None
+                use_xi0 = None
                 xi_in = xi_out[:, step_t - 1]
 
             pp = p_push[:, step_t].view(B, 1, 1)
@@ -1588,9 +1856,9 @@ def _tridiag_stack_scan_3pass_bwd_torch(
             d_vt[:, step_t] = p_push[:, step_t].unsqueeze(-1) * g_tot[:, 0, :]
 
             g_in = _tridiag_apply_transpose_torch(g_tot, pp, po, ph)
+            if xi_init is not None and use_xi0 is not None:
+                d_xi0 = d_xi0 + torch.where(use_xi0, g_in, torch.zeros_like(g_in))
             if is_rst is not None:
-                if xi_init is not None:
-                    d_xi0 = d_xi0 + torch.where(is_rst, g_in, torch.zeros_like(g_in))
                 adj = torch.where(is_rst, torch.zeros_like(adj), g_in)
             else:
                 adj = g_in
@@ -1609,6 +1877,7 @@ def _tridiag_stack_scan_fwd_op(
     reset_mask: Optional[torch.Tensor] = None,
     xi_init: Optional[torch.Tensor] = None,
     chunk_size: int = DEFAULT_SCAN_CHUNK_SIZE,
+    reset_to_zero: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Zero-graph-break 3-pass fused tridiagonal stack scan returning `(Xi [B,T,16,d_tag], M_sum [B,K,16,16])`."""
     pp_f = p_push.float().contiguous()
@@ -1672,6 +1941,7 @@ def _tridiag_stack_scan_fwd_op(
             D_TAG=d_tag,
             HAS_RESET=has_reset,
             HAS_XI_INIT=has_xi0,
+            RESET_TO_ZERO=bool(reset_to_zero),
         )
 
         if n_chunks > 1:
@@ -1718,10 +1988,13 @@ def _tridiag_stack_scan_fwd_op(
             D_TAG=d_tag,
             HAS_RESET=has_reset,
             HAS_XI_INIT=has_xi0,
+            RESET_TO_ZERO=bool(reset_to_zero),
         )
         return Xi, M_sum
 
-    return _tridiag_stack_scan_3pass_fwd_torch(pp_f, po_f, ph_f, vt_f, rm_b, xi0_f, C)
+    return _tridiag_stack_scan_3pass_fwd_torch(
+        pp_f, po_f, ph_f, vt_f, rm_b, xi0_f, C, reset_to_zero=bool(reset_to_zero)
+    )
 
 
 @_tridiag_stack_scan_fwd_op.register_fake
@@ -1733,6 +2006,7 @@ def _tridiag_stack_scan_fwd_fake(
     reset_mask: Optional[torch.Tensor] = None,
     xi_init: Optional[torch.Tensor] = None,
     chunk_size: int = DEFAULT_SCAN_CHUNK_SIZE,
+    reset_to_zero: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, d_tag = v_tag.shape
     C = max(1, int(chunk_size))
@@ -1755,6 +2029,7 @@ def _tridiag_stack_scan_bwd_op(
     xi_out: torch.Tensor,
     m_sum: torch.Tensor,
     chunk_size: int = DEFAULT_SCAN_CHUNK_SIZE,
+    reset_to_zero: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Analytical 3-pass tridiagonal stack backward returning `(d_pp, d_po, d_ph, d_vt, d_xi0_or_empty)`."""
     gxi_f = grad_xi.float().contiguous()
@@ -1891,6 +2166,7 @@ def _tridiag_stack_scan_bwd_op(
             D_TAG=d_tag,
             HAS_RESET=has_reset,
             HAS_XI_INIT=has_xi0,
+            RESET_TO_ZERO=bool(reset_to_zero),
         )
         d_xi0 = (
             d_xi0_chunk.sum(dim=1).contiguous()
@@ -1899,7 +2175,9 @@ def _tridiag_stack_scan_bwd_op(
         )
         return d_pp, d_po, d_ph, d_vt, d_xi0
 
-    return _tridiag_stack_scan_3pass_bwd_torch(gxi_f, pp_f, po_f, ph_f, vt_f, rm_b, xi0_f, xi_f, ms_f, C)
+    return _tridiag_stack_scan_3pass_bwd_torch(
+        gxi_f, pp_f, po_f, ph_f, vt_f, rm_b, xi0_f, xi_f, ms_f, C, reset_to_zero=bool(reset_to_zero)
+    )
 
 
 @_tridiag_stack_scan_bwd_op.register_fake
@@ -1914,6 +2192,7 @@ def _tridiag_stack_scan_bwd_fake(
     xi_out: torch.Tensor,
     m_sum: torch.Tensor,
     chunk_size: int = DEFAULT_SCAN_CHUNK_SIZE,
+    reset_to_zero: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, d_tag = v_tag.shape
     d_xi0 = (
@@ -1931,7 +2210,7 @@ def _tridiag_stack_scan_bwd_fake(
 
 
 def _tridiag_stack_scan_setup_context(ctx, inputs, output) -> None:
-    p_push, p_pop, p_hold, v_tag, reset_mask, xi_init, chunk_size = inputs
+    p_push, p_pop, p_hold, v_tag, reset_mask, xi_init, chunk_size, reset_to_zero = inputs
     xi_out, m_sum = output
     ctx.p_dtype = p_push.dtype
     ctx.v_dtype = v_tag.dtype
@@ -1939,6 +2218,7 @@ def _tridiag_stack_scan_setup_context(ctx, inputs, output) -> None:
     ctx.has_xi_init = xi_init is not None
     ctx.xi0_dtype = xi_init.dtype if xi_init is not None else torch.float32
     ctx.chunk_size = int(chunk_size)
+    ctx.reset_to_zero = bool(reset_to_zero)
     ctx.save_for_backward(
         p_push,
         p_pop,
@@ -1953,7 +2233,7 @@ def _tridiag_stack_scan_setup_context(ctx, inputs, output) -> None:
 
 def _tridiag_stack_scan_autograd_bwd(ctx, grad_xi: torch.Tensor, _grad_m_sum: Optional[torch.Tensor]):
     if grad_xi is None:
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
     p_push, p_pop, p_hold, v_tag, rm_saved, xi0_saved, xi_out, m_sum = ctx.saved_tensors
     rm_arg = rm_saved if ctx.has_reset else None
     xi0_arg = xi0_saved if ctx.has_xi_init else None
@@ -1968,6 +2248,7 @@ def _tridiag_stack_scan_autograd_bwd(ctx, grad_xi: torch.Tensor, _grad_m_sum: Op
         xi_out,
         m_sum,
         ctx.chunk_size,
+        ctx.reset_to_zero,
     )
     return (
         d_pp.to(ctx.p_dtype),
@@ -1976,6 +2257,7 @@ def _tridiag_stack_scan_autograd_bwd(ctx, grad_xi: torch.Tensor, _grad_m_sum: Op
         d_vt.to(ctx.v_dtype),
         None,
         d_xi0.to(ctx.xi0_dtype) if ctx.has_xi_init else None,
+        None,
         None,
     )
 
@@ -1995,12 +2277,15 @@ def parallel_stack_scan(
     reset_mask: Optional[torch.Tensor] = None,
     max_span: Optional[int] = None,
     chunk_size: int = DEFAULT_SCAN_CHUNK_SIZE,
+    reset_to_zero: bool = False,
 ) -> torch.Tensor:
     """Exact Chunked Parallel Associative Scan (C = 256) for the 128B differentiable pushdown stack Xi_t.
 
     Implements Performance Audit Task 1 strictly inside `fp32_island(device)`:
       - M_t = (1 - reset_t) * (p_hold * I_16 + p_push * S_down + p_pop * S_up) in R^{16x16}
       - B_t = p_push * (e_1 @ v_tag^T) in R^{16x4}
+      - When `reset_to_zero=True`: `xi_init` initializes `t=0` (when `~reset_mask[:, 0]`), while any
+        `reset_mask` bit resets the stack to ZERO (empty stack) instead of `xi_init`.
       - On CUDA with Triton (eager & `torch.compile`): dispatches directly to 3-pass fused tridiagonal
         custom_op `torch.ops.dcpa.tridiag_stack_scan_fwd`, eliminating `[B, T, 16, 16]` dense HBM tensors!
       - On CPU / MPS: uses C=256 chunked batched `torch.bmm` parallel associative scan.
@@ -2024,7 +2309,7 @@ def parallel_stack_scan(
             rm_arg = reset_mask.bool() if reset_mask is not None else None
             xi0_arg = xi_init.float() if xi_init is not None else None
             xi_out, _ = torch.ops.dcpa.tridiag_stack_scan_fwd(
-                p_push_f, p_pop_f, p_hold_f, v_tag_f, rm_arg, xi0_arg, int(chunk_size)
+                p_push_f, p_pop_f, p_hold_f, v_tag_f, rm_arg, xi0_arg, int(chunk_size), bool(reset_to_zero)
             )
             return xi_out
 
@@ -2048,8 +2333,9 @@ def parallel_stack_scan(
             M = (1.0 - reset_f)[..., None, None] * M_raw
             if xi_init is not None:
                 xi0 = xi_init.float()  # [B, 16, d_tag]
-                B_init_inj = torch.matmul(M_raw, xi0.unsqueeze(1))
-                B_mat = B_mat + reset_f[..., None, None] * B_init_inj
+                if not reset_to_zero:
+                    B_init_inj = torch.matmul(M_raw, xi0.unsqueeze(1))
+                    B_mat = B_mat + reset_f[..., None, None] * B_init_inj
                 init_carry = (1.0 - reset_f[:, 0])[..., None, None] * xi0
             else:
                 init_carry = None
@@ -2130,6 +2416,7 @@ def sequential_stack_scan_ref(
     v_tag: torch.Tensor,
     xi_init: Optional[torch.Tensor] = None,
     reset_mask: Optional[torch.Tensor] = None,
+    reset_to_zero: bool = False,
 ) -> torch.Tensor:
     """Strict O(T) byte-by-byte sequential pushdown stack reference ONLY for unit-test equivalence checking."""
     B, T, d_tag = v_tag.shape
@@ -2147,7 +2434,7 @@ def sequential_stack_scan_ref(
             rm = reset_mask[:, t].bool().view(B, 1, 1)
             base_xi = (
                 torch.zeros_like(xi)
-                if xi_init is None
+                if (xi_init is None or reset_to_zero)
                 else xi_init.float()
             )
             xi = torch.where(rm, base_xi, xi)

@@ -19,6 +19,7 @@ Integrates Deliverables 1-5 and Global Override Iron Laws #1-#5:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 import contextlib
 import copy
@@ -79,6 +80,7 @@ from train.curriculum_state_machine import (
 )
 from train.visual_probe import format_console_header, format_console_row, run_visual_probe
 from train.watchdog_and_ckpt import (
+    AsyncCheckpointWriter,
     CheckpointManager,
     MeltdownAbortError,
     PreemptionSignalGuard,
@@ -585,6 +587,7 @@ class _DynamicRaggedCursorStream:
         anchor_doc_start: bool = False,
         cap_mix_prob: float = -1.0,
         wug_mode: str = "classic",
+        pin_output: bool = True,
     ) -> tuple[Any, ...]:
         dw_key = tuple(sorted((int(k), round(float(v), 6)) for k, v in domain_weights.items()))
         return (
@@ -600,6 +603,7 @@ class _DynamicRaggedCursorStream:
             bool(anchor_doc_start),
             round(float(cap_mix_prob), 4),
             str(wug_mode),
+            bool(pin_output),
         )
 
     def _select_cap_shard_idx(self, logical_b: int, *, stage_id: int) -> int:
@@ -649,6 +653,7 @@ class _DynamicRaggedCursorStream:
         anchor_doc_start: bool = False,
         cap_mix_prob: float = -1.0,
         wug_mode: str = "classic",
+        pin_output: bool = True,
     ) -> dict[str, torch.Tensor]:
         # Key shard choice AND length-bucket tier on logical `b_idx` so ALL ranks draw homogeneous
         # document lengths on the same step, while `phys_b_idx` gives each rank disjoint documents
@@ -697,7 +702,7 @@ class _DynamicRaggedCursorStream:
                     max_doc_bytes=max_doc_bytes,
                     wug_ratio=wug_ratio,
                 )
-        return pin_batch_if_cuda(batch, self._device)
+        return pin_batch_if_cuda(batch, self._device) if pin_output else batch
 
     def _clear_prefetch(self) -> None:
         for fut in list(self._prefetch_futures.values()):
@@ -709,6 +714,7 @@ class _DynamicRaggedCursorStream:
         *,
         target_batch_bytes: int,
         state: CurriculumStepState,
+        pin_output: bool = True,
     ) -> dict[str, torch.Tensor]:
         b_idx = int(self.cursor["batch_idx"])
         seed_val = int(self.cursor["seed"])
@@ -733,6 +739,7 @@ class _DynamicRaggedCursorStream:
                 anc_start,
                 cap_p,
                 w_mode,
+                pin_output,
             )
             fut = self._prefetch_futures.pop(req_key, None)
             if fut is not None:
@@ -752,6 +759,7 @@ class _DynamicRaggedCursorStream:
                     anc_start,
                     cap_p,
                     w_mode,
+                    pin_output,
                 )
             for off in range(1, self._prefetch_depth + 1):
                 look_b = b_idx + off
@@ -768,6 +776,7 @@ class _DynamicRaggedCursorStream:
                     anc_start,
                     cap_p,
                     w_mode,
+                    pin_output,
                 )
                 if look_key not in self._prefetch_futures:
                     self._prefetch_futures[look_key] = self._executor.submit(
@@ -784,6 +793,7 @@ class _DynamicRaggedCursorStream:
                         anc_start,
                         cap_p,
                         w_mode,
+                        pin_output,
                     )
         else:
             batch = self._fetch_one(
@@ -799,6 +809,7 @@ class _DynamicRaggedCursorStream:
                 anc_start,
                 cap_p,
                 w_mode,
+                pin_output,
             )
 
         next_b = b_idx + 1
@@ -839,6 +850,208 @@ class _DynamicRaggedCursorStream:
                     cds.close()
                     self._cap_datasets[i] = None
                     self._cap_keys[i] = None
+
+
+class _AsyncStreamCarryPrefetcher:
+    """Single-worker sequential background prefetcher for stateful `StreamCarryPacker`.
+
+    Overlaps CPU stream packing + page-locked `pin_memory()` with GPU forward/backward while
+    snapshotting `stream.cursor` per packed batch so checkpoints, stage transitions, and Watchdog
+    rollbacks remain 100% deterministic.
+    """
+
+    def __init__(
+        self,
+        packer: StreamCarryPacker,
+        stream: _DynamicRaggedCursorStream,
+        device: torch.device,
+        *,
+        prefetch_depth: int = 0,
+    ) -> None:
+        self.packer = packer
+        self.stream = stream
+        self.device = device
+        self.prefetch_depth = max(0, int(prefetch_depth))
+        self._executor: Optional[ThreadPoolExecutor] = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"dcpa_carry_r{stream.rank}")
+            if self.prefetch_depth > 0
+            else None
+        )
+        self._pending: deque[tuple[int, int, int, Future[tuple[dict[str, torch.Tensor], dict[str, Any]]]]] = deque()
+        self._committed_cursor: Optional[dict[str, Any]] = None
+        self._cursor_ran_ahead: bool = False
+
+    @property
+    def committed_cursor(self) -> Optional[dict[str, Any]]:
+        return dict(self._committed_cursor) if self._committed_cursor is not None else None
+
+    def _produce_one(
+        self,
+        target_batch_bytes: int,
+        state: CurriculumStepState,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        batch = self.packer.next_batch(
+            lambda: self.stream.next_batch(
+                target_batch_bytes=target_batch_bytes,
+                state=state,
+                pin_output=False,
+            )
+        )
+        cursor_snap = dict(self.stream.cursor)
+        batch = pin_batch_if_cuda(batch, self.device)
+        return batch, cursor_snap
+
+    def _schedule_ahead(
+        self,
+        *,
+        next_step_idx: int,
+        next_micro_idx: int,
+        grad_accum_steps: int,
+        total_steps: int,
+        active_stage_id: int,
+        target_batch_bytes: int,
+        controller: CurriculumController,
+    ) -> None:
+        if self._executor is None or self.prefetch_depth <= 0:
+            return
+        if self._pending:
+            last_step, last_micro, _, _ = self._pending[-1]
+            s_cur, m_cur = last_step, last_micro + 1
+            if m_cur >= grad_accum_steps:
+                s_cur += 1
+                m_cur = 0
+        else:
+            s_cur, m_cur = next_step_idx, next_micro_idx
+
+        while len(self._pending) < self.prefetch_depth and s_cur < total_steps:
+            sc_next = controller.get(s_cur)
+            if sc_next.stage_id != active_stage_id or sc_next.model_stage not in ("B", "C"):
+                break
+            fut = self._executor.submit(self._produce_one, int(target_batch_bytes), sc_next)
+            self._pending.append((s_cur, m_cur, int(sc_next.stage_id), fut))
+            self._cursor_ran_ahead = True
+            m_cur += 1
+            if m_cur >= grad_accum_steps:
+                s_cur += 1
+                m_cur = 0
+
+    def next_batch(
+        self,
+        *,
+        step_idx: int,
+        micro_idx: int,
+        target_batch_bytes: int,
+        state: CurriculumStepState,
+        grad_accum_steps: int,
+        total_steps: int,
+        controller: CurriculumController,
+    ) -> dict[str, torch.Tensor]:
+        if self._executor is not None and self.prefetch_depth > 0:
+            if self._pending:
+                p_step, p_micro, p_stage, fut = self._pending.popleft()
+                if p_step == step_idx and p_micro == micro_idx and p_stage == state.stage_id:
+                    batch, cursor_snap = fut.result()
+                else:
+                    fut.result()
+                    self._drain_and_realign()
+                    batch, cursor_snap = self._produce_one(int(target_batch_bytes), state)
+            else:
+                batch, cursor_snap = self._produce_one(int(target_batch_bytes), state)
+            self._committed_cursor = cursor_snap
+            if not self._pending:
+                self._cursor_ran_ahead = False
+
+            next_s, next_m = step_idx, micro_idx + 1
+            if next_m >= grad_accum_steps:
+                next_s += 1
+                next_m = 0
+            self._schedule_ahead(
+                next_step_idx=next_s,
+                next_micro_idx=next_m,
+                grad_accum_steps=grad_accum_steps,
+                total_steps=total_steps,
+                active_stage_id=int(state.stage_id),
+                target_batch_bytes=int(target_batch_bytes),
+                controller=controller,
+            )
+            return batch
+
+        batch, cursor_snap = self._produce_one(int(target_batch_bytes), state)
+        self._committed_cursor = cursor_snap
+        self._cursor_ran_ahead = False
+        return batch
+
+    def _drain_pending(self) -> None:
+        while self._pending:
+            _, _, _, fut = self._pending.popleft()
+            try:
+                fut.result()
+            except Exception:
+                pass
+
+    def _drain_and_realign(self) -> None:
+        self._drain_pending()
+        if self._cursor_ran_ahead and self._committed_cursor is not None:
+            self.stream.restore_cursor(self._committed_cursor)
+        self._cursor_ran_ahead = False
+
+    def reset(self, *, restore_stream_cursor: bool = True) -> None:
+        """Drain any in-flight worker future, reset packer, and restore stream cursor if ran ahead."""
+        self._drain_pending()
+        if restore_stream_cursor and self._cursor_ran_ahead and self._committed_cursor is not None:
+            self.stream.restore_cursor(self._committed_cursor)
+        self._cursor_ran_ahead = False
+        self._committed_cursor = None
+        self.packer.reset()
+
+    def close(self) -> None:
+        self._drain_pending()
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor = None
+
+
+def _stage_microbatch_to_device(
+    batch: dict[str, torch.Tensor],
+    stage_id: int,
+    device: torch.device,
+    h2d_stream: Optional[Any],
+) -> tuple[dict[str, Optional[torch.Tensor]], Optional[bool], Optional[Any]]:
+    """Transfer a micro-batch to `device`, using dedicated CUDA `h2d_stream` when available."""
+    # Check Stage-2 loss_mask homogeneity on CPU before async H2D DMA (zero CUDA sync!)
+    loss_mask_all_ones: Optional[bool] = bool(batch["loss_mask"].all()) if stage_id == 2 else None
+    keys = (
+        "x_bytes",
+        "cu_seqlens",
+        "doc_lang_ids",
+        "doc_style_ids",
+        "doc_ponder_tax_scale",
+        "byte_lang_ids",
+        "loss_mask",
+        "wug_target_mask",
+    )
+    if h2d_stream is not None:
+        with torch.cuda.stream(h2d_stream):
+            staged = {k: to_device_async(batch.get(k), device) for k in keys}
+            ev = torch.cuda.Event()
+            ev.record(h2d_stream)
+        return staged, loss_mask_all_ones, ev
+    staged = {k: to_device_async(batch.get(k), device) for k in keys}
+    return staged, loss_mask_all_ones, None
+
+
+def _await_staged_microbatch(
+    staged: dict[str, Optional[torch.Tensor]],
+    h2d_event: Optional[Any],
+    device: torch.device,
+) -> None:
+    """Synchronize compute stream on `h2d_event` and protect async-copied tensors via `record_stream`."""
+    if h2d_event is not None and device.type == "cuda":
+        cur_stream = torch.cuda.current_stream(device)
+        cur_stream.wait_event(h2d_event)
+        for t in staged.values():
+            if t is not None:
+                t.record_stream(cur_stream)
 
 
 def run_training(
@@ -1383,6 +1596,7 @@ def run_training(
             stream_chunk_bytes if stream_chunk_bytes is not None else hw_cfg.get("stream_chunk_bytes", 512)
         )
         carry_packer: Optional[StreamCarryPacker] = None
+        carry_prefetcher: Optional[_AsyncStreamCarryPrefetcher] = None
         carry_bank: Optional[StreamCarryBank] = None
         carry_active_stage: Optional[int] = None
         if eff_stream_carry:
@@ -1396,20 +1610,42 @@ def run_training(
                 min_piece_bytes=int(hw_cfg.get("stream_min_piece_bytes", 64)),
                 max_entries=entry_cap,
             )
+            eff_carry_prefetch = max(2, eff_prefetch_depth) if device.type == "cuda" else 0
+            carry_prefetcher = _AsyncStreamCarryPrefetcher(
+                carry_packer,
+                stream,
+                device,
+                prefetch_depth=eff_carry_prefetch,
+            )
             carry_bank = StreamCarryBank.from_config(cfg, n_carry_streams, device)
             _r0_print(
                 f"[StreamCarry] enabled for Stages B/C | streams={n_carry_streams} | chunk={eff_stream_chunk}B | "
-                f"entry_cap={entry_cap} | bcg_cudagraphs={eff_bcg_cudagraphs}",
+                f"entry_cap={entry_cap} | prefetch={eff_carry_prefetch} | bcg_cudagraphs={eff_bcg_cudagraphs}",
                 flush=True,
             )
 
         def _reset_stream_carry() -> None:
             nonlocal carry_active_stage
-            if carry_packer is not None:
+            if carry_prefetcher is not None:
+                carry_prefetcher.reset(restore_stream_cursor=True)
+            elif carry_packer is not None:
                 carry_packer.reset()
             if carry_bank is not None:
                 carry_bank.reset()
             carry_active_stage = None
+
+        h2d_stream: Optional[Any] = (
+            torch.cuda.Stream(device=device) if (device.type == "cuda" and torch.cuda.is_available()) else None
+        )
+        async_ckpt: Optional[AsyncCheckpointWriter] = (
+            AsyncCheckpointWriter(
+                device,
+                max_pinned_mirror_gb=float(ck_cfg.get("async_pinned_mirror_gb", 8.0)),
+                enabled=bool(ck_cfg.get("async_checkpoint", True)),
+            )
+            if is_primary
+            else None
+        )
 
         # Resume handling (auto: Colab A/B Ping-Pong first if configured, else local CheckpointManager)
         start_step = 0
@@ -1537,6 +1773,13 @@ def run_training(
         header_printed = False
         interrupted_sig: Optional[str] = None
 
+        def _current_dataloader_cursor() -> dict[str, Any]:
+            if carry_prefetcher is not None and carry_active_stage is not None:
+                committed = carry_prefetcher.committed_cursor
+                if committed is not None:
+                    return committed
+            return dict(stream.cursor)
+
         def _build_ckpt_payload(completed_step: int, st_id: int) -> dict[str, Any]:
             return CheckpointManager.build_payload(
                 step=completed_step,
@@ -1545,7 +1788,7 @@ def run_training(
                 optimizer=optimizer,
                 scheduler_state=controller.state_dict(),
                 dynamic_loss_multipliers=watchdog.state_dict(),
-                dataloader_cursor=dict(stream.cursor),
+                dataloader_cursor=_current_dataloader_cursor(),
                 best_val_metric=best_val_metric,
                 config_dict=cfg.to_dict(),
                 hardware_tier=profile.tier,
@@ -1604,34 +1847,43 @@ def run_training(
                 accum_metric_vec: Optional[torch.Tensor] = None
                 step_loss_finite = True
 
-                for _micro_idx in range(grad_accum_steps):
-                    use_carry = carry_packer is not None and carry_bank is not None and sc.model_stage in ("B", "C")
-                    doc_carry = None
+                use_carry = carry_packer is not None and carry_bank is not None and sc.model_stage in ("B", "C")
+                if use_carry:
+                    if carry_active_stage != sc.stage_id:
+                        _reset_stream_carry()
+                        carry_active_stage = sc.stage_id
+                elif carry_active_stage is not None:
+                    _reset_stream_carry()
+
+                def _pull_microbatch(_m_i: int) -> dict[str, torch.Tensor]:
                     if use_carry:
-                        assert carry_packer is not None and carry_bank is not None
-                        if carry_active_stage != sc.stage_id:
-                            _reset_stream_carry()
-                            carry_active_stage = sc.stage_id
-                        batch = carry_packer.next_batch(
-                            lambda: stream.next_batch(target_batch_bytes=eff_micro_bytes, state=sc)
+                        assert carry_prefetcher is not None
+                        return carry_prefetcher.next_batch(
+                            step_idx=step_idx,
+                            micro_idx=_m_i,
+                            target_batch_bytes=eff_micro_bytes,
+                            state=sc,
+                            grad_accum_steps=grad_accum_steps,
+                            total_steps=eff_total_steps,
+                            controller=controller,
                         )
-                        doc_carry = carry_bank.gather(batch["carry_from"], max_entry_bytes=eff_stream_chunk)
-                    else:
-                        if carry_active_stage is not None:
-                            _reset_stream_carry()
-                        batch = stream.next_batch(target_batch_bytes=eff_micro_bytes, state=sc)
-                    # Check Stage-2 loss_mask homogeneity on CPU before async H2D DMA (zero CUDA sync!)
-                    loss_mask_all_ones: Optional[bool] = (
-                        bool(batch["loss_mask"].all()) if sc.stage_id == 2 else None
-                    )
-                    x_bytes = to_device_async(batch["x_bytes"], device)
-                    cu_seqlens = to_device_async(batch["cu_seqlens"], device)
-                    doc_lang_ids = to_device_async(batch["doc_lang_ids"], device)
-                    doc_style_ids_t = to_device_async(batch.get("doc_style_ids"), device)
-                    doc_pts_t = to_device_async(batch.get("doc_ponder_tax_scale"), device)
-                    byte_lang_ids = to_device_async(batch["byte_lang_ids"], device)
-                    loss_mask = to_device_async(batch["loss_mask"], device)
-                    wug_target_mask = to_device_async(batch["wug_target_mask"], device)
+                    return stream.next_batch(target_batch_bytes=eff_micro_bytes, state=sc)
+
+                batch_cur = _pull_microbatch(0)
+                staged_cur, lmao_cur, ev_cur = _stage_microbatch_to_device(batch_cur, sc.stage_id, device, h2d_stream)
+
+                for _micro_idx in range(grad_accum_steps):
+                    _await_staged_microbatch(staged_cur, ev_cur, device)
+                    batch = batch_cur
+                    loss_mask_all_ones = lmao_cur
+                    x_bytes = staged_cur["x_bytes"]
+                    cu_seqlens = staged_cur["cu_seqlens"]
+                    doc_lang_ids = staged_cur["doc_lang_ids"]
+                    doc_style_ids_t = staged_cur["doc_style_ids"]
+                    doc_pts_t = staged_cur["doc_ponder_tax_scale"]
+                    byte_lang_ids = staged_cur["byte_lang_ids"]
+                    loss_mask = staged_cur["loss_mask"]
+                    wug_target_mask = staged_cur["wug_target_mask"]
                     assert (
                         x_bytes is not None
                         and cu_seqlens is not None
@@ -1640,6 +1892,21 @@ def run_training(
                         and loss_mask is not None
                         and wug_target_mask is not None
                     )
+
+                    doc_carry = None
+                    if use_carry:
+                        assert carry_bank is not None
+                        doc_carry = carry_bank.gather(batch["carry_from"], max_entry_bytes=eff_stream_chunk)
+
+                    # Double-buffer next micro-batch H2D DMA on `h2d_stream` overlapped with forward + backward
+                    if _micro_idx + 1 < grad_accum_steps and h2d_stream is not None:
+                        batch_next = _pull_microbatch(_micro_idx + 1)
+                        staged_next, lmao_next, ev_next = _stage_microbatch_to_device(
+                            batch_next, sc.stage_id, device, h2d_stream
+                        )
+                    else:
+                        batch_next = None
+                        staged_next, lmao_next, ev_next = None, None, None
 
                     loss_w = build_byte_loss_weights(
                         x_bytes=x_bytes,
@@ -1732,6 +1999,16 @@ def run_training(
                         for k, v in out.metrics.items():
                             accum_metrics[k] = accum_metrics.get(k, 0.0) + float(v) / float(grad_accum_steps)
 
+                    if _micro_idx + 1 < grad_accum_steps:
+                        if batch_next is not None and staged_next is not None:
+                            batch_cur = batch_next
+                            staged_cur, lmao_cur, ev_cur = staged_next, lmao_next, ev_next
+                        else:
+                            batch_cur = _pull_microbatch(_micro_idx + 1)
+                            staged_cur, lmao_cur, ev_cur = _stage_microbatch_to_device(
+                                batch_cur, sc.stage_id, device, h2d_stream
+                            )
+
                 if accum_metric_vec is not None:
                     accum_metrics = materialize_metric_vec(accum_metric_vec / float(grad_accum_steps))
                 local_bad_loss = not math.isfinite(float(accum_metrics.get("loss_total", float("nan"))))
@@ -1795,6 +2072,8 @@ def run_training(
                         flush=True,
                     )
                     _sync_log(force=True)
+                    if async_ckpt is not None:
+                        async_ckpt.wait()
                     dist_barrier(dist_ctx)
                     if ckpt_mgr.last_healthy_path.exists():
                         healthy_ckpt = ckpt_mgr.load_checkpoint(ckpt_mgr.last_healthy_path, map_location="cpu")
@@ -1836,7 +2115,9 @@ def run_training(
                         reseed_all_rngs(eff_r_seed, device=device)
                     continue
 
-                # Healthy optimization step
+                # Healthy optimization step (zero-CPU-sync wait if previous async checkpoint D2H still in flight)
+                if async_ckpt is not None:
+                    async_ckpt.wait_for_d2h_on_stream()
                 optimizer.step()
                 watchdog.tick_post_healthy_step(completed_step)
                 steps_since_start += 1
@@ -1965,10 +2246,11 @@ def run_training(
                     if dist_ctx.is_distributed and need_sync_ckpt:
                         sync_tensor_avg_(unwrap_compiled_module(model.bcg_pc).c0, dist_ctx)
                     if is_primary:
-                        synchronize(device)
-                        payload = _build_ckpt_payload(completed_step, sc.stage_id)
-
                         if any_interrupted:
+                            if async_ckpt is not None:
+                                async_ckpt.wait()
+                            synchronize(device)
+                            payload = _build_ckpt_payload(completed_step, sc.stage_id)
                             ckpt_mgr.save_emergency(payload)
                             saves_performed += 1
                             interrupted_sig = sig_guard.signal_name or "SIGTERM"
@@ -1978,40 +2260,52 @@ def run_training(
                                 flush=True,
                             )
                         else:
-                            if (healthy_due or is_final_step) and step_healthy_ok:
-                                ckpt_mgr.save_healthy(payload)
-                                saves_performed += 1
-
-                            if milestone_due:
-                                ckpt_mgr.save_milestone(payload)
-                                saves_performed += 1
-
-                            if is_best:
-                                ckpt_mgr.save_best(payload)
-                                saves_performed += 1
-
-                            if sync_mgr is not None and (wall_due or milestone_due or is_final_step or is_best):
-                                reason_s = wall_reason or ("milestone" if milestone_due else ("final" if is_final_step else "best"))
-                                sync_mgr.save_ping_pong(
-                                    payload=payload,
+                            want_drive = bool(sync_mgr is not None and (wall_due or milestone_due or is_final_step or is_best))
+                            want_healthy = bool(
+                                ((healthy_due or is_final_step) and step_healthy_ok)
+                                or (wall_due and not want_drive and not healthy_due and step_healthy_ok)
+                            )
+                            want_milestone = bool(milestone_due)
+                            want_best = bool(is_best)
+                            drive_reason: Optional[str] = (
+                                (wall_reason or ("milestone" if milestone_due else ("final" if is_final_step else "best")))
+                                if want_drive
+                                else None
+                            )
+                            if want_healthy or want_milestone or want_best or want_drive:
+                                payload = _build_ckpt_payload(completed_step, sc.stage_id)
+                                assert async_ckpt is not None
+                                async_ckpt.submit_checkpoint(
+                                    raw_payload=payload,
                                     step=completed_step,
-                                    stage_id=sc.model_stage,
-                                    reason=reason_s,
-                                    is_best=is_best,
+                                    model_stage=sc.model_stage,
+                                    ckpt_mgr=ckpt_mgr,
+                                    save_healthy=want_healthy,
+                                    save_milestone=want_milestone,
+                                    save_best=want_best,
+                                    sync_mgr=sync_mgr if want_drive else None,
+                                    drive_reason=drive_reason,
+                                    post_commit_fn=(lambda: _sync_log(force=True)) if want_drive else None,
                                 )
-                                wall_trigger.mark_saved(completed_step)
-                                saves_performed += 1
-                                _sync_log(force=True)
-                            elif wall_due and not healthy_due:
-                                if step_healthy_ok:
-                                    ckpt_mgr.save_healthy(payload)
+                                if want_healthy:
                                     saves_performed += 1
+                                if want_milestone:
+                                    saves_performed += 1
+                                if want_best:
+                                    saves_performed += 1
+                                if want_drive:
+                                    saves_performed += 1
+                            if want_drive or (wall_due and not healthy_due):
                                 wall_trigger.mark_saved(completed_step)
+                            if is_final_step and async_ckpt is not None:
+                                async_ckpt.wait()
                     else:
                         if not any_interrupted and step_healthy_ok and (healthy_due or is_final_step or (wall_due and drive_sync_dir is None)):
                             ckpt_mgr.last_healthy_step = completed_step
 
-                    if need_sync_ckpt:
+                    # Only barrier across ranks on emergency preemption or final step;
+                    # regular checkpoints overlap Rank-0 disk/Drive I/O without stalling other ranks.
+                    if any_interrupted or is_final_step:
                         dist_barrier(dist_ctx)
                     if any_interrupted:
                         interrupted_sig = sig_guard.signal_name or "SIGTERM"
@@ -2019,6 +2313,10 @@ def run_training(
                         break
 
                 step_idx += 1
+
+        # Drain any in-flight async checkpoint before final export or returning summary
+        if async_ckpt is not None:
+            async_ckpt.wait()
 
         # Final `.safetensors` export on clean completion (Rank 0 exclusive)
         final_export_path: Optional[Path] = None
@@ -2077,8 +2375,12 @@ def run_training(
         _exit_exc = sys.exc_info()
         raise
     finally:
+        if "async_ckpt" in locals() and async_ckpt is not None:
+            async_ckpt.close()
         if wb_tracker is not None:
             wb_tracker.finish()
+        if "carry_prefetcher" in locals() and carry_prefetcher is not None:
+            carry_prefetcher.close()
         if stream is not None:
             stream.close()
         run_log.__exit__(*_exit_exc)

@@ -24,16 +24,19 @@ Implements Deliverable 3 & Red Line #4:
 
 from __future__ import annotations
 
+import copy
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import math
 import os
 import random
+import shutil
 import signal
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -72,6 +75,48 @@ def atomic_torch_save(payload: Mapping[str, Any], target_path: str | Path) -> Pa
         torch.save(dict(payload), f)
         f.flush()
         os.fsync(f.fileno())
+    os.replace(tmp, dst)
+    _fsync_dir(dst.parent)
+    return dst
+
+
+def atomic_copy_or_link(src_path: str | Path, target_path: str | Path) -> Path:
+    """Atomically replicate an already-serialized local checkpoint to `target_path`.
+
+    Uses an O(1) hardlink + `os.replace` when `src` and `dst` share a filesystem (safe because all
+    local writes use atomic `*.tmp -> os.replace`, never mutating existing inodes in-place), falling
+    back cleanly to an atomic `fsync` copy across filesystems.
+    """
+    src = Path(src_path)
+    dst = Path(target_path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src.exists() and dst.exists():
+        try:
+            if src.samefile(dst):
+                return dst
+        except OSError:
+            pass
+    tmp = dst.with_name(f"{dst.name}.tmp")
+    if tmp.exists():
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    try:
+        os.link(src, tmp)
+        os.replace(tmp, dst)
+        _fsync_dir(dst.parent)
+        return dst
+    except OSError:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    with src.open("rb") as f_in, tmp.open("wb") as f_out:
+        shutil.copyfileobj(f_in, f_out, length=4 * 1024 * 1024)
+        f_out.flush()
+        os.fsync(f_out.fileno())
     os.replace(tmp, dst)
     _fsync_dir(dst.parent)
     return dst
@@ -603,12 +648,23 @@ class CheckpointManager:
         self.last_healthy_step = int(payload["step"])
         return path
 
+    def save_healthy_from_file(self, src_path: str | Path, step: int) -> Path:
+        path = atomic_copy_or_link(src_path, self.last_healthy_path)
+        self.last_healthy_step = int(step)
+        return path
+
     def save_milestone(self, payload: Mapping[str, Any]) -> Path:
         step = int(payload["step"])
         return atomic_torch_save(payload, self.milestone_path(step))
 
+    def save_milestone_from_file(self, src_path: str | Path, step: int) -> Path:
+        return atomic_copy_or_link(src_path, self.milestone_path(int(step)))
+
     def save_best(self, payload: Mapping[str, Any]) -> Path:
         return atomic_torch_save(payload, self.best_model_path)
+
+    def save_best_from_file(self, src_path: str | Path) -> Path:
+        return atomic_copy_or_link(src_path, self.best_model_path)
 
     def save_emergency(self, payload: Mapping[str, Any]) -> Path:
         return atomic_torch_save(payload, self.emergency_interrupt_path)
@@ -711,3 +767,205 @@ class CheckpointManager:
         step = int(ckpt.get("step", 0))
         cursor = dict(ckpt.get("dataloader_cursor") or {})
         return step, cursor
+
+
+class AsyncCheckpointWriter:
+    """Asynchronous GPU->Pinned-CPU snapshot + single-serialization background checkpoint writer.
+
+    Eliminates synchronous `torch.save` and Google Drive FUSE upload stalls from the GPU hot loop:
+      - On CUDA: copies model & optimizer tensors on a dedicated `ckpt_stream` into a reusable
+        pinned CPU mirror (guarded by `max_pinned_mirror_gb`), recording `d2h_done_event`. The
+        compute stream immediately proceeds to next step's read-only forward + backward and only
+        waits on `d2h_done_event` (zero CPU sync) right before the next `optimizer.step()`.
+      - In a single background thread: serializes the snapshot ONCE via `atomic_torch_save`,
+        replicates any secondary local targets (`milestone`, `best`) in O(1) via
+        `atomic_copy_or_link`, and optionally commits Drive A/B Ping-Pong directly from the
+        already-serialized file (`staged_path`).
+    """
+
+    def __init__(
+        self,
+        device: torch.device,
+        *,
+        max_pinned_mirror_gb: float = 8.0,
+        enabled: bool = True,
+    ) -> None:
+        self.device = device
+        self.enabled = bool(enabled)
+        self.max_pinned_bytes = int(max(0.0, float(max_pinned_mirror_gb)) * float(1024**3))
+        self._is_cuda = bool(device.type == "cuda" and torch.cuda.is_available())
+        self._ckpt_stream: Optional[Any] = (
+            torch.cuda.Stream(device=device) if (self.enabled and self._is_cuda) else None
+        )
+        self._executor: Optional[ThreadPoolExecutor] = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="dcpa_ckpt_writer")
+            if self.enabled
+            else None
+        )
+        self._pinned_mirror: dict[str, torch.Tensor] = {}
+        self._inflight: Optional[Future[None]] = None
+        self._pending_d2h_event: Optional[Any] = None
+
+    @staticmethod
+    def _estimate_cuda_bytes(obj: Any) -> int:
+        if isinstance(obj, torch.Tensor):
+            return int(obj.numel() * obj.element_size()) if obj.device.type == "cuda" else 0
+        if isinstance(obj, dict):
+            return sum(AsyncCheckpointWriter._estimate_cuda_bytes(v) for v in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return sum(AsyncCheckpointWriter._estimate_cuda_bytes(v) for v in obj)
+        return 0
+
+    def _snapshot_tree(self, obj: Any, prefix: str, pin_enabled: bool) -> Any:
+        if isinstance(obj, torch.Tensor):
+            t = obj.detach()
+            if t.device.type == "cuda":
+                buf = self._pinned_mirror.get(prefix)
+                if (
+                    buf is None
+                    or buf.shape != t.shape
+                    or buf.dtype != t.dtype
+                    or bool(buf.is_pinned()) != bool(pin_enabled)
+                ):
+                    try:
+                        buf = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=pin_enabled)
+                    except RuntimeError:
+                        buf = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=False)
+                    self._pinned_mirror[prefix] = buf
+                buf.copy_(t, non_blocking=bool(buf.is_pinned()))
+                return buf
+            if t.device.type != "cpu":
+                return t.to("cpu").clone()
+            return t.clone()
+        if isinstance(obj, dict):
+            return {k: self._snapshot_tree(v, f"{prefix}.{k}", pin_enabled) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._snapshot_tree(v, f"{prefix}[{i}]", pin_enabled) for i, v in enumerate(obj)]
+        if isinstance(obj, tuple):
+            return tuple(self._snapshot_tree(v, f"{prefix}[{i}]", pin_enabled) for i, v in enumerate(obj))
+        return copy.deepcopy(obj)
+
+    def wait_for_d2h_on_stream(self) -> None:
+        """Emit a zero-CPU-sync CUDA stream wait before mutating weights/moments in `optimizer.step()`."""
+        ev = self._pending_d2h_event
+        if ev is not None and self._is_cuda:
+            torch.cuda.current_stream(self.device).wait_event(ev)
+            self._pending_d2h_event = None
+
+    def wait(self) -> None:
+        """Block until any in-flight background checkpoint write finishes; re-raises worker errors."""
+        fut = self._inflight
+        if fut is not None:
+            self._inflight = None
+            try:
+                fut.result()
+            finally:
+                self._pending_d2h_event = None
+
+    def submit_checkpoint(
+        self,
+        *,
+        raw_payload: Mapping[str, Any],
+        step: int,
+        model_stage: str,
+        ckpt_mgr: CheckpointManager,
+        save_healthy: bool,
+        save_milestone: bool,
+        save_best: bool,
+        sync_mgr: Optional[Any] = None,
+        drive_reason: Optional[str] = None,
+        post_commit_fn: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Snapshot model/optimizer tensors and serialize ONCE (async when enabled)."""
+        want_drive = bool(sync_mgr is not None and drive_reason is not None)
+        if not (save_healthy or save_milestone or save_best or want_drive):
+            return
+
+        # Drain any prior background write so reusable pinned mirror buffers are 100% idle.
+        self.wait()
+
+        if save_healthy:
+            ckpt_mgr.last_healthy_step = int(step)
+
+        d2h_done_ev: Optional[Any] = None
+        if self.enabled and self._ckpt_stream is not None:
+            cuda_bytes = self._estimate_cuda_bytes(raw_payload["model_state_dict"]) + self._estimate_cuda_bytes(
+                raw_payload["optimizer_state_dict"]
+            )
+            use_pinned = cuda_bytes <= self.max_pinned_bytes
+            if not use_pinned and self._pinned_mirror:
+                self._pinned_mirror.clear()
+            step_done_ev = torch.cuda.Event()
+            step_done_ev.record(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(self._ckpt_stream):
+                self._ckpt_stream.wait_event(step_done_ev)
+                snap_payload: dict[str, Any] = dict(raw_payload)
+                snap_payload["model_state_dict"] = self._snapshot_tree(
+                    raw_payload["model_state_dict"], "m", use_pinned
+                )
+                snap_payload["optimizer_state_dict"] = self._snapshot_tree(
+                    raw_payload["optimizer_state_dict"], "o", use_pinned
+                )
+                d2h_done_ev = torch.cuda.Event()
+                d2h_done_ev.record(self._ckpt_stream)
+            self._pending_d2h_event = d2h_done_ev
+        elif self.enabled:
+            snap_payload = dict(raw_payload)
+            snap_payload["model_state_dict"] = self._snapshot_tree(raw_payload["model_state_dict"], "m", False)
+            snap_payload["optimizer_state_dict"] = self._snapshot_tree(
+                raw_payload["optimizer_state_dict"], "o", False
+            )
+        else:
+            snap_payload = dict(raw_payload)
+
+        def _commit_job() -> None:
+            if d2h_done_ev is not None:
+                d2h_done_ev.synchronize()
+
+            if save_healthy:
+                primary_path = ckpt_mgr.last_healthy_path
+            elif save_milestone:
+                primary_path = ckpt_mgr.milestone_path(step)
+            elif save_best:
+                primary_path = ckpt_mgr.best_model_path
+            else:
+                assert sync_mgr is not None
+                primary_path = sync_mgr.staging_path
+
+            # Single atomic torch.save per checkpoint step
+            atomic_torch_save(snap_payload, primary_path)
+
+            # Replicate secondary local targets in O(1) via atomic hardlink/copy
+            if save_milestone:
+                ms_path = ckpt_mgr.milestone_path(step)
+                if ms_path != primary_path:
+                    ckpt_mgr.save_milestone_from_file(primary_path, step)
+            if save_best and ckpt_mgr.best_model_path != primary_path:
+                ckpt_mgr.save_best_from_file(primary_path)
+
+            if want_drive and sync_mgr is not None:
+                sync_mgr.save_ping_pong(
+                    payload=None,
+                    step=int(step),
+                    stage_id=str(model_stage),
+                    reason=str(drive_reason),
+                    is_best=bool(save_best),
+                    staged_path=primary_path,
+                )
+                if post_commit_fn is not None:
+                    post_commit_fn()
+
+        if self._executor is not None:
+            self._inflight = self._executor.submit(_commit_job)
+        else:
+            _commit_job()
+
+    def close(self) -> None:
+        try:
+            self.wait()
+        finally:
+            if self._executor is not None:
+                self._executor.shutdown(wait=True, cancel_futures=False)
+                self._executor = None
+            self._pinned_mirror.clear()
+            self._pending_d2h_event = None

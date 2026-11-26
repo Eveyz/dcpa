@@ -222,28 +222,37 @@ class ABDriveSyncManager:
 
     def save_ping_pong(
         self,
-        payload: dict[str, Any],
+        payload: Optional[dict[str, Any]],
         step: int,
         stage_id: str,
         reason: str = "periodic",
         is_best: bool = False,
         verify_readback: bool = False,
+        staged_path: Optional[str | Path] = None,
     ) -> dict[str, Any]:
         """Execute the 3-step A/B Ping-Pong commit protocol.
 
-        Step 1: Fast local NVMe staging write + BLAKE2b checksum + byte size.
+        Step 1: Fast local NVMe staging write + BLAKE2b checksum + byte size (reuses `staged_path`
+                when an identical local NVMe checkpoint was already serialized this step).
         Step 2: In-place overwrite of inactive Drive slot (`slot_A.pt` <-> `slot_B.pt`) + flush + fsync.
         Step 3: Size verification on Drive + manifest.json commit.
         """
-        # Step 1: Local NVMe staging
-        digest, file_size = self._stage_local_checkpoint(payload)
+        # Step 1: Local NVMe staging (skip redundant torch.save when already serialized locally)
+        if staged_path is not None:
+            src_staged = Path(staged_path)
+            digest, file_size = compute_file_blake2b(src_staged)
+        else:
+            if payload is None:
+                raise ValueError("save_ping_pong requires either `payload` or `staged_path`")
+            src_staged = self.staging_path
+            digest, file_size = self._stage_local_checkpoint(payload)
 
         # Step 2: Determine target slot and overwrite in-place with fsync
         prev_manifest = self._read_manifest()
         target_slot, prev_active = self._next_target_slot(prev_manifest)
         target_file = self.drive_sync_dir / SLOT_FILES[target_slot]
 
-        written = copy_inplace_fsync(self.staging_path, target_file)
+        written = copy_inplace_fsync(src_staged, target_file)
         actual_size = target_file.stat().st_size
         if written != file_size or actual_size != file_size:
             raise IOError(
@@ -296,12 +305,12 @@ class ABDriveSyncManager:
         if int(step) in self.milestone_steps:
             ms_name = f"milestone_step_{int(step):06d}.pt"
             ms_path = self.drive_sync_dir / ms_name
-            copy_inplace_fsync(self.staging_path, ms_path)
+            copy_inplace_fsync(src_staged, ms_path)
             print(f"[DriveSync] Archived milestone checkpoint -> {ms_path}", flush=True)
 
         if is_best:
             best_path = self.drive_sync_dir / "best_model.pt"
-            copy_inplace_fsync(self.staging_path, best_path)
+            copy_inplace_fsync(src_staged, best_path)
             print(f"[DriveSync] Updated best_model.pt at step={step}", flush=True)
 
         return manifest

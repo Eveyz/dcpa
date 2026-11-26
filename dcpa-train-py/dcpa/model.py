@@ -34,7 +34,7 @@ from dcpa.modules.sgsc import SGSC, SGSCOutput
 from dcpa.ops.fp32 import fp32_island
 from dcpa.ops.ragged import ragged_local_offsets, ragged_segment_sum
 from dcpa.ops.rope import compute_causal_byte_scope_depth, compute_segment_scope_depths
-from dcpa.ops.scan import parallel_diag_scan
+from dcpa.ops.scan import HAS_TRITON, parallel_diag_scan
 from dcpa.stream_carry import (
     DocCarryState,
     RowLayout,
@@ -207,6 +207,29 @@ class DCPAModel(nn.Module):
         self.bcg_tbptt_window: int = 0
         self.bcg_tbptt_replay: bool = False
         self.bcg_chunk_steps: int = max(1, int(cfg.clause_chunk_size))
+        self._c0_ema_weights_cache: dict[tuple[str, int, float], tuple[torch.Tensor, ...]] = {}
+
+    def _get_c0_ema_weights_by_rem(
+        self,
+        k_c: int,
+        m_ema_val: float,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, ...]:
+        """Cache per-remainder EMA weights on `device` to avoid 16 GPU allocations every micro-step."""
+        key = (str(device), int(k_c), float(m_ema_val))
+        cached = self._c0_ema_weights_cache.get(key)
+        if cached is not None:
+            return cached
+        weights = tuple(
+            torch.tensor(
+                [(m_ema_val ** (r_len - 1 - idx_r)) * (1.0 - m_ema_val) for idx_r in range(r_len)],
+                device=device,
+                dtype=torch.float32,
+            ).unsqueeze(1)
+            for r_len in range(1, k_c + 1)
+        )
+        self._c0_ema_weights_cache[key] = weights
+        return weights
 
     def _clause_chunk_checkpointed_fn(
         self,
@@ -581,13 +604,15 @@ class DCPAModel(nn.Module):
         seg_doc_ids = torch.repeat_interleave(
             torch.arange(V, device=device, dtype=torch.int64),
             seg_counts.to(torch.int64),
+            output_size=m_total,
         )
         l_reg_seg = l_reg[seg_doc_ids]
 
         seg_doc_start = torch.zeros((m_total,), device=device, dtype=torch.bool)
-        valid_docs = seg_counts > 0
-        if valid_docs.any():
-            seg_doc_start[seg_offsets[valid_docs].to(torch.int64)] = True
+        if m_total > 0:
+            seg_doc_start[0] = True
+            if m_total > 1:
+                seg_doc_start[1:] = seg_doc_ids[1:] != seg_doc_ids[:-1]
 
         # Sensory losses (L_rate, L_sgsc_prior, L_var)
         with fp32_island(device):
@@ -652,7 +677,11 @@ class DCPAModel(nn.Module):
                     ema_decay = 0.8
                     a_ema = torch.full((1, m_total, sgsc_out.c_slow.shape[-1]), ema_decay, device=device, dtype=torch.float32)
                     b_ema = (1.0 - ema_decay) * c_prev.float().unsqueeze(0)
-                    max_seg_span = int(seg_counts.max().item()) if seg_counts.numel() > 0 else m_total
+                    max_seg_span = (
+                        m_total
+                        if (HAS_TRITON and device.type == "cuda")
+                        else (int(seg_counts.max().item()) if seg_counts.numel() > 0 else m_total)
+                    )
                     g_ema_prev = parallel_diag_scan(
                         a_ema,
                         b_ema,
@@ -1347,14 +1376,30 @@ class DCPAModel(nn.Module):
                 V_eff = _coarse_bucket_v(V, 1 << 30) if use_bucketing else V
                 pad_v = V_eff - V
 
+                # Single D2H read of seg_counts [V] per micro-step: derives seg_offsets_cpu,
+                # carry_q_pad, prefix-shrink doc ordering, and Stage 3 Broca CQ offsets on CPU
+                # with zero additional GPU->CPU syncs for the rest of Mode III.
+                sc_orig_cpu = [int(x) for x in seg_counts.detach().to(torch.int32).to("cpu").tolist()]
+                so_orig_cpu: list[int] = []
+                _run_seg_off = 0
+                for _sc_v in sc_orig_cpu:
+                    so_orig_cpu.append(_run_seg_off)
+                    _run_seg_off += _sc_v
+
                 pts_base = (
                     torch.ones((V,), device=device, dtype=torch.float32)
                     if ponder_tax_scale is None
                     else ponder_tax_scale.to(device=device, dtype=torch.float32)
                 )
                 if use_prefix_shrink:
-                    doc_order = torch.argsort(seg_counts, descending=True)
-                    inv_doc_order = torch.argsort(doc_order)
+                    doc_order_cpu = sorted(range(V), key=lambda idx: -sc_orig_cpu[idx])
+                    inv_doc_order_cpu = [0] * V
+                    for _new_i, _old_i in enumerate(doc_order_cpu):
+                        inv_doc_order_cpu[_old_i] = _new_i
+                    doc_order = torch.tensor(doc_order_cpu, device=device, dtype=torch.int64)
+                    inv_doc_order = torch.tensor(inv_doc_order_cpu, device=device, dtype=torch.int64)
+                    seg_counts_ord_cpu = [sc_orig_cpu[i] for i in doc_order_cpu]
+                    seg_offsets_ord_cpu = [so_orig_cpu[i] for i in doc_order_cpu]
                     seg_counts_ord = seg_counts[doc_order]
                     seg_offsets_ord = seg_offsets[doc_order]
                     l_reg_ord = l_reg[doc_order]
@@ -1362,6 +1407,8 @@ class DCPAModel(nn.Module):
                     fam_mask_ord = familiar_doc_mask[doc_order] if familiar_doc_mask is not None else None
                 else:
                     inv_doc_order = None
+                    seg_counts_ord_cpu = sc_orig_cpu
+                    seg_offsets_ord_cpu = so_orig_cpu
                     seg_counts_ord = seg_counts
                     seg_offsets_ord = seg_offsets
                     l_reg_ord = l_reg
@@ -1398,8 +1445,7 @@ class DCPAModel(nn.Module):
                 carry_ring_valid: Optional[torch.Tensor] = None
                 if carry_mode and m_total > 0:
                     assert doc_carry is not None and carry_cont is not None
-                    sc_cpu_list = [int(x) for x in seg_counts.detach().to(torch.int64).to("cpu").tolist()]
-                    carry_q_pad = bucket_pow2(max(sc_cpu_list) if sc_cpu_list else 1, 16)
+                    carry_q_pad = bucket_pow2(max(sc_orig_cpu) if sc_orig_cpu else 1, 16)
                     carry_seg_pad_pos = seg_doc_ids * carry_q_pad + seg_local
                     carry_ring_valid = doc_carry.ring_valid.to(device=device).bool() & carry_cont.unsqueeze(-1)
                     ring_rows = bucket_pow2(V, 16)  # static-shape ring width for the compiled cortical kernels
@@ -1491,16 +1537,6 @@ class DCPAModel(nn.Module):
                 tau_m_t = torch.tensor(float(tau_m), device=device, dtype=torch.float32)
                 mix_t = torch.tensor(float(merge_uniform_mix), device=device, dtype=torch.float32)
 
-                counts_offs_cpu = (
-                    torch.cat(
-                        [seg_counts_ord.detach().to(torch.int32), seg_offsets_ord.detach().to(torch.int32)], dim=0
-                    )
-                    .to("cpu")
-                    .tolist()
-                )
-                n_v_cpu = int(seg_counts_ord.numel())
-                seg_counts_ord_cpu = [int(x) for x in counts_offs_cpu[:n_v_cpu]]
-                seg_offsets_ord_cpu = [int(x) for x in counts_offs_cpu[n_v_cpu : 2 * n_v_cpu]]
                 m_max = max(seg_counts_ord_cpu) if seg_counts_ord_cpu else 0
 
                 s_trace_flat = torch.zeros((m_total, K, D), device=device, dtype=h_enc_all.dtype) if record_traces else None
@@ -1599,14 +1635,7 @@ class DCPAModel(nn.Module):
                     k_offs_c = torch.arange(K_c, device=device, dtype=torch.int64)
                     ach_zeros_flat = torch.zeros((K_c * V_eff,), device=device, dtype=torch.float32)
                     m_ema_val = float(bcg_raw.cfg.c0_ema_momentum)
-                    c0_ema_weights_by_rem: tuple[torch.Tensor, ...] = tuple(
-                        torch.tensor(
-                            [(m_ema_val ** (r_len - 1 - idx_r)) * (1.0 - m_ema_val) for idx_r in range(r_len)],
-                            device=device,
-                            dtype=torch.float32,
-                        ).unsqueeze(1)
-                        for r_len in range(1, K_c + 1)
-                    )
+                    c0_ema_weights_by_rem = self._get_c0_ema_weights_by_rem(K_c, m_ema_val, device)
 
                     m_step = 0
                     while m_step < m_max:
@@ -2153,9 +2182,7 @@ class DCPAModel(nn.Module):
 
                     if use_cq:
                         if use_parallel_cq:
-                            # `seg_counts` / `seg_offsets` in original document order match `pre_*_flat` (`inv_perm`)!
-                            sc_orig_cpu = [int(x) for x in seg_counts.detach().to(torch.int32).to("cpu").tolist()]
-                            so_orig_cpu = [int(x) for x in seg_offsets.detach().to(torch.int32).to("cpu").tolist()]
+                            # `sc_orig_cpu` / `so_orig_cpu` in original document order match `pre_*_flat` (`inv_perm`)!
                             z_cq_flat, ds_cq_flat = self.pmd.broca_cq_blocks_parallel(
                                 pre_slots_flat=pre_slots_flat,
                                 pre_edges_flat=pre_edges_flat,

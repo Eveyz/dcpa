@@ -751,6 +751,43 @@ class CurriculumController:
         self._last_stage_id = int(state.get("last_stage_id", 0))
 
 
+_STAGE3_BYTE_WEIGHT_LUT_CACHE: dict[tuple[str, float], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_stage3_byte_weight_luts(
+    device: torch.device,
+    code_delimiter_focal_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return cached `(code_lut [256], noncode_lut [256])` float32 byte-weight tables on `device`.
+
+    Replaces the per-step Python loop over `CODE_DELIMITER_BYTES` + EOT/tool checks with a
+    single O(1) GPU table gather.
+    """
+    focal_w = float(code_delimiter_focal_weight) if float(code_delimiter_focal_weight) > 1.0 else 1.0
+    key = (str(device), focal_w)
+    cached = _STAGE3_BYTE_WEIGHT_LUT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    noncode_vals = [1.0] * 256
+    noncode_vals[0x04] = max(noncode_vals[0x04], 1.5)
+    noncode_vals[0x11] = max(noncode_vals[0x11], 2.0)
+    noncode_vals[0x13] = max(noncode_vals[0x13], 2.0)
+
+    code_vals = [1.0] * 256
+    if focal_w > 1.0:
+        for code_pt in CODE_DELIMITER_BYTES:
+            code_vals[int(code_pt)] = focal_w
+    code_vals[0x04] = max(code_vals[0x04], 1.5)
+    code_vals[0x11] = max(code_vals[0x11], 2.0)
+    code_vals[0x13] = max(code_vals[0x13], 2.0)
+
+    code_lut = torch.tensor(code_vals, device=device, dtype=torch.float32)
+    noncode_lut = torch.tensor(noncode_vals, device=device, dtype=torch.float32)
+    _STAGE3_BYTE_WEIGHT_LUT_CACHE[key] = (code_lut, noncode_lut)
+    return code_lut, noncode_lut
+
+
 def build_byte_loss_weights(
     x_bytes: torch.Tensor,
     byte_lang_ids: torch.Tensor,
@@ -778,26 +815,15 @@ def build_byte_loss_weights(
 
     if state.stage_id == 3:
         b = x_bytes.to(device=device, dtype=torch.int64)
-        m_bool = loss_mask.to(device=device, dtype=torch.bool)
-        w = m_bool.to(dtype=torch.float32)
-        if state.code_delimiter_focal_weight > 1.0:
+        m_f = loss_mask.to(device=device, dtype=torch.bool).to(dtype=torch.float32)
+        code_lut, noncode_lut = _get_stage3_byte_weight_luts(device, state.code_delimiter_focal_weight)
+        if float(state.code_delimiter_focal_weight) > 1.0:
             lids = byte_lang_ids.to(device=device, dtype=torch.int64)
             is_code = (lids == 3) | (lids == 4) | (lids == 5)
-            is_delim = torch.zeros_like(is_code)
-            for code_pt in CODE_DELIMITER_BYTES:
-                is_delim = is_delim | (b == code_pt)
-            boost = is_code & is_delim & m_bool
-            w = torch.where(
-                boost,
-                torch.full_like(w, float(state.code_delimiter_focal_weight)),
-                w,
-            )
-        # Boost EOT (0x04) and tool-call framing bytes (0x11 / 0x13) on supervised capability spans
-        is_eot = (b == 0x04) & m_bool
-        is_tool = ((b == 0x11) | (b == 0x13)) & m_bool
-        w = torch.where(is_eot, torch.maximum(w, torch.full_like(w, 1.5)), w)
-        w = torch.where(is_tool, torch.maximum(w, torch.full_like(w, 2.0)), w)
-        return w.unsqueeze(0)
+            base_w = torch.where(is_code, code_lut[b], noncode_lut[b])
+        else:
+            base_w = noncode_lut[b]
+        return (base_w * m_f).unsqueeze(0)
 
     if state.stage_id == 2:
         all_ones = bool(loss_mask.all().item()) if loss_mask_all_ones is None else bool(loss_mask_all_ones)

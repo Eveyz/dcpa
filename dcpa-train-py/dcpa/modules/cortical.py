@@ -29,6 +29,118 @@ from dcpa.ops.fp32 import fp32_island
 from dcpa.ops.rmsnorm import RMSNorm
 from dcpa.ops.rope import apply_concept_rope_2d
 
+try:
+    from torch.nn.attention.flex_attention import (
+        create_block_mask as _create_block_mask,
+        flex_attention as _flex_attention,
+    )
+
+    _HAS_FLEX_ATTENTION = True
+except Exception:
+    _create_block_mask = None  # type: ignore[assignment]
+    _flex_attention = None  # type: ignore[assignment]
+    _HAS_FLEX_ATTENTION = False
+
+_FLEX_BLOCK_SIZE: int = 128
+_FLEX_ATTN_SM80_CACHE: dict[int, bool] = {}
+_COMPILED_FLEX_ATTN: Optional[Callable[..., Any]] = None
+
+
+def _device_supports_flex_attention(device: torch.device, dtype: torch.dtype) -> bool:
+    """Return True when FlexAttention fused Triton kernels are supported (CUDA SM>=80 + BF16/FP16)."""
+    if not _HAS_FLEX_ATTENTION:
+        return False
+    if device.type != "cuda" or dtype not in (torch.bfloat16, torch.float16):
+        return False
+    idx = 0 if device.index is None else int(device.index)
+    supported = _FLEX_ATTN_SM80_CACHE.get(idx)
+    if supported is None:
+        try:
+            major, _ = torch.cuda.get_device_capability(device)
+            supported = int(major) >= 8
+        except Exception:
+            supported = False
+        _FLEX_ATTN_SM80_CACHE[idx] = supported
+    return supported
+
+
+def _call_flex_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_mask: Any,
+    scale: float,
+    return_lse: bool,
+) -> Any:
+    """Invoke FlexAttention directly inside `torch.compile`, or via cached compiled wrapper in eager CUDA."""
+    global _COMPILED_FLEX_ATTN
+    assert _flex_attention is not None
+    if torch.compiler.is_compiling() or q.device.type != "cuda":
+        return _flex_attention(q, k, v, block_mask=block_mask, scale=scale, return_lse=return_lse)
+    if _COMPILED_FLEX_ATTN is None:
+        _COMPILED_FLEX_ATTN = torch.compile(_flex_attention, dynamic=False)
+    return _COMPILED_FLEX_ATTN(q, k, v, block_mask=block_mask, scale=scale, return_lse=return_lse)
+
+
+def _build_cortical_encoder_block_mask(
+    doc_ids: torch.Tensor,
+    window_size: int,
+    *,
+    compile_mask: bool = False,
+) -> tuple[Any, int]:
+    """Build a shared FlexAttention `BlockMask` for causal sliding-window + same-doc isolation.
+
+    Pads `doc_ids` to a multiple of `_FLEX_BLOCK_SIZE` (128) with `-2` so PyTorch 2.5's block-mask
+    evaluator never indexes out-of-bounds, and keeps the diagonal valid on padded rows (`doc < 0`)
+    to prevent `0/0` NaNs.
+    """
+    assert _create_block_mask is not None
+    M = int(doc_ids.shape[0])
+    M_flex = max(_FLEX_BLOCK_SIZE, ((M + _FLEX_BLOCK_SIZE - 1) // _FLEX_BLOCK_SIZE) * _FLEX_BLOCK_SIZE)
+    if M_flex > M:
+        doc_pad = torch.cat(
+            [doc_ids, torch.full((M_flex - M,), -2, device=doc_ids.device, dtype=doc_ids.dtype)],
+            dim=0,
+        )
+    else:
+        doc_pad = doc_ids
+
+    W = int(window_size)
+
+    def _enc_window_mask_mod(b, h, q_idx, kv_idx):
+        diff = q_idx - kv_idx
+        in_win = (diff >= 0) & (diff < W)
+        dq = doc_pad[q_idx]
+        dk = doc_pad[kv_idx]
+        same_doc = (dq == dk) & (dq >= 0)
+        diag_fb = (q_idx == kv_idx) & (dq < 0)
+        return (same_doc & in_win) | diag_fb
+
+    if compile_mask:
+        try:
+            bm = _create_block_mask(
+                _enc_window_mask_mod,
+                B=1,
+                H=None,
+                Q_LEN=M_flex,
+                KV_LEN=M_flex,
+                device=doc_pad.device,
+                _compile=True,
+            )
+            return bm, M_flex
+        except Exception:
+            pass
+    bm = _create_block_mask(
+        _enc_window_mask_mod,
+        B=1,
+        H=None,
+        Q_LEN=M_flex,
+        KV_LEN=M_flex,
+        device=doc_pad.device,
+        _compile=False,
+    )
+    return bm, M_flex
+
 
 class RingMemory(NamedTuple):
     """Stream-carry cross-chunk window memory (previous chunk's last `W` segments per packed entry).
@@ -370,6 +482,8 @@ class CorticalEncoderLayer(nn.Module):
         scope_depth: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
         ring: Optional[RingMemory] = None,
+        block_mask: Optional[Any] = None,
+        flex_m_len: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Tiled O(M * W) causal sliding-window attention (`0 <= m - n < W`) across `[M_total, D]`."""
         M, D = x.shape
@@ -393,6 +507,51 @@ class CorticalEncoderLayer(nn.Module):
         k_rot = apply_concept_rope_2d(
             k, pos_in_doc, scope_depth, theta_base=self.cfg.rope_theta_concept, scope_period=self.cfg.rope_period
         )
+
+        scale = 1.0 / math.sqrt(float(Dh))
+
+        # Fused Flash/FlexAttention path: avoids `[Nt, H, 2W, Dh]` KV duplication, dense `[Nt, 1, W, 2W]`
+        # bool mask materialization, and FP32 `[Nt, H, W, 2W]` scores in stream-carry (`ring is not None`).
+        if block_mask is not None and _HAS_FLEX_ATTENTION:
+            M_flex = (
+                int(flex_m_len)
+                if flex_m_len is not None
+                else max(_FLEX_BLOCK_SIZE, ((M + _FLEX_BLOCK_SIZE - 1) // _FLEX_BLOCK_SIZE) * _FLEX_BLOCK_SIZE)
+            )
+            dh_pad = 16 if Dh < 16 else (1 << (Dh - 1).bit_length())
+            q_flex = q_rot.to(orig_dtype).transpose(0, 1).unsqueeze(0)  # [1, H, M, Dh]
+            k_flex = k_rot.to(orig_dtype).transpose(0, 1).unsqueeze(0)
+            v_flex = v.to(orig_dtype).transpose(0, 1).unsqueeze(0)
+            pad_m = M_flex - M
+            pad_d = dh_pad - Dh
+            if pad_m > 0 or pad_d > 0:
+                q_flex = F.pad(q_flex, (0, pad_d, 0, pad_m))
+                k_flex = F.pad(k_flex, (0, pad_d, 0, pad_m))
+                v_flex = F.pad(v_flex, (0, pad_d, 0, pad_m))
+            q_flex = q_flex.contiguous()
+            k_flex = k_flex.contiguous()
+            v_flex = v_flex.contiguous()
+
+            if ring is not None:
+                ctx_flex, lse_flex = _call_flex_attention(
+                    q_flex, k_flex, v_flex, block_mask, scale, True
+                )
+                ctx_in = ctx_flex[0, :, :M, :Dh].transpose(0, 1).float()  # [M, H, Dh] fp32
+                lse_in_f = lse_flex[0, :, :M].transpose(0, 1).float()     # [M, H] fp32
+                ctx_mem, lse_mem, _ = _ring_memory_attention(
+                    q_rot, self.w_uk, self.w_uv, ring, pos_in_doc, self.cfg, lo=1, hi=W - 1, scale=scale
+                )
+                with fp32_island(device):
+                    a_in, a_mem = _lse_merge_weights(lse_in_f, lse_mem)
+                    ctx = (a_in.unsqueeze(-1) * ctx_in + a_mem.unsqueeze(-1) * ctx_mem).reshape(M, D).to(orig_dtype)
+            else:
+                ctx_flex = _call_flex_attention(
+                    q_flex, k_flex, v_flex, block_mask, scale, False
+                )
+                ctx = ctx_flex[0, :, :M, :Dh].transpose(0, 1).reshape(M, D).to(orig_dtype)
+
+            x = x + self.w_o(ctx)
+            return self.moe(x, sample_mask=valid_token_mask)
 
         # Pad M up to a multiple of W for zero-loop `[N_tiles, H, W, 2W]` batched attention
         n_tiles = (M + W - 1) // W
@@ -831,6 +990,8 @@ class CorticalSandwich(nn.Module):
         # Position-aware pointer-copy stem residual (initialized to 0 so Stage 1->2 transition is smooth!)
         self.w_copy_out = nn.Linear(d_s, d_s, bias=False)
         nn.init.zeros_(self.w_copy_out.weight)
+        self.use_flex_attention: bool = True
+        self._force_flex_attention: bool = False
         self._compiled_encode: Optional[Callable[..., Any]] = None
         self._compiled_decode: Optional[Callable[..., Any]] = None
 
@@ -886,13 +1047,23 @@ class CorticalSandwich(nn.Module):
         seg_end_depth: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
         ring: Optional[RingMemory] = None,
+        block_mask: Optional[Any] = None,
+        flex_m_len: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         c_kv = self.build_shared_kv(f_stem, c_slow)
         x = c_slow
         bal_sum = torch.zeros((), device=c_slow.device, dtype=torch.float32)
         for layer in self.enc_layers:
             x, bal_l = layer.forward_parallel(
-                x, c_kv, doc_ids, pos_in_doc, seg_end_depth, valid_token_mask=valid_token_mask, ring=ring
+                x,
+                c_kv,
+                doc_ids,
+                pos_in_doc,
+                seg_end_depth,
+                valid_token_mask=valid_token_mask,
+                ring=ring,
+                block_mask=block_mask,
+                flex_m_len=flex_m_len,
             )
             bal_sum = bal_sum + bal_l
         h_enc = self.norm_enc_out(x)
@@ -929,12 +1100,30 @@ class CorticalSandwich(nn.Module):
                 torch.zeros((0, d_s), device=dev, dtype=f_stem.dtype),
                 torch.zeros((), device=dev, dtype=torch.float32),
             )
+        use_flex = bool(
+            _HAS_FLEX_ATTENTION
+            and (
+                self._force_flex_attention
+                or (self.use_flex_attention and _device_supports_flex_attention(dev, c_slow.dtype))
+            )
+        )
         if self._compiled_encode is None:
-            return self._encode_tiled_impl(c_slow, f_stem, doc_ids, pos_in_doc, seg_end_depth, None, ring)
+            enc_bm = None
+            flex_m_len: Optional[int] = None
+            if use_flex:
+                enc_bm, flex_m_len = _build_cortical_encoder_block_mask(
+                    doc_ids, self.cfg.window_size, compile_mask=(dev.type == "cuda")
+                )
+            return self._encode_tiled_impl(
+                c_slow, f_stem, doc_ids, pos_in_doc, seg_end_depth, None, ring, enc_bm, flex_m_len
+            )
 
         W = self.cfg.window_size
         n_tiles = self._bucket_cortical_tiles((M + W - 1) // W)
         M_pad = n_tiles * W
+        if use_flex and (M_pad % _FLEX_BLOCK_SIZE) != 0:
+            step_m = math.lcm(W, _FLEX_BLOCK_SIZE)
+            M_pad = ((M_pad + step_m - 1) // step_m) * step_m
         pad = M_pad - M
         valid_mask = torch.arange(M_pad, device=dev) < M
         if pad > 0:
@@ -946,8 +1135,14 @@ class CorticalSandwich(nn.Module):
         else:
             c_p, f_p, doc_p, pos_p, dep_p = c_slow, f_stem, doc_ids, pos_in_doc, seg_end_depth
 
+        enc_bm = None
+        flex_m_len = None
+        if use_flex:
+            enc_bm, flex_m_len = _build_cortical_encoder_block_mask(
+                doc_p, W, compile_mask=(dev.type == "cuda")
+            )
         h_enc_p, c_kv_p, bal_mean = self._compiled_encode(
-            c_p, f_p, doc_p, pos_p, dep_p, valid_mask, self._pad_ring(ring, pad)
+            c_p, f_p, doc_p, pos_p, dep_p, valid_mask, self._pad_ring(ring, pad), enc_bm, flex_m_len
         )
         return h_enc_p[:M], c_kv_p[:M], bal_mean
 

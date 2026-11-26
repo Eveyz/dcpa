@@ -30,7 +30,7 @@ from dcpa.ops.ragged import (
 )
 from dcpa.ops.rmsnorm import RMSNorm
 from dcpa.ops.rope import apply_holographic_rope
-from dcpa.ops.scan import lif_membrane_scan, parallel_diag_scan
+from dcpa.ops.scan import HAS_TRITON, lif_membrane_scan, parallel_diag_scan
 from dcpa.stream_carry import RowLayout, from_rows, pad_entries, to_rows
 
 
@@ -250,8 +250,12 @@ class SGSC(nn.Module):
             ends = doc_cu_seqlens[1:].to(dtype=torch.int64, device=device)
             if starts.numel() > 0:
                 doc_reset_mask[0, starts] = True
-                # Skip GPU->CPU sync when compiled byte scan ignores max_span
-                if self._compiled_byte_scan is None:
+                # Skip GPU->CPU sync when compiled byte scan, row_layout, or CUDA+Triton ignores max_span
+                if (
+                    self._compiled_byte_scan is None
+                    and row_layout is None
+                    and not (HAS_TRITON and device.type == "cuda")
+                ):
                     doc_max_span = int((ends - starts).max().item())
 
         h_start = self.h0 if h_init is None else h_init

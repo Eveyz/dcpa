@@ -32,7 +32,7 @@ from dcpa.ops.fp32 import fp32_island
 from dcpa.ops.ragged import ragged_local_offsets, ragged_segment_cumsum
 from dcpa.ops.rmsnorm import RMSNorm
 from dcpa.ops.rope import apply_holographic_rope
-from dcpa.ops.scan import parallel_diag_scan, parallel_stack_scan
+from dcpa.ops.scan import HAS_TRITON, parallel_diag_scan, parallel_stack_scan
 from dcpa.stream_carry import RowLayout, from_rows, pad_entries, to_rows
 
 
@@ -209,9 +209,8 @@ class PMD(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Stream-carry Hotspot B2 on a right-padded `[R, L]` row layout with per-row initial states.
 
-        By linearity of the pushdown recurrence in `Xi` (actions depend only on `u_prev`/`l_reg`):
-          Xi_t = scan(zero init, frame resets)_t + 1[t < first frame reset] * (M_t ... M_0) xi0,
-        so mid-row frame resets still reset to an EMPTY stack while row starts continue from `xi0`.
+        Uses `reset_to_zero=True` so row starts continue from `xi0` (unless reset at `t=0`) while
+        mid-row frame resets reset to an EMPTY stack — executed in ONE single stack scan!
         """
         R, L, _ = u_prev.shape
         act_probs = F.softmax(self.w_act(torch.cat([u_prev, l_reg_bt], dim=-1)).float(), dim=-1)
@@ -220,12 +219,15 @@ class PMD(nn.Module):
         p_hold = act_probs[..., 2]
         v_tag = torch.tanh(self.w_tag(u_prev).float())
 
-        xi_main = parallel_stack_scan(p_push, p_pop, p_hold, v_tag, xi_init=None, reset_mask=stack_reset_mask)
-        xi_hom = parallel_stack_scan(
-            p_push, p_pop, p_hold, torch.zeros_like(v_tag), xi_init=xi0.float(), reset_mask=None
+        stack_xi = parallel_stack_scan(
+            p_push,
+            p_pop,
+            p_hold,
+            v_tag,
+            xi_init=xi0.float(),
+            reset_mask=stack_reset_mask,
+            reset_to_zero=True,
         )
-        before_first_reset = torch.cumsum(stack_reset_mask.to(torch.int32), dim=1) == 0  # [R, L]
-        stack_xi = xi_main + before_first_reset.to(xi_hom.dtype)[..., None, None] * xi_hom
         xi_top2 = stack_xi[:, :, :2, :].reshape(R, L, 2 * self.cfg.stack_tag_dim).to(u_prev.dtype)
 
         x_in = u_prev + d_drive + self.w_st(xi_top2)
@@ -562,11 +564,12 @@ class PMD(nn.Module):
             num_docs = doc_lens.numel()
             if num_docs > 0:
                 doc_reset_mask[0, doc_starts] = True
-                if not use_compiled_motor and not carry_rows:
+                if not use_compiled_motor and not carry_rows and not (HAS_TRITON and device.type == "cuda"):
                     doc_max_span = int(doc_lens.max().item())
             doc_id_flat = torch.repeat_interleave(
                 torch.arange(num_docs, device=device, dtype=torch.int64),
                 doc_lens,
+                output_size=N,
             )  # [N]
         else:
             doc_id_flat = torch.arange(B, device=device, dtype=torch.int64).unsqueeze(1).expand(B, T).reshape(N)

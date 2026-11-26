@@ -274,8 +274,9 @@ def test_bcg_cudagraph_chunk_kernel_matches_compiled_on_cuda() -> None:
     assert bcg_raw.has_cudagraph_chunk_kernel
     cg_fn = bcg_raw._cudagraph_chunk_fn
 
-    x = torch.tensor(list(TEXT_A[:200] + TEXT_B[:80]), dtype=torch.uint8, device=dev).unsqueeze(0)
-    cu = torch.tensor([0, 200, 280], dtype=torch.int32, device=dev)
+    p1, p2 = TEXT_A[:200], TEXT_B
+    x = torch.tensor(list(p1 + p2), dtype=torch.uint8, device=dev).unsqueeze(0)
+    cu = torch.tensor([0, len(p1), len(p1) + len(p2)], dtype=torch.int32, device=dev)
     lang = torch.zeros((2,), dtype=torch.int64, device=dev)
     bank = StreamCarryBank.from_config(model.cfg, n_streams=2, device=dev)
 

@@ -82,8 +82,8 @@ class DocCarryState:
         return [f.name for f in fields(self) if f.name not in ("cont_mask", "max_entry_bytes")]
 
     def detached(self) -> "DocCarryState":
-        kw = {name: getattr(self, name).detach() for name in self.tensor_field_names()}
-        return replace(self, cont_mask=self.cont_mask.detach(), **kw)
+        kw = {name: getattr(self, name).detach().clone() for name in self.tensor_field_names()}
+        return replace(self, cont_mask=self.cont_mask.detach().clone(), **kw)
 
 
 @dataclass

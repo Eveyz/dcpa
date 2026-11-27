@@ -48,10 +48,20 @@ from dcpa.stream_carry import (
 )
 
 try:
-    from utils.device import get_allocated_memory_gb as _get_allocated_memory_gb
+    from utils.device import (
+        get_allocated_memory_gb as _get_allocated_memory_gb,
+        is_vram_headroom_low as _is_vram_headroom_low,
+    )
 except ImportError:
     def _get_allocated_memory_gb(_device: torch.device) -> float:
         return 0.0
+
+    def _is_vram_headroom_low(
+        _device: torch.device,
+        min_free_gb: float = 3.5,
+        min_free_frac: float = 0.15,
+    ) -> bool:
+        return False
 
 
 def _compute_pin_trigger_byte_mask(
@@ -200,10 +210,15 @@ class DCPAModel(nn.Module):
         self.doc_bucket_size: int = 16
         self.bcg_grad_checkpointing: bool = True
         self.bcg_checkpoint_vram_watermark_gb: float = 0.0
-        # Log-Space Contractive Gate Lambda_m in [0.92, 0.998] bounds the recurrent slot Jacobian
-        # organically, so carry_grad_gamma defaults to 1.0 (full end-to-end gradient flow!).
-        self.carry_grad_gamma: float = 1.0
-        self.carry_grad_max_rms: float = 2.0
+        self.bcg_vram_min_free_gb: float = 3.5
+        self.bcg_cudagraph_max_chunks: int = 4
+        # Even with contractive Lambda_m in [0.92, 0.998], edge/salience updates, Gumbel-STE merge
+        # selection (1/tau_m), Slot-0 pinning (Lambda_0=1.0), and the slots->c_hat->eps_0->z_0
+        # feedback loop have Jacobian spectral radius > 1 across a 32-step TBPTT window.
+        # `_DampedBoundedCarry` is an exact 0.0-ULP forward identity (preserving Rust parity) that
+        # keeps recurrent carry gradients spectrally bounded in backward.
+        self.carry_grad_gamma: float = 0.5
+        self.carry_grad_max_rms: float = 0.25
         self.bcg_tbptt_window: int = 0
         self.bcg_tbptt_replay: bool = False
         self.bcg_chunk_steps: int = max(1, int(cfg.clause_chunk_size))
@@ -248,6 +263,8 @@ class DCPAModel(nn.Module):
         mix_t: torch.Tensor,
         gumbel_u_seq: torch.Tensor,
         check_pin: bool,
+        carry_gamma: float = 0.5,
+        carry_max_rms: float = 0.25,
     ) -> tuple[torch.Tensor, ...]:
         bcg_raw = getattr(self.bcg_pc, "_orig_mod", self.bcg_pc)
         return bcg_raw.forward_clause_chunk(
@@ -267,6 +284,8 @@ class DCPAModel(nn.Module):
             gumbel_u_seq=gumbel_u_seq,
             use_gumbel=True,
             check_pin=check_pin,
+            carry_gamma=carry_gamma,
+            carry_max_rms=carry_max_rms,
         )
 
     def _query_hippocampus_expression_fast(
@@ -1629,7 +1648,17 @@ class DCPAModel(nn.Module):
                     assert pi_cort_all is not None
                     K_c = int(self.bcg_chunk_steps)
                     # A2: replay the static-shape chunk kernel through CUDA Graphs (outside checkpointing).
-                    use_cg_chunks = bool(device.type == "cuda" and bcg_raw.has_cudagraph_chunk_kernel)
+                    # Cap CUDA-Graph execution to a single linear head chain (`cur_v == V_eff`, depth < max_cg_chunks)
+                    # while live CUDA free VRAM has safe headroom so prefix-shrink tails & low-rho outlier batches
+                    # never branch CUDAGraph Trees into multi-GiB unfreeable private pools.
+                    min_free_gb = float(self.bcg_vram_min_free_gb)
+                    max_cg_chunks = int(self.bcg_cudagraph_max_chunks)
+                    use_cg_chunks = bool(
+                        device.type == "cuda"
+                        and bcg_raw.has_cudagraph_chunk_kernel
+                        and not _is_vram_headroom_low(device, min_free_gb=min_free_gb)
+                    )
+                    cg_chunks_used = 0
                     if use_cg_chunks and hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                         torch.compiler.cudagraph_mark_step_begin()
                     k_offs_c = torch.arange(K_c, device=device, dtype=torch.int64)
@@ -1692,7 +1721,7 @@ class DCPAModel(nn.Module):
                                 in_slots = g_state.slots.detach().requires_grad_(True)
                                 in_edges = g_state.edges.detach().requires_grad_(True)
                                 in_sal = g_state.salience.detach().requires_grad_(True)
-                            elif carry_gamma < 0.9999:
+                            elif carry_gamma < 0.9999 or carry_max_rms < 1e6:
                                 in_slots = _DampedBoundedCarry.apply(g_state.slots, carry_gamma, carry_max_rms)
                                 in_edges = _DampedBoundedCarry.apply(g_state.edges, carry_gamma, carry_max_rms)
                                 in_sal = _DampedBoundedCarry.apply(g_state.salience, carry_gamma, carry_max_rms)
@@ -1707,13 +1736,24 @@ class DCPAModel(nn.Module):
                             if self.training
                             else None
                         )
+                        vram_low = bool(
+                            device.type == "cuda"
+                            and self.training
+                            and torch.is_grad_enabled()
+                            and _is_vram_headroom_low(device, min_free_gb=min_free_gb)
+                        )
                         use_ckpt_chunk = bool(
                             self.training
                             and torch.is_grad_enabled()
                             and self.bcg_grad_checkpointing
-                            and (watermark_gb <= 0.0 or _get_allocated_memory_gb(device) >= watermark_gb)
+                            and (
+                                watermark_gb <= 0.0
+                                or _get_allocated_memory_gb(device) >= watermark_gb
+                                or vram_low
+                            )
                         )
                         if use_ckpt_chunk:
+                            use_cg_chunks = False
                             assert gumbel_u_seq is not None
                             chunk_out = torch_checkpoint(
                                 self._clause_chunk_checkpointed_fn,
@@ -1732,10 +1772,20 @@ class DCPAModel(nn.Module):
                                 mix_t,
                                 gumbel_u_seq,
                                 True,
+                                carry_gamma,
+                                carry_max_rms,
                                 use_reentrant=False,
                                 preserve_rng_state=False,
                             )
                         else:
+                            use_cg_this_chunk = bool(
+                                use_cg_chunks
+                                and (not vram_low)
+                                and (cur_v == V_eff)
+                                and (max_cg_chunks <= 0 or cg_chunks_used < max_cg_chunks)
+                            )
+                            if not use_cg_this_chunk:
+                                use_cg_chunks = False
                             chunk_out = bcg_raw.forward_clause_chunk(
                                 in_slots,
                                 in_edges,
@@ -1753,8 +1803,12 @@ class DCPAModel(nn.Module):
                                 gumbel_u_seq=gumbel_u_seq,
                                 use_gumbel=self.training,
                                 check_pin=True,
-                                use_cudagraph=use_cg_chunks,
+                                use_cudagraph=use_cg_this_chunk,
+                                carry_gamma=carry_gamma,
+                                carry_max_rms=carry_max_rms,
                             )
+                            if use_cg_this_chunk:
+                                cg_chunks_used += 1
 
                         (
                             z0_seq,
@@ -1956,7 +2010,7 @@ class DCPAModel(nn.Module):
                                     cq_q_cur = cq_q_cur.detach()
                                 if cq_a_prev is not None:
                                     cq_a_prev = cq_a_prev.detach()
-                            elif carry_gamma < 0.9999:
+                            elif carry_gamma < 0.9999 or carry_max_rms < 1e6:
                                 in_slots = _DampedBoundedCarry.apply(g_state.slots, carry_gamma, carry_max_rms)
                                 in_edges = _DampedBoundedCarry.apply(g_state.edges, carry_gamma, carry_max_rms)
                                 in_sal = _DampedBoundedCarry.apply(g_state.salience, carry_gamma, carry_max_rms)

@@ -247,8 +247,10 @@ curriculum:
       - [38000, 2048]
     max_stage_tier: 2
     anchor_doc_start: false
-    # Keep Slot-0 unpinned for first 2/3 of Stage 2 (12k..~37.3k) so all 72 merge pairs train freely; warm in 15% at ~37.3k..50k
+    # Keep Slot-0 unpinned for first 2/3 of Stage 2 (12k..~37.3k) so all 72 merge pairs train freely;
+    # then smoothly linear-ramp cap_mix 0% -> 15% over 8% of Stage 2 (~3,040 steps: ~37.3k..~40.4k).
     cap_warmup_start_progress: 0.6667
+    cap_warmup_ramp_progress: 0.08
     cap_mix_ratio: 0.15
     # 37% Logic + 31% Writing (68% across en/zh/formal) + 32% Modular Code (py=17%, sql=5%, js=10%)
     domain_weights: [0.26, 0.29, 0.13, 0.17, 0.05, 0.10]

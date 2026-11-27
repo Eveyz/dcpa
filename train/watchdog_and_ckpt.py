@@ -244,6 +244,17 @@ class SelfHealingWatchdog:
         self.compression_ratio_max: float = float(cfg.get("compression_ratio_max", 25.0))
         self.concept_std_min_floor: float = float(cfg.get("concept_std_min_floor", 0.35))
         self.merge_entropy_min: float = float(cfg.get("merge_entropy_min", 0.08))
+        # Finite numerical explosion guards (Rule A) & checkpoint health cap:
+        # catches runaway finite GN (e.g. 1e5..1e9) or loss blowups BEFORE optimizer.step() corrupts weights.
+        self.grad_norm_explosion_threshold: float = float(cfg.get("grad_norm_explosion_threshold", 10_000.0))
+        self.grad_norm_warmup_explosion_threshold: float = float(
+            cfg.get(
+                "grad_norm_warmup_explosion_threshold",
+                max(100_000.0, self.grad_norm_explosion_threshold * 10.0),
+            )
+        )
+        self.grad_norm_healthy_cap: float = float(cfg.get("grad_norm_healthy_cap", 1_000.0))
+        self.max_finite_loss: float = float(cfg.get("max_finite_loss", 100.0))
 
         self.skip_batches_on_rollback: int = int(cfg.get("skip_batches_on_rollback", 10))
         self.seed_stride_on_rollback: int = int(cfg.get("seed_stride_on_rollback", 9973))
@@ -347,13 +358,25 @@ class SelfHealingWatchdog:
         bad_reasons: list[str] = []
         if not grads_finite:
             bad_reasons.append("non_finite_gradient")
-        if grad_norm is not None and not math.isfinite(float(grad_norm)):
-            bad_reasons.append(f"grad_norm={grad_norm}")
+        if grad_norm is not None:
+            gn_f = float(grad_norm)
+            if not math.isfinite(gn_f):
+                bad_reasons.append(f"grad_norm={grad_norm}")
+            elif self.grad_norm_explosion_threshold > 0.0:
+                eff_gn_limit = (
+                    self.grad_norm_explosion_threshold
+                    if step >= self.rule_bcd_warmup_steps
+                    else self.grad_norm_warmup_explosion_threshold
+                )
+                if gn_f > eff_gn_limit:
+                    bad_reasons.append(f"grad_norm_explosion={gn_f:.2e}>{eff_gn_limit:.2e}")
         for key in self.SUB_LOSS_KEYS:
             if key in metrics:
                 val = float(metrics[key])
                 if not math.isfinite(val):
                     bad_reasons.append(f"{key}={val}")
+                elif key == "loss_total" and self.max_finite_loss > 0.0 and val > self.max_finite_loss:
+                    bad_reasons.append(f"loss_total_explosion={val:.3f}>{self.max_finite_loss:.1f}")
 
         if bad_reasons:
             return self._trigger_rollback(
@@ -435,10 +458,31 @@ class SelfHealingWatchdog:
 
         return WatchdogAction(triggered=False)
 
-    def is_healthy_for_checkpoint(self, step: int, stage_id: int, metrics: Mapping[str, float]) -> bool:
-        """Return True iff the current step is safe to commit as `last_healthy.pt`."""
+    def is_healthy_for_checkpoint(
+        self,
+        step: int,
+        stage_id: int,
+        metrics: Mapping[str, float],
+        grad_norm: Optional[float] = None,
+    ) -> bool:
+        """Return True iff the current step is safe to commit as `last_healthy.pt` or a Drive slot."""
         for key in self.SUB_LOSS_KEYS:
-            if key in metrics and not math.isfinite(float(metrics[key])):
+            if key in metrics:
+                val = float(metrics[key])
+                if not math.isfinite(val):
+                    return False
+                if key == "loss_total" and self.max_finite_loss > 0.0 and val > self.max_finite_loss:
+                    return False
+        eff_gn = grad_norm if grad_norm is not None else metrics.get("grad_norm")
+        if eff_gn is not None:
+            gn_f = float(eff_gn)
+            if not math.isfinite(gn_f):
+                return False
+            if (
+                step >= self.rule_bcd_warmup_steps
+                and self.grad_norm_healthy_cap > 0.0
+                and gn_f > self.grad_norm_healthy_cap
+            ):
                 return False
         if step >= self.rule_bcd_warmup_steps and stage_id in (1, 2, 3):
             comp = float(metrics.get("compression_ratio", 9.5))

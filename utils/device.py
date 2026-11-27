@@ -420,6 +420,43 @@ def get_allocated_memory_gb(device: torch.device) -> float:
     return 0.0
 
 
+def get_reserved_memory_gb(device: torch.device) -> float:
+    """Return currently reserved accelerator memory in GB (includes PyTorch caching allocator pools)."""
+    if device.type == "cuda" and is_cuda_available():
+        return float(torch.cuda.memory_reserved(device)) / float(1024**3)
+    return 0.0
+
+
+def get_vram_free_and_total_gb(device: torch.device) -> tuple[float, float]:
+    """Return live `(free_gb, total_gb)` from CUDA driver (accounts for CUDAGraph private pools & context)."""
+    if device.type == "cuda" and is_cuda_available():
+        try:
+            free_b, total_b = torch.cuda.mem_get_info(device)
+            return float(free_b) / float(1024**3), float(total_b) / float(1024**3)
+        except Exception:
+            return 0.0, 0.0
+    return 0.0, 0.0
+
+
+def is_vram_headroom_low(
+    device: torch.device,
+    min_free_gb: float = 3.5,
+    min_free_frac: float = 0.15,
+) -> bool:
+    """Return True when live CUDA free VRAM falls below `max(min_free_gb, min_free_frac * total_gb)`.
+
+    Guards activation checkpointing and CUDAGraph capture against OOM from memory invisible to
+    `torch.cuda.memory_allocated` (such as multi-GiB CUDA Graph private pools and cuBLAS workspaces).
+    """
+    if device.type != "cuda" or not is_cuda_available():
+        return False
+    free_gb, total_gb = get_vram_free_and_total_gb(device)
+    if total_gb <= 0.0:
+        return False
+    floor_gb = min(0.45 * total_gb, max(float(min_free_gb), float(min_free_frac) * total_gb))
+    return free_gb < floor_gb
+
+
 def pin_batch_if_cuda(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     """Pin CPU batch tensors into page-locked host memory when targeting a live CUDA device."""
     if device.type != "cuda" or not is_cuda_available():

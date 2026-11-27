@@ -1613,8 +1613,16 @@ class BCGPC(nn.Module):
         gumbel_u_seq: Optional[torch.Tensor] = None,
         use_gumbel: bool = True,
         check_pin: bool = True,
+        carry_gamma: float = 0.5,
+        carry_max_rms: float = 0.25,
     ) -> tuple[torch.Tensor, ...]:
-        """Multi-step (`S = clause_chunk_size`, e.g. 16) zero-MoE contractive graph chunk kernel."""
+        """Multi-step (`S = clause_chunk_size`, e.g. 16) zero-MoE contractive graph chunk kernel.
+
+        Caller applies `_DampedBoundedCarry` (or TBPTT `.detach()`) on the incoming `(slots, edges,
+        salience)` before step 0; intra-chunk steps `k = 1..S-1` apply `_DampedBoundedCarry` identically
+        (0.0 ULP forward identity, spectral-safe backward) so chunked `K_c = 16` matches `K_c = 1`
+        and never suffers 32-step Jacobian explosions from edge/salience/Gumbel-STE/Slot-0 pinning loops.
+        """
         S = c_fused_seq.shape[0]
         B = slots.shape[0]
         K = self.cfg.k_slots
@@ -1624,12 +1632,18 @@ class BCGPC(nn.Module):
         cur_sal = salience
         cur_phase = phase
         cur_pin = slot0_pinned.float()
+        apply_carry_damp = bool(self.training and (carry_gamma < 0.9999 or carry_max_rms < 1e6))
 
         z0_l, g_l, chat_l, pi_l, pieff_l, surp_l, eps_l, sbar_prev_l = [], [], [], [], [], [], [], []
         mp_l, alpha_l, c0_l = [], [], []
         pre_s_l, pre_e_l, pre_w_l, pre_p_l = [], [], [], []
 
         for k in range(S):
+            if apply_carry_damp and k > 0:
+                cur_slots = _DampedBoundedCarry.apply(cur_slots, carry_gamma, carry_max_rms)
+                cur_edges = _DampedBoundedCarry.apply(cur_edges, carry_gamma, carry_max_rms)
+                cur_sal = _DampedBoundedCarry.apply(cur_sal, carry_gamma, carry_max_rms)
+
             eff_pin = torch.where(unpin_seq[k], torch.zeros_like(cur_pin), cur_pin)
             eff_phase = torch.where(unpin_seq[k].view(B, 1), torch.zeros_like(cur_phase), cur_phase)
 
@@ -1741,6 +1755,8 @@ class BCGPC(nn.Module):
         use_gumbel: bool = True,
         check_pin: bool = True,
         use_cudagraph: bool = False,
+        carry_gamma: float = 0.5,
+        carry_max_rms: float = 0.25,
     ) -> tuple[torch.Tensor, ...]:
         if use_cudagraph and self._cudagraph_chunk_fn is not None:
             try:
@@ -1761,6 +1777,8 @@ class BCGPC(nn.Module):
                     gumbel_u_seq,
                     use_gumbel,
                     check_pin,
+                    carry_gamma,
+                    carry_max_rms,
                 )
             except Exception as exc:  # pragma: no cover - CUDA-only safety net
                 warnings.warn(
@@ -1795,6 +1813,8 @@ class BCGPC(nn.Module):
             gumbel_u_seq,
             use_gumbel,
             check_pin,
+            carry_gamma,
+            carry_max_rms,
         )
 
     def forward_fast_dispatch(

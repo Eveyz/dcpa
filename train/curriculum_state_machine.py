@@ -577,7 +577,15 @@ class CurriculumController:
             s2_cap_prob = -1.0
             if "cap_mix_ratio" in self.s2_cfg:
                 cap_warm_prog = float(self.s2_cfg.get("cap_warmup_start_progress", 0.50))
-                s2_cap_prob = float(self.s2_cfg["cap_mix_ratio"]) if progress >= cap_warm_prog else 0.0
+                cap_ramp_prog = max(0.0, float(self.s2_cfg.get("cap_warmup_ramp_progress", 0.08)))
+                cap_target = float(self.s2_cfg["cap_mix_ratio"])
+                if progress < cap_warm_prog:
+                    s2_cap_prob = 0.0
+                elif cap_ramp_prog <= 0.0:
+                    s2_cap_prob = cap_target
+                else:
+                    ramp_frac = min(1.0, (progress - cap_warm_prog) / cap_ramp_prog)
+                    s2_cap_prob = cap_target * ramp_frac
 
             target_rho = float(self.s2_cfg.get("target_rho", 9.5))
             state = CurriculumStepState(

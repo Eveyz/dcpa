@@ -2234,7 +2234,9 @@ def run_training(
                 milestone_due = ckpt_mgr.is_milestone_step(completed_step)
                 wall_due_local, wall_reason = wall_trigger.should_save(completed_step) if is_primary else (False, None)
                 wall_due = sync_bool_any(wall_due_local, dist_ctx, device)
-                step_healthy_ok = watchdog.is_healthy_for_checkpoint(completed_step, sc.stage_id, last_metrics)
+                step_healthy_ok = watchdog.is_healthy_for_checkpoint(
+                    completed_step, sc.stage_id, last_metrics, grad_norm=grad_norm
+                )
                 need_sync_ckpt = (
                     healthy_due
                     or milestone_due
@@ -2260,12 +2262,27 @@ def run_training(
                                 flush=True,
                             )
                         else:
-                            want_drive = bool(sync_mgr is not None and (wall_due or milestone_due or is_final_step or is_best))
+                            if sync_mgr is not None and (wall_due or milestone_due) and not step_healthy_ok:
+                                _r0_print(
+                                    f"[DriveSync][SKIP] Skipped Drive slot overwrite at step={completed_step} "
+                                    f"(unhealthy step: grad_norm={grad_norm}, loss={last_metrics.get('loss_total')}); "
+                                    "preserving last healthy Drive slot.",
+                                    flush=True,
+                                )
+                            want_drive = bool(
+                                sync_mgr is not None
+                                and (
+                                    (wall_due and step_healthy_ok)
+                                    or (milestone_due and step_healthy_ok)
+                                    or (is_final_step and step_healthy_ok)
+                                    or is_best
+                                )
+                            )
                             want_healthy = bool(
                                 ((healthy_due or is_final_step) and step_healthy_ok)
                                 or (wall_due and not want_drive and not healthy_due and step_healthy_ok)
                             )
-                            want_milestone = bool(milestone_due)
+                            want_milestone = bool(milestone_due and step_healthy_ok)
                             want_best = bool(is_best)
                             drive_reason: Optional[str] = (
                                 (wall_reason or ("milestone" if milestone_due else ("final" if is_final_step else "best")))
@@ -2295,7 +2312,7 @@ def run_training(
                                     saves_performed += 1
                                 if want_drive:
                                     saves_performed += 1
-                            if want_drive or (wall_due and not healthy_due):
+                            if want_drive or (want_healthy and wall_due):
                                 wall_trigger.mark_saved(completed_step)
                             if is_final_step and async_ckpt is not None:
                                 async_ckpt.wait()

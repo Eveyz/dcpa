@@ -55,7 +55,15 @@ from data.cognitive_v2_sources import (
     COGNITIVE_V2_VAL_QUOTAS,
     SID_JS_ES6_SHORT_S1,
     SID_ZH_PROSE_SHORT_S1,
+    V3_FLAT_SOURCE_DESCRIPTORS,
+    V3_FLAT_SOURCE_IDS,
+    PreChunk,
+    chunk_code_lossless,
+    chunk_prose_lossless,
+    encode_fixed_point_loss_mask,
     infer_corpus_style_id,
+    prechunk_document,
+    scan_code_lexical,
     stream_en_cosmopedia_s2,
     stream_en_finephrase_s1,
     stream_en_us_pd_books_s1,
@@ -64,6 +72,7 @@ from data.cognitive_v2_sources import (
     stream_offline_cognitive_domain,
     stream_python_edu_and_swallow,
     stream_sql_create_context_s2,
+    stream_v3_flat_source,
     stream_zh_cci3_hq_s2,
 )
 from data.ragged_dataloader import IDX_RECORD_FMT, IDX_RECORD_SIZE, utf8_safe_end
@@ -1313,6 +1322,96 @@ def _populate_cognitive_v2_domain(
     return _finalize_domain_stat(acc, time.perf_counter() - t0)
 
 
+def _populate_v3_flat_domain(
+    lang_id: int,
+    acc: _DomainAccum,
+    emit_fn: Any,
+    validator: CodeASTValidator,
+    *,
+    smoke_quota: bool,
+    scale_factor: float,
+    offline: bool,
+    seed: int = 2026,
+    max_chunk_bytes: int = 3800,
+) -> dict[str, Any]:
+    """Populate one DCPA-Flat v3.3 domain (`0..5`) using 2025-2026 sources, lossless pre-chunking & x10 loss masks."""
+    t0 = time.perf_counter()
+
+    def _emit_prechunked(raw_text: str, sid: int) -> None:
+        for pc in prechunk_document(raw_text, lang_id=lang_id, max_chunk_bytes=max_chunk_bytes):
+            if lang_id in (3, 5):
+                acc.code_candidates += 1
+                lang_key = "python" if lang_id == 3 else "javascript"
+                ok, depth = validator.validate(lang_key, pc.raw_bytes)
+                if not ok:
+                    acc.code_rejected += 1
+                    continue
+                emit_fn(acc, pc.raw_bytes, sid, depth, pc.loss_mask_bytes)
+            else:
+                emit_fn(acc, pc.raw_bytes, sid, pc.max_depth, pc.loss_mask_bytes)
+            if acc.done:
+                return
+
+    if not offline:
+        v3_repos_by_lang: dict[int, tuple[str, ...]] = {
+            0: ("nvidia/Nemotron-CC-v2.1", "epfml/FineWeb2-HQ"),
+            1: (
+                "opencsg/chinese-fineweb-edu-v2",
+                "opencsg/Fineweb-Edu-Chinese-V2.2",
+                "opencsg/chinese-cosmopedia",
+                "BAAI/CCI3-HQ",
+                "BAAI/Infinity-Instruct",
+            ),
+            2: ("nvidia/Nemotron-CC-Math-v1",),
+            3: (
+                "tokyotech-llm/swallow-code-v2",
+                "nvidia/Nemotron-CC-Code-v1",
+                "nvidia/OpenCodeReasoning",
+                "nvidia/OpenCodeReasoning-2",
+            ),
+            4: (),
+            5: ("nvidia/Nemotron-CC-Code-v1",),
+        }
+        for repo_id in v3_repos_by_lang.get(lang_id, ()):
+            if acc.done:
+                break
+            print(f"  -> [v3_flat | lang_id={lang_id}] streaming {repo_id}...", flush=True)
+            for doc_b, mask_b, sid, depth in stream_v3_flat_source(repo_id, max_chunk_bytes=max_chunk_bytes):
+                if lang_id in (3, 5):
+                    acc.code_candidates += 1
+                    lang_key = "python" if lang_id == 3 else "javascript"
+                    ok, v_depth = validator.validate(lang_key, doc_b)
+                    if not ok:
+                        acc.code_rejected += 1
+                        continue
+                    emit_fn(acc, doc_b, sid, v_depth, mask_b)
+                else:
+                    emit_fn(acc, doc_b, sid, depth, mask_b)
+                if acc.done:
+                    break
+
+        # Top up from v2 high-purity streams if any v3 source is gated or partial
+        if not acc.done:
+            return _populate_cognitive_v2_domain(
+                lang_id,
+                acc,
+                emit_fn,
+                validator,
+                smoke_quota=smoke_quota,
+                scale_factor=scale_factor,
+                offline=False,
+                seed=seed,
+            )
+
+    if not acc.done:
+        for doc_b, sid in stream_offline_cognitive_domain(lang_id, seed=seed):
+            _emit_prechunked(doc_b.decode("utf-8", errors="strict"), sid)
+            if acc.done:
+                break
+
+    return _finalize_domain_stat(acc, time.perf_counter() - t0)
+
+
 def _populate_single_domain(
     lang_id: int,
     acc: _DomainAccum,
@@ -1323,10 +1422,24 @@ def _populate_single_domain(
     scale_factor: float,
     stem_upgrade: bool,
     cognitive_v2: bool = False,
+    v3_flat: bool = False,
     offline: bool = False,
     seed: int = 2026,
+    max_chunk_bytes: int = 3800,
 ) -> dict[str, Any]:
-    """Populate a single `lang_id` (`0..5`) via `emit_fn(acc, doc_bytes, source_id, max_depth)`."""
+    """Populate a single `lang_id` (`0..5`) via `emit_fn(acc, doc_bytes, source_id, max_depth, [loss_mask_bytes])`."""
+    if v3_flat:
+        return _populate_v3_flat_domain(
+            lang_id,
+            acc,
+            emit_fn,
+            validator,
+            smoke_quota=smoke_quota,
+            scale_factor=scale_factor,
+            offline=offline,
+            seed=seed,
+            max_chunk_bytes=max_chunk_bytes,
+        )
     if cognitive_v2:
         return _populate_cognitive_v2_domain(
             lang_id,
@@ -1540,15 +1653,19 @@ def _worker_spool_domain(args_tuple: tuple[Any, ...]) -> dict[str, Any]:
         scale_factor,
         stem_upgrade,
         cognitive_v2,
+        v3_flat,
+        write_loss_mask,
+        max_chunk_bytes,
         offline,
     ) = args_tuple
     spool_dir = Path(spool_dir_str)
     spool_dir.mkdir(parents=True, exist_ok=True)
     spool_bin = spool_dir / f"dom_{lang_id}.bin"
     spool_rec = spool_dir / f"dom_{lang_id}.rec"
+    spool_msk = spool_dir / f"dom_{lang_id}.msk"
 
     validator = CodeASTValidator()
-    dname_map = COGNITIVE_V2_DOMAIN_NAMES if cognitive_v2 else DOMAIN_NAMES
+    dname_map = COGNITIVE_V2_DOMAIN_NAMES if (cognitive_v2 or v3_flat) else DOMAIN_NAMES
     acc = _DomainAccum(lang_id, dname_map[lang_id], train_target, val_target)
     local_hashes: set[bytes] = set()
     hash_person = f"dcpa{seed}".encode("ascii")[:16]
@@ -1556,8 +1673,18 @@ def _worker_spool_domain(args_tuple: tuple[Any, ...]) -> dict[str, Any]:
     source_id_to_name = {v: k for k, v in SOURCE_IDS.items()}
     spool_offset = 0
 
-    with spool_bin.open("wb") as f_bin, spool_rec.open("wb") as f_rec:
-        def _spool_emit(a: _DomainAccum, doc_bytes: bytes, source_id: int, max_depth: int) -> bool:
+    with (
+        spool_bin.open("wb") as f_bin,
+        spool_rec.open("wb") as f_rec,
+        (spool_msk.open("wb") if write_loss_mask else open(os.devnull, "wb")) as f_msk,
+    ):
+        def _spool_emit(
+            a: _DomainAccum,
+            doc_bytes: bytes,
+            source_id: int,
+            max_depth: int,
+            loss_mask_bytes: Optional[bytes] = None,
+        ) -> bool:
             nonlocal spool_offset
             if a.done or not doc_bytes:
                 return False
@@ -1577,6 +1704,13 @@ def _worker_spool_domain(args_tuple: tuple[Any, ...]) -> dict[str, Any]:
             else:
                 return False
             f_bin.write(doc_bytes)
+            if write_loss_mask:
+                mb = (
+                    loss_mask_bytes
+                    if (loss_mask_bytes is not None and len(loss_mask_bytes) == rec_len)
+                    else encode_fixed_point_loss_mask(doc_bytes)
+                )
+                f_msk.write(mb)
             f_rec.write(struct.pack("<QIBB", spool_offset, rec_len, source_id, min(max_depth, 255)))
             spool_offset += rec_len
             sname = source_id_to_name.get(source_id, f"src_{source_id}")
@@ -1593,8 +1727,10 @@ def _worker_spool_domain(args_tuple: tuple[Any, ...]) -> dict[str, Any]:
             scale_factor=scale_factor,
             stem_upgrade=stem_upgrade,
             cognitive_v2=cognitive_v2,
+            v3_flat=v3_flat,
             offline=offline,
             seed=seed,
+            max_chunk_bytes=max_chunk_bytes,
         )
     return {
         "lang_id": lang_id,
@@ -1604,6 +1740,7 @@ def _worker_spool_domain(args_tuple: tuple[Any, ...]) -> dict[str, Any]:
         "elapsed_sec": stat["elapsed_sec"],
         "spool_bin": str(spool_bin),
         "spool_rec": str(spool_rec),
+        "spool_msk": str(spool_msk) if write_loss_mask else None,
     }
 
 
@@ -1616,10 +1753,16 @@ def build_corpus(
     stem_upgrade: bool = False,
     workers: int = 1,
     cognitive_v2: bool = False,
+    v3_flat: bool = False,
+    write_loss_mask: bool = False,
+    max_chunk_bytes: int = 3800,
     offline: bool = False,
     hf_token: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Stream, filter, deduplicate, and write DCPA `.bin/.idx/.meta.json` shards."""
+    """Stream, filter, deduplicate, and write DCPA `.bin/.idx/.meta.json` (and optional `.loss_mask.bin`) shards."""
+    if v3_flat:
+        cognitive_v2 = True
+        write_loss_mask = True
     if not offline:
         configure_hf_auth(hf_token)
     out_path = Path(out_dir)
@@ -1632,7 +1775,11 @@ def build_corpus(
     validator = CodeASTValidator()
     active_ids = COGNITIVE_V2_DOMAIN_IDS if cognitive_v2 else ACTIVE_DOMAIN_IDS
     dname_map = COGNITIVE_V2_DOMAIN_NAMES if cognitive_v2 else DOMAIN_NAMES
-    if cognitive_v2:
+    if v3_flat:
+        mode = "v3_flat_smoke" if smoke_quota else "v3_flat"
+        base_train_q = COGNITIVE_V2_SMOKE_TRAIN_QUOTAS if smoke_quota else COGNITIVE_V2_TRAIN_QUOTAS
+        base_val_q = COGNITIVE_V2_SMOKE_VAL_QUOTAS if smoke_quota else COGNITIVE_V2_VAL_QUOTAS
+    elif cognitive_v2:
         mode = "cognitive_v2_smoke" if smoke_quota else "cognitive_v2"
         base_train_q = COGNITIVE_V2_SMOKE_TRAIN_QUOTAS if smoke_quota else COGNITIVE_V2_TRAIN_QUOTAS
         base_val_q = COGNITIVE_V2_SMOKE_VAL_QUOTAS if smoke_quota else COGNITIVE_V2_VAL_QUOTAS
@@ -1651,8 +1798,10 @@ def build_corpus(
 
     train_bin_path = out_path / "train.bin"
     train_idx_path = out_path / "train.idx"
+    train_msk_path = out_path / "train.loss_mask.bin"
     val_bin_path = out_path / "val.bin"
     val_idx_path = out_path / "val.idx"
+    val_msk_path = out_path / "val.loss_mask.bin"
 
     seen_hashes: set[bytes] = set()
     train_offset = 0
@@ -1678,9 +1827,17 @@ def build_corpus(
         train_idx_path.open("wb") as train_idx,
         val_bin_path.open("wb") as val_bin,
         val_idx_path.open("wb") as val_idx,
+        (train_msk_path.open("wb") if write_loss_mask else open(os.devnull, "wb")) as train_msk,
+        (val_msk_path.open("wb") if write_loss_mask else open(os.devnull, "wb")) as val_msk,
     ):
 
-        def _emit_doc(acc: _DomainAccum, doc_bytes: bytes, source_id: int, max_depth: int) -> bool:
+        def _emit_doc(
+            acc: _DomainAccum,
+            doc_bytes: bytes,
+            source_id: int,
+            max_depth: int,
+            loss_mask_bytes: Optional[bytes] = None,
+        ) -> bool:
             """Deduplicate via 64-bit blake2b and route strictly without Train/Val leakage."""
             nonlocal train_offset, val_offset, train_docs_total, val_docs_total
             if acc.done:
@@ -1700,8 +1857,18 @@ def build_corpus(
             style_id = infer_corpus_style_id(acc.lang_id, doc_bytes, source_id) if cognitive_v2 else 0
             val_mod = 10 if smoke_quota else 20
             bucket_hit = (int.from_bytes(digest[:4], "little") % val_mod) == 0
+            eff_mask: Optional[bytes] = None
+            if write_loss_mask:
+                eff_mask = (
+                    loss_mask_bytes
+                    if (loss_mask_bytes is not None and len(loss_mask_bytes) == rec_len)
+                    else encode_fixed_point_loss_mask(doc_bytes)
+                )
+
             if acc.val_bytes < acc.val_target and (bucket_hit or acc.train_bytes >= acc.train_target):
                 val_bin.write(doc_bytes)
+                if eff_mask is not None:
+                    val_msk.write(eff_mask)
                 val_idx.write(
                     struct.pack(IDX_RECORD_FMT, val_offset, rec_len, acc.lang_id, source_id, min(max_depth, 255), style_id)
                 )
@@ -1711,6 +1878,8 @@ def build_corpus(
                 acc.val_docs += 1
             elif acc.train_bytes < acc.train_target:
                 train_bin.write(doc_bytes)
+                if eff_mask is not None:
+                    train_msk.write(eff_mask)
                 train_idx.write(
                     struct.pack(IDX_RECORD_FMT, train_offset, rec_len, acc.lang_id, source_id, min(max_depth, 255), style_id)
                 )
@@ -1743,6 +1912,9 @@ def build_corpus(
                         float(scale_factor),
                         bool(stem_upgrade),
                         bool(cognitive_v2),
+                        bool(v3_flat),
+                        bool(write_loss_mask),
+                        int(max_chunk_bytes),
                         bool(offline),
                     )
                     for lid in active_ids
@@ -1766,12 +1938,21 @@ def build_corpus(
                     )
                     sp_bin = Path(res["spool_bin"])
                     sp_rec = Path(res["spool_rec"])
-                    with sp_bin.open("rb") as fb, sp_rec.open("rb") as fr:
+                    sp_msk = Path(res["spool_msk"]) if res.get("spool_msk") else None
+                    with (
+                        sp_bin.open("rb") as fb,
+                        sp_rec.open("rb") as fr,
+                        (sp_msk.open("rb") if sp_msk is not None else open(os.devnull, "rb")) as fm,
+                    ):
                         while buf := fr.read(rec_struct.size):
                             off, rlen, sid, depth = rec_struct.unpack(buf)
                             fb.seek(off)
                             doc_b = fb.read(rlen)
-                            _emit_doc(acc, doc_b, sid, depth)
+                            msk_b: Optional[bytes] = None
+                            if sp_msk is not None:
+                                fm.seek(off)
+                                msk_b = fm.read(rlen)
+                            _emit_doc(acc, doc_b, sid, depth, msk_b)
                     total_b = acc.train_bytes + acc.val_bytes
                     total_d = acc.train_docs + acc.val_docs
                     avg_len = (total_b / total_d) if total_d > 0 else 0.0
@@ -1809,8 +1990,10 @@ def build_corpus(
                     scale_factor=float(scale_factor),
                     stem_upgrade=bool(stem_upgrade),
                     cognitive_v2=bool(cognitive_v2),
+                    v3_flat=bool(v3_flat),
                     offline=bool(offline),
                     seed=seed,
+                    max_chunk_bytes=int(max_chunk_bytes),
                 )
 
     def _file_blake2b(path: Path) -> str:
@@ -1870,6 +2053,9 @@ def build_corpus(
         "scale_factor": float(scale_factor),
         "stem_upgrade": bool(stem_upgrade),
         "cognitive_v2": bool(cognitive_v2),
+        "v3_flat": bool(v3_flat),
+        "write_loss_mask": bool(write_loss_mask),
+        "loss_mask_encoding": "fixed_point_x10" if write_loss_mask else None,
         "offline": bool(offline),
         "seed": seed,
         "tree_sitter_active": validator.tree_sitter_active,
@@ -1971,6 +2157,22 @@ def main() -> None:
         help="Build 6-domain v2 holistic cognitive shards (en, zh, formal, python, sql_struct, javascript; zero Rust).",
     )
     ap.add_argument(
+        "--v3-flat",
+        action="store_true",
+        help="Build DCPA-Flat v3.3 6-domain shards with 2025-2026 sources, lossless pre-chunking, and fixed-point x10 .loss_mask.bin.",
+    )
+    ap.add_argument(
+        "--write-loss-mask",
+        action="store_true",
+        help="Emit byte-aligned fixed-point x10 .loss_mask.bin alongside .bin/.idx.",
+    )
+    ap.add_argument(
+        "--max-chunk-bytes",
+        type=int,
+        default=3800,
+        help="Maximum UTF-8 byte length per lossless pre-chunk in --v3-flat mode (default: 3800).",
+    )
+    ap.add_argument(
         "--offline",
         action="store_true",
         help="Skip external network downloads and synthesize deterministic multi-tier shards locally.",
@@ -1992,6 +2194,9 @@ def main() -> None:
         stem_upgrade=args.stem_upgrade,
         workers=args.workers,
         cognitive_v2=args.cognitive_v2,
+        v3_flat=args.v3_flat,
+        write_loss_mask=args.write_loss_mask,
+        max_chunk_bytes=args.max_chunk_bytes,
         offline=args.offline,
         hf_token=args.hf_token,
     )

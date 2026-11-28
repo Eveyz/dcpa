@@ -20,7 +20,21 @@ import json
 import random
 import re
 import unicodedata
-from typing import Iterator, Optional
+from dataclasses import dataclass
+from typing import Iterator, Optional, Sequence
+
+import numpy as np
+
+# Fixed-point x10 `.loss_mask.bin` constants (SSOT: dcpa/interfaces.py)
+LOSS_MASK_IGNORE: int = 0
+LOSS_MASK_LEGACY_ONE: int = 1
+LOSS_MASK_NORMAL_X10: int = 10
+LOSS_MASK_SYNTAX_X10: int = 15
+LOSS_MASK_ANCHOR_X10: int = 30
+SYNTAX_DELIM_BYTES: frozenset[int] = frozenset(b"{}()[]:;\n")
+_SYNTAX_DELIM_LUT: np.ndarray = np.array(
+    [i in SYNTAX_DELIM_BYTES for i in range(256)], dtype=np.bool_
+)
 
 # Stage-aware `.idx` `source_id` constants matching `data/ragged_dataloader.py::SOURCE_STAGE_TIERS`
 SID_FINEPHRASE_S1 = 21
@@ -43,6 +57,141 @@ SID_LONG_ESSAYS_S3 = 35
 SID_COMPLEX_PROOFS_S3 = 36
 SID_SQL_CTE_SCHEMA_S3 = 37
 
+# DCPA-Flat v3.3 2025-2026 High-Purity Source IDs (41..52)
+SID_NEMOTRON_CC_V21 = 41
+SID_FINEWEB2_HQ = 42
+SID_ZH_FINEWEB_EDU_V2 = 43
+SID_ZH_FINEWEB_EDU_V22 = 44
+SID_ZH_COSMOPEDIA = 45
+SID_BAAI_CCI3_HQ_V3 = 46
+SID_BAAI_INFINITY_INSTRUCT = 47
+SID_NEMOTRON_CC_MATH_V1 = 48
+SID_SWALLOW_CODE_V2_V3 = 49
+SID_NEMOTRON_CC_CODE_V1 = 50
+SID_OPENCODEREASONING = 51
+SID_OPENCODEREASONING_2 = 52
+
+
+@dataclass(frozen=True)
+class SourceDescriptor:
+    """Declarative registry entry for a 2025-2026 high-purity streaming corpus source."""
+
+    repo_id: str
+    source_id: int
+    lang_id: int
+    stage_tier: int
+    text_fields: tuple[str, ...]
+    description: str
+    config_name: Optional[str] = None
+    split: str = "train"
+
+
+V3_FLAT_SOURCE_DESCRIPTORS: dict[str, SourceDescriptor] = {
+    "nvidia/Nemotron-CC-v2.1": SourceDescriptor(
+        repo_id="nvidia/Nemotron-CC-v2.1",
+        source_id=SID_NEMOTRON_CC_V21,
+        lang_id=0,
+        stage_tier=2,
+        text_fields=("text", "content"),
+        description="High-purity English rephrased/filtered web prose & STEM (Nemotron-CC v2.1).",
+    ),
+    "epfml/FineWeb2-HQ": SourceDescriptor(
+        repo_id="epfml/FineWeb2-HQ",
+        source_id=SID_FINEWEB2_HQ,
+        lang_id=0,
+        stage_tier=2,
+        text_fields=("text", "content"),
+        description="Classifier-filtered high-quality web corpus (EPFL FineWeb2-HQ).",
+    ),
+    "opencsg/chinese-fineweb-edu-v2": SourceDescriptor(
+        repo_id="opencsg/chinese-fineweb-edu-v2",
+        source_id=SID_ZH_FINEWEB_EDU_V2,
+        lang_id=1,
+        stage_tier=2,
+        text_fields=("text", "content"),
+        description="High-score Chinese educational web prose (OpenCSG Chinese FineWeb-Edu v2).",
+    ),
+    "opencsg/Fineweb-Edu-Chinese-V2.2": SourceDescriptor(
+        repo_id="opencsg/Fineweb-Edu-Chinese-V2.2",
+        source_id=SID_ZH_FINEWEB_EDU_V22,
+        lang_id=1,
+        stage_tier=2,
+        text_fields=("text", "content"),
+        description="Updated Chinese educational prose & essays (OpenCSG Fineweb-Edu-Chinese V2.2).",
+    ),
+    "opencsg/chinese-cosmopedia": SourceDescriptor(
+        repo_id="opencsg/chinese-cosmopedia",
+        source_id=SID_ZH_COSMOPEDIA,
+        lang_id=1,
+        stage_tier=2,
+        text_fields=("text", "content"),
+        description="Synthetic Chinese textbooks, tutorials, and conceptual essays (Chinese Cosmopedia).",
+    ),
+    "BAAI/CCI3-HQ": SourceDescriptor(
+        repo_id="BAAI/CCI3-HQ",
+        source_id=SID_BAAI_CCI3_HQ_V3,
+        lang_id=1,
+        stage_tier=2,
+        text_fields=("text", "content"),
+        description="BAAI CCI3-HQ high-purity Chinese commentary & knowledge prose.",
+    ),
+    "BAAI/Infinity-Instruct": SourceDescriptor(
+        repo_id="BAAI/Infinity-Instruct",
+        source_id=SID_BAAI_INFINITY_INSTRUCT,
+        lang_id=1,
+        stage_tier=3,
+        text_fields=("conversations", "text", "content"),
+        description="BAAI Infinity-Instruct bilingual reasoning & instructional dialogues.",
+    ),
+    "nvidia/Nemotron-CC-Math-v1": SourceDescriptor(
+        repo_id="nvidia/Nemotron-CC-Math-v1",
+        source_id=SID_NEMOTRON_CC_MATH_V1,
+        lang_id=2,
+        stage_tier=3,
+        text_fields=("text", "content"),
+        description="Formal math derivations, symbolic equations & proofs (Nemotron-CC-Math v1).",
+    ),
+    "tokyotech-llm/swallow-code-v2": SourceDescriptor(
+        repo_id="tokyotech-llm/swallow-code-v2",
+        source_id=SID_SWALLOW_CODE_V2_V3,
+        lang_id=3,
+        stage_tier=2,
+        text_fields=("text", "code", "content"),
+        description="Self-contained rewritten high-clarity Python modules (Swallow-Code v2).",
+    ),
+    "nvidia/Nemotron-CC-Code-v1": SourceDescriptor(
+        repo_id="nvidia/Nemotron-CC-Code-v1",
+        source_id=SID_NEMOTRON_CC_CODE_V1,
+        lang_id=3,
+        stage_tier=3,
+        text_fields=("text", "code", "content"),
+        description="High-purity web-extracted Python & JavaScript code (Nemotron-CC-Code v1).",
+    ),
+    "nvidia/OpenCodeReasoning": SourceDescriptor(
+        repo_id="nvidia/OpenCodeReasoning",
+        source_id=SID_OPENCODEREASONING,
+        lang_id=3,
+        stage_tier=3,
+        text_fields=("solution", "output", "text", "code"),
+        description="Verified algorithmic code reasoning traces & solutions (OpenCodeReasoning).",
+    ),
+    "nvidia/OpenCodeReasoning-2": SourceDescriptor(
+        repo_id="nvidia/OpenCodeReasoning-2",
+        source_id=SID_OPENCODEREASONING_2,
+        lang_id=3,
+        stage_tier=3,
+        text_fields=("solution", "output", "text", "code"),
+        description="Expanded verified multi-language code reasoning solutions (OpenCodeReasoning-2).",
+    ),
+}
+
+V3_FLAT_SOURCE_IDS: dict[str, int] = {
+    repo: desc.source_id for repo, desc in V3_FLAT_SOURCE_DESCRIPTORS.items()
+}
+V3_FLAT_SOURCE_STAGE_TIERS: dict[int, int] = {
+    desc.source_id: desc.stage_tier for desc in V3_FLAT_SOURCE_DESCRIPTORS.values()
+}
+
 COGNITIVE_V2_SOURCE_IDS: dict[str, int] = {
     "HuggingFaceFW/finephrase:s1": SID_FINEPHRASE_S1,
     "storytracer/US-PD-Books:s1": SID_US_PD_BOOKS_S1,
@@ -61,6 +210,7 @@ COGNITIVE_V2_SOURCE_IDS: dict[str, int] = {
     "long_essays_criticism:s3": SID_LONG_ESSAYS_S3,
     "complex_formal_proofs:s3": SID_COMPLEX_PROOFS_S3,
     "sql_cte_analytic_schemas:s3": SID_SQL_CTE_SCHEMA_S3,
+    **V3_FLAT_SOURCE_IDS,
 }
 
 # Base quotas at scale_factor=1.0 (~440 MB Train -> ~5.28 GB at scale_factor=12.0 for v2_cognitive_5g)
@@ -135,10 +285,23 @@ def infer_corpus_style_id(lang_id: int, doc_bytes: bytes, source_id: int) -> int
     """
     if source_id == SID_US_PD_BOOKS_S1:
         return 3
-    if source_id in (SID_FOLIO_LOGIC_S2, SID_LOGIQA_RECLOR_S2, SID_FINEMATH_S2, SID_COMPLEX_PROOFS_S3):
+    if source_id in (
+        SID_FOLIO_LOGIC_S2,
+        SID_LOGIQA_RECLOR_S2,
+        SID_FINEMATH_S2,
+        SID_COMPLEX_PROOFS_S3,
+        SID_NEMOTRON_CC_MATH_V1,
+    ):
         return 0
-    if source_id == SID_COSMOPEDIA_S2:
+    if source_id in (SID_COSMOPEDIA_S2, SID_ZH_COSMOPEDIA):
         return 2
+    if source_id in (
+        SID_SWALLOW_CODE_V2_V3,
+        SID_NEMOTRON_CC_CODE_V1,
+        SID_OPENCODEREASONING,
+        SID_OPENCODEREASONING_2,
+    ):
+        return 4
     txt = doc_bytes[:1536].decode("utf-8", errors="ignore")
     if lang_id in (3, 5):
         if '"""' in txt or "'''" in txt or "/**" in txt:
@@ -159,6 +322,813 @@ def infer_corpus_style_id(lang_id: int, doc_bytes: bytes, source_id: int) -> int
     if rig_hits >= 2:
         return 0
     return 2
+
+
+# =============================================================================
+# Fixed-Point x10 `.loss_mask.bin` Writer Helper & Lossless Pre-Chunkers (WS-1)
+# =============================================================================
+
+_CTRL_STRIP_TABLE_V3: dict[int, None] = {
+    **{c: None for c in range(32) if c not in (0x09, 0x0A)},
+    0x7F: None,
+}
+_SENT_SPLIT_RE = re.compile(
+    r'(?:[。！？；]+[”’」』）】]*\s*|[.!?;]+["\'”’\)\]]*(?:\s+|$))'
+)
+
+
+def _utf8_truncate(raw: bytes, max_bytes: int) -> bytes:
+    """Truncate `raw` to `<= max_bytes` without ever splitting a multi-byte UTF-8 sequence."""
+    if len(raw) <= max_bytes:
+        return raw
+    end = max(0, max_bytes)
+    steps = 0
+    while end > 0 and steps < 4 and (raw[end] & 0xC0) == 0x80:
+        end -= 1
+        steps += 1
+    return raw[:end]
+
+
+def encode_fixed_point_loss_mask(
+    raw_bytes: bytes,
+    *,
+    zero_spans: Sequence[tuple[int, int]] = (),
+    anchor_spans: Sequence[tuple[int, int]] = (),
+    base_mask: Optional[bytes | np.ndarray] = None,
+    highlight_syntax_delims: bool = True,
+) -> bytes:
+    """Encode byte-aligned fixed-point x10 `.loss_mask.bin` weights (`uint8`):
+      - `0`  (0.0x): ignored bytes (prepended headers, prompts, observations, `zero_spans`)
+      - `10` (1.0x): standard supervised bytes (upgrades legacy `1` -> `10`)
+      - `15` (1.5x): structural delimiters `{ } ( ) [ ] : ; \\n` on supervised bytes
+      - `30` (3.0x): high-salience anchor spans (`anchor_spans`)
+    """
+    n = len(raw_bytes)
+    if n == 0:
+        return b""
+
+    if base_mask is not None:
+        base_arr = (
+            np.frombuffer(base_mask, dtype=np.uint8)
+            if isinstance(base_mask, (bytes, bytearray))
+            else np.asarray(base_mask, dtype=np.uint8)
+        )
+        if len(base_arr) != n:
+            raise ValueError(f"base_mask length {len(base_arr)} != raw_bytes length {n}")
+        mask = np.where(
+            base_arr == LOSS_MASK_LEGACY_ONE,
+            np.uint8(LOSS_MASK_NORMAL_X10),
+            base_arr,
+        ).astype(np.uint8, copy=True)
+    else:
+        mask = np.full(n, LOSS_MASK_NORMAL_X10, dtype=np.uint8)
+
+    if highlight_syntax_delims:
+        raw_arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+        is_delim = _SYNTAX_DELIM_LUT[raw_arr]
+        mask[(mask == LOSS_MASK_NORMAL_X10) & is_delim] = np.uint8(LOSS_MASK_SYNTAX_X10)
+
+    for s, e in anchor_spans:
+        cs = max(0, min(int(s), n))
+        ce = max(cs, min(int(e), n))
+        if ce > cs:
+            mask[cs:ce] = np.uint8(LOSS_MASK_ANCHOR_X10)
+
+    for s, e in zero_spans:
+        cs = max(0, min(int(s), n))
+        ce = max(cs, min(int(e), n))
+        if ce > cs:
+            mask[cs:ce] = np.uint8(LOSS_MASK_IGNORE)
+
+    return mask.tobytes()
+
+
+@dataclass(frozen=True)
+class PreChunk:
+    """Lossless pre-chunk emitted for static-grid packing (zero mid-doc truncation)."""
+
+    raw_bytes: bytes
+    loss_mask_bytes: bytes
+    lang_id: int
+    max_depth: int
+    header_byte_len: int = 0
+    chunk_index: int = 0
+
+
+def _normalize_lossless_text(text: str) -> str:
+    """Stage-1 NFC + LF normalization stripping disallowed ASCII control chars without dropping prose."""
+    nfc = unicodedata.normalize("NFC", text).replace("\r\n", "\n").replace("\r", "\n")
+    return nfc.translate(_CTRL_STRIP_TABLE_V3)
+
+
+def _split_sentences_preserve(para: str) -> list[str]:
+    """Split a paragraph strictly at sentence-ending punctuation (. ! ? 。 ！ ？ ; ；)."""
+    pieces: list[str] = []
+    prev = 0
+    for m in _SENT_SPLIT_RE.finditer(para):
+        seg = para[prev : m.end()]
+        if seg.strip():
+            pieces.append(seg)
+        prev = m.end()
+    if prev < len(para):
+        tail = para[prev:]
+        if tail.strip():
+            pieces.append(tail)
+    return pieces
+
+
+def chunk_prose_lossless(
+    text: str,
+    max_chunk_bytes: int = 3800,
+    min_chunk_bytes: int = 1,
+) -> list[bytes]:
+    """Lossless paragraph- & sentence-aligned pre-chunker for natural language & formal math (`lang_id in {0,1,2}`).
+
+    Splits long documents exceeding `max_chunk_bytes` ONLY at `\\n\\n` paragraph breaks or
+    sentence-ending punctuation (`. ! ? 。 ！ ？ ; ；` followed by whitespace/newline or CJK continuation),
+    never mid-sentence or mid-UTF-8 character, and preserves all content without dropping tails.
+    """
+    if max_chunk_bytes < 16:
+        raise ValueError(f"max_chunk_bytes must be >= 16, got {max_chunk_bytes}")
+    norm = _normalize_lossless_text(text).strip()
+    if not norm:
+        return []
+    full_b = (norm + "\n").encode("utf-8", errors="strict")
+    if len(full_b) <= max_chunk_bytes:
+        return [full_b] if len(full_b) >= min_chunk_bytes else []
+
+    paras = [p.strip() for p in re.split(r"\n{2,}", norm) if p.strip()]
+    out: list[bytes] = []
+    acc: list[str] = []
+    acc_bytes = 0
+
+    def _flush_acc() -> None:
+        nonlocal acc, acc_bytes
+        if not acc:
+            return
+        chunk = ("\n\n".join(acc) + "\n").encode("utf-8", errors="strict")
+        if len(chunk) >= min_chunk_bytes:
+            out.append(chunk)
+        acc = []
+        acc_bytes = 0
+
+    for para in paras:
+        p_b = (para + "\n").encode("utf-8", errors="strict")
+        if len(p_b) > max_chunk_bytes:
+            _flush_acc()
+            sents = _split_sentences_preserve(para)
+            s_acc: list[str] = []
+            s_bytes = 0
+            for sent in sents:
+                s_clean = sent if s_acc else sent.lstrip()
+                sb = s_clean.encode("utf-8", errors="strict")
+                if len(sb) + 1 > max_chunk_bytes:
+                    if s_acc:
+                        chunk_s = ("".join(s_acc).strip() + "\n").encode("utf-8", errors="strict")
+                        if len(chunk_s) >= min_chunk_bytes:
+                            out.append(chunk_s)
+                        s_acc, s_bytes = [], 0
+                    # Fallback only if a single sentence has zero sentence terminators and exceeds max_chunk_bytes:
+                    # prefer newline boundaries, then whitespace boundaries, never splitting a UTF-8 char.
+                    rem_str = sent.strip()
+                    while rem_str:
+                        rem_b = (rem_str + "\n").encode("utf-8", errors="strict")
+                        if len(rem_b) <= max_chunk_bytes:
+                            if len(rem_b) >= min_chunk_bytes:
+                                out.append(rem_b)
+                            break
+                        cut_b = _utf8_truncate(rem_b, max_chunk_bytes - 1)
+                        cut_s = cut_b.decode("utf-8", errors="strict")
+                        split_at = cut_s.rfind("\n")
+                        if split_at <= 0:
+                            split_at = cut_s.rfind(" ")
+                        if split_at > 0:
+                            piece_s = cut_s[:split_at].rstrip()
+                            rem_str = rem_str[split_at:].lstrip()
+                        else:
+                            piece_s = cut_s
+                            rem_str = rem_str[len(cut_s) :]
+                        if piece_s:
+                            pb_out = (piece_s + "\n").encode("utf-8", errors="strict")
+                            if len(pb_out) >= min_chunk_bytes:
+                                out.append(pb_out)
+                    continue
+
+                if s_acc and (s_bytes + len(sb) + 1) > max_chunk_bytes:
+                    chunk_s = ("".join(s_acc).strip() + "\n").encode("utf-8", errors="strict")
+                    if len(chunk_s) >= min_chunk_bytes:
+                        out.append(chunk_s)
+                    s_clean = sent.lstrip()
+                    sb = s_clean.encode("utf-8", errors="strict")
+                    s_acc = [s_clean]
+                    s_bytes = len(sb)
+                else:
+                    s_acc.append(s_clean)
+                    s_bytes += len(sb)
+            if s_acc:
+                chunk_s = ("".join(s_acc).strip() + "\n").encode("utf-8", errors="strict")
+                if len(chunk_s) >= min_chunk_bytes:
+                    out.append(chunk_s)
+            continue
+
+        sep = 2 if acc else 0
+        if acc and (acc_bytes + sep + len(p_b)) > max_chunk_bytes:
+            _flush_acc()
+            acc = [para]
+            acc_bytes = len(p_b)
+        else:
+            acc.append(para)
+            acc_bytes += sep + len(p_b)
+
+    _flush_acc()
+    return out
+
+
+def scan_code_lexical(code: str | bytes, lang_id: int) -> tuple[bool, int, list[int]]:
+    """Lightweight lexical state machine for Python (`3`), SQL/JSON (`4`), and JavaScript (`5`).
+
+    Tracks strings (incl. Python triple quotes, SQL `''` escapes, JS template literals w/ `${...}`),
+    line/block comments, and `{}()[]` bracket stack.
+
+    Returns:
+      `(is_balanced_and_valid, max_depth, depth0_split_byte_offsets)`
+    Rejects unbalanced brackets, unclosed strings/block comments, invalid UTF-8, or `max_depth > 16`.
+    """
+    if lang_id not in (3, 4, 5):
+        return False, 0, []
+    if isinstance(code, str):
+        raw = code.encode("utf-8", errors="strict")
+    else:
+        raw = bytes(code)
+        try:
+            raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return False, 0, []
+    n = len(raw)
+    if n == 0:
+        return False, 0, []
+
+    # Lexer modes
+    M_CODE = 0
+    M_LINE_COMMENT = 1
+    M_BLOCK_COMMENT = 2
+    M_SINGLE = 3
+    M_DOUBLE = 4
+    M_TRIPLE_SINGLE = 5
+    M_TRIPLE_DOUBLE = 6
+    M_TEMPLATE = 7
+
+    mode = M_CODE
+    stack: list[int] = []
+    template_expr_depths: list[int] = []
+    max_depth = 0
+    splits: list[int] = []
+    json_splits: list[int] = []
+
+    at_line_start = True
+    prev_py_decorator = False
+    i = 0
+
+    while i < n:
+        c = raw[i]
+        nxt = raw[i + 1] if (i + 1) < n else 0
+        nxt2 = raw[i + 2] if (i + 2) < n else 0
+
+        if mode == M_LINE_COMMENT:
+            if c == 0x0A:
+                mode = M_CODE
+                at_line_start = True
+            i += 1
+            continue
+
+        if mode == M_BLOCK_COMMENT:
+            if c == 0x2A and nxt == 0x2F:  # */
+                mode = M_CODE
+                i += 2
+            else:
+                i += 1
+            continue
+
+        if mode == M_SINGLE:
+            if lang_id == 4:
+                if c == 0x27 and nxt == 0x27:  # ''
+                    i += 2
+                    continue
+                if c == 0x5C:  # \
+                    if i + 1 >= n:
+                        return False, max_depth, []
+                    i += 2
+                    continue
+                if c == 0x27:
+                    mode = M_CODE
+                i += 1
+                continue
+            if c == 0x5C:
+                if i + 1 >= n:
+                    return False, max_depth, []
+                i += 2
+                continue
+            if c == 0x0A:
+                return False, max_depth, []
+            if c == 0x27:
+                mode = M_CODE
+            i += 1
+            continue
+
+        if mode == M_DOUBLE:
+            if c == 0x5C:
+                if i + 1 >= n:
+                    return False, max_depth, []
+                i += 2
+                continue
+            if c == 0x0A and lang_id != 4:
+                return False, max_depth, []
+            if c == 0x22:
+                mode = M_CODE
+            i += 1
+            continue
+
+        if mode == M_TRIPLE_SINGLE:
+            if c == 0x5C:
+                if i + 1 >= n:
+                    return False, max_depth, []
+                i += 2
+                continue
+            if c == 0x27 and nxt == 0x27 and nxt2 == 0x27:
+                mode = M_CODE
+                i += 3
+                continue
+            i += 1
+            continue
+
+        if mode == M_TRIPLE_DOUBLE:
+            if c == 0x5C:
+                if i + 1 >= n:
+                    return False, max_depth, []
+                i += 2
+                continue
+            if c == 0x22 and nxt == 0x22 and nxt2 == 0x22:
+                mode = M_CODE
+                i += 3
+                continue
+            i += 1
+            continue
+
+        if mode == M_TEMPLATE:
+            if c == 0x5C:
+                if i + 1 >= n:
+                    return False, max_depth, []
+                i += 2
+                continue
+            if c == 0x24 and nxt == 0x7B:  # ${
+                template_expr_depths.append(len(stack))
+                stack.append(0x7D)
+                if len(stack) > max_depth:
+                    max_depth = len(stack)
+                    if max_depth > 16:
+                        return False, max_depth, []
+                mode = M_CODE
+                at_line_start = False
+                i += 2
+                continue
+            if c == 0x60:  # `
+                mode = M_CODE
+            i += 1
+            continue
+
+        # M_CODE
+        if at_line_start:
+            if not stack:
+                if lang_id == 3:
+                    if raw.startswith((b"def ", b"async def ", b"class "), i):
+                        if i > 0 and not prev_py_decorator:
+                            splits.append(i)
+                        prev_py_decorator = False
+                    elif c == 0x40:  # @decorator at top-level column 0
+                        if i > 0 and not prev_py_decorator:
+                            splits.append(i)
+                        prev_py_decorator = True
+                    elif c not in (0x0A, 0x0D, 0x20, 0x09, 0x23):  # non-blank, non-comment
+                        prev_py_decorator = False
+                elif lang_id == 5:
+                    if raw.startswith((b"export ", b"function ", b"async function ", b"class "), i):
+                        if i > 0:
+                            splits.append(i)
+            if c != 0x0A:
+                at_line_start = False
+
+        if c == 0x0A:
+            at_line_start = True
+            i += 1
+            continue
+
+        # Comments
+        if lang_id == 3 and c == 0x23:  # #
+            mode = M_LINE_COMMENT
+            i += 1
+            continue
+        if lang_id == 4 and c == 0x2D and nxt == 0x2D:  # --
+            mode = M_LINE_COMMENT
+            i += 2
+            continue
+        if lang_id == 5 and c == 0x2F and nxt == 0x2F:  # //
+            mode = M_LINE_COMMENT
+            i += 2
+            continue
+        if lang_id in (4, 5) and c == 0x2F and nxt == 0x2A:  # /*
+            mode = M_BLOCK_COMMENT
+            i += 2
+            continue
+
+        # String / template openers
+        if lang_id == 3 and c == 0x22 and nxt == 0x22 and nxt2 == 0x22:
+            mode = M_TRIPLE_DOUBLE
+            i += 3
+            continue
+        if lang_id == 3 and c == 0x27 and nxt == 0x27 and nxt2 == 0x27:
+            mode = M_TRIPLE_SINGLE
+            i += 3
+            continue
+        if c == 0x22:
+            mode = M_DOUBLE
+            i += 1
+            continue
+        if c == 0x27:
+            mode = M_SINGLE
+            i += 1
+            continue
+        if lang_id == 5 and c == 0x60:
+            mode = M_TEMPLATE
+            i += 1
+            continue
+
+        # SQL statement terminator `;\n` at depth == 0
+        if lang_id == 4 and c == 0x3B and not stack:
+            j = i + 1
+            while j < n and raw[j] in (0x20, 0x09):
+                j += 1
+            if j < n and raw[j] == 0x0A:
+                splits.append(j + 1)
+            i += 1
+            continue
+
+        # Brackets
+        if c == 0x7B:  # {
+            stack.append(0x7D)
+            if len(stack) > max_depth:
+                max_depth = len(stack)
+                if max_depth > 16:
+                    return False, max_depth, []
+        elif c == 0x28:  # (
+            stack.append(0x29)
+            if len(stack) > max_depth:
+                max_depth = len(stack)
+                if max_depth > 16:
+                    return False, max_depth, []
+        elif c == 0x5B:  # [
+            stack.append(0x5D)
+            if len(stack) > max_depth:
+                max_depth = len(stack)
+                if max_depth > 16:
+                    return False, max_depth, []
+        elif c == 0x7D:  # }
+            if not stack or stack.pop() != 0x7D:
+                return False, max_depth, []
+            if lang_id == 5 and template_expr_depths and template_expr_depths[-1] == len(stack):
+                template_expr_depths.pop()
+                mode = M_TEMPLATE
+            elif lang_id == 4 and not stack and (i + 1) < n and raw[i + 1] == 0x0A:
+                json_splits.append(i + 2)
+        elif c in (0x29, 0x5D):  # ) or ]
+            if not stack or stack.pop() != c:
+                return False, max_depth, []
+            if lang_id == 4 and c == 0x5D and not stack and (i + 1) < n and raw[i + 1] == 0x0A:
+                json_splits.append(i + 2)
+
+        i += 1
+
+    if mode not in (M_CODE, M_LINE_COMMENT):
+        return False, max_depth, []
+    if stack or template_expr_depths or max_depth > 16:
+        return False, max_depth, []
+
+    final_splits = splits if splits else json_splits
+    return True, max_depth, final_splits
+
+
+def extract_compact_code_header(
+    raw_bytes: bytes,
+    lang_id: int,
+    max_header_bytes: int = 256,
+) -> bytes:
+    """Extract a compact, bracket-balanced file header (imports / schema / signatures) `<= max_header_bytes`."""
+    if max_header_bytes <= 0 or not raw_bytes:
+        return b""
+    text = raw_bytes.decode("utf-8", errors="strict")
+    lines = text.splitlines()
+
+    if lang_id == 3:
+        header_lines: list[str] = []
+        used = 0
+        # 1. Collect balanced top-level import lines
+        for ln in lines:
+            if ln.startswith(("import ", "from ")):
+                cand = ln.rstrip() + "\n"
+                cb = cand.encode("utf-8", errors="strict")
+                ok, depth, _ = scan_code_lexical(cb, 3)
+                if ok and depth <= 16 and (used + len(cb)) <= max_header_bytes:
+                    header_lines.append(cand)
+                    used += len(cb)
+        if header_lines:
+            return "".join(header_lines).encode("utf-8", errors="strict")
+
+        # 2. Fallback: compact top-level signature context comment (always balanced & valid Python AST)
+        sigs: list[str] = []
+        for ln in lines:
+            if ln.startswith(("def ", "async def ", "class ")):
+                sigs.append(ln.split(":", 1)[0].strip())
+                if len(sigs) >= 4:
+                    break
+        if sigs:
+            comment = "# context: " + "; ".join(sigs)
+            cb = _utf8_truncate(comment.encode("utf-8", errors="strict"), max_header_bytes - 1) + b"\n"
+            return cb
+        return b""
+
+    if lang_id == 5:
+        header_lines = []
+        used = 0
+        for ln in lines:
+            if ln.startswith("import ") or (ln.startswith(("const ", "let ", "var ")) and "require(" in ln):
+                cand = ln.rstrip() + "\n"
+                cb = cand.encode("utf-8", errors="strict")
+                ok, depth, _ = scan_code_lexical(cb, 5)
+                if ok and depth <= 16 and (used + len(cb)) <= max_header_bytes:
+                    header_lines.append(cand)
+                    used += len(cb)
+        if header_lines:
+            return "".join(header_lines).encode("utf-8", errors="strict")
+
+        sigs = []
+        for ln in lines:
+            if ln.startswith(("export ", "function ", "async function ", "class ")):
+                sigs.append(ln.split("{", 1)[0].strip())
+                if len(sigs) >= 4:
+                    break
+        if sigs:
+            comment = "// context: " + "; ".join(sigs)
+            cb = _utf8_truncate(comment.encode("utf-8", errors="strict"), max_header_bytes - 1) + b"\n"
+            return cb
+        return b""
+
+    if lang_id == 4:
+        # Collect leading balanced CREATE TABLE statements up to max_header_bytes
+        ok, _, splits = scan_code_lexical(raw_bytes, 4)
+        if ok:
+            bounds = [0] + sorted(set(splits)) + [len(raw_bytes)]
+            stmts: list[bytes] = []
+            used = 0
+            for s, e in zip(bounds[:-1], bounds[1:]):
+                stmt = raw_bytes[s:e].lstrip(b"\n")
+                if not stmt:
+                    continue
+                upper = stmt.decode("utf-8", errors="ignore").lstrip().upper()
+                if upper.startswith("CREATE TABLE") or upper.startswith("-- SCHEMA"):
+                    if not stmt.endswith(b"\n"):
+                        stmt += b"\n"
+                    s_ok, s_d, _ = scan_code_lexical(stmt, 4)
+                    if s_ok and s_d <= 16 and (used + len(stmt)) <= max_header_bytes:
+                        stmts.append(stmt)
+                        used += len(stmt)
+            if stmts:
+                return b"".join(stmts)
+        # Fallback: compact schema/table comment
+        table_names = re.findall(r"(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)", text)
+        if table_names:
+            comment = "-- schema tables: " + ", ".join(dict.fromkeys(table_names))
+            return _utf8_truncate(comment.encode("utf-8", errors="strict"), max_header_bytes - 1) + b"\n"
+        return b""
+
+    return b""
+
+
+def chunk_code_lossless(
+    code: str,
+    lang_id: int,
+    max_chunk_bytes: int = 3800,
+    max_header_bytes: int = 256,
+    highlight_syntax_delims: bool = True,
+) -> list[PreChunk]:
+    """Syntax-aligned lossless pre-chunker for Python (`3`), SQL/JSON (`4`), and JavaScript (`5`).
+
+    - Splits ONLY at bracket-depth == 0 top-level boundaries (`\\ndef `, `\\nasync def `, `\\nclass `,
+      `\\nexport `, `\\nfunction `, SQL `;\\n`).
+    - Automatically prepends compact file header imports/signatures (`<= max_header_bytes`, default 256 B)
+      to continuation sub-chunks (`chunk_index > 0`) with corresponding `.loss_mask.bin` bytes set to `0`.
+    - Guarantees every emitted chunk is 100% valid UTF-8, 100% bracket-balanced, and `max_depth <= 16`.
+    """
+    if lang_id not in (3, 4, 5):
+        raise ValueError(f"chunk_code_lossless requires lang_id in {{3, 4, 5}}, got {lang_id}")
+    if max_chunk_bytes < 64:
+        raise ValueError(f"max_chunk_bytes must be >= 64, got {max_chunk_bytes}")
+
+    norm = _normalize_lossless_text(code).strip()
+    if not norm:
+        return []
+    raw = (norm + "\n").encode("utf-8", errors="strict")
+
+    ok, full_depth, splits = scan_code_lexical(raw, lang_id)
+    if not ok or full_depth > 16:
+        return []
+
+    if len(raw) <= max_chunk_bytes:
+        if lang_id in (3, 5) and full_depth < 1:
+            return []
+        mask = encode_fixed_point_loss_mask(raw, highlight_syntax_delims=highlight_syntax_delims)
+        return [
+            PreChunk(
+                raw_bytes=raw,
+                loss_mask_bytes=mask,
+                lang_id=lang_id,
+                max_depth=full_depth,
+                header_byte_len=0,
+                chunk_index=0,
+            )
+        ]
+
+    # Partition into depth-0 atomic top-level blocks
+    bounds = sorted({0, len(raw), *(p for p in splits if 0 < p < len(raw))})
+    blocks: list[bytes] = []
+    for s, e in zip(bounds[:-1], bounds[1:]):
+        blk = raw[s:e]
+        if blk.strip():
+            blocks.append(blk)
+    if not blocks:
+        return []
+
+    eff_max_hdr = min(max_header_bytes, max(0, max_chunk_bytes // 4))
+    header = extract_compact_code_header(raw, lang_id, max_header_bytes=eff_max_hdr)
+
+    chunks: list[PreChunk] = []
+    acc: list[bytes] = []
+    acc_len = 0
+
+    def _emit_current() -> None:
+        nonlocal acc, acc_len
+        if not acc:
+            return
+        body = b"".join(acc).lstrip(b"\n")
+        acc = []
+        acc_len = 0
+        if not body.strip():
+            return
+        if not body.endswith(b"\n"):
+            body += b"\n"
+
+        chunk_idx = len(chunks)
+        use_hdr = (
+            chunk_idx > 0
+            and len(header) > 0
+            and not body.startswith(header)
+            and (len(header) + len(body)) <= max_chunk_bytes
+        )
+        hdr_len = len(header) if use_hdr else 0
+        chunk_bytes = (header + body) if use_hdr else body
+
+        c_ok, c_depth, _ = scan_code_lexical(chunk_bytes, lang_id)
+        if not c_ok or c_depth > 16:
+            return
+        if lang_id in (3, 5) and c_depth < 1:
+            return
+        mask = encode_fixed_point_loss_mask(
+            chunk_bytes,
+            zero_spans=((0, hdr_len),) if hdr_len > 0 else (),
+            highlight_syntax_delims=highlight_syntax_delims,
+        )
+        chunks.append(
+            PreChunk(
+                raw_bytes=chunk_bytes,
+                loss_mask_bytes=mask,
+                lang_id=lang_id,
+                max_depth=c_depth,
+                header_byte_len=hdr_len,
+                chunk_index=chunk_idx,
+            )
+        )
+
+    for blk in blocks:
+        next_idx = len(chunks)
+        reserved_hdr = len(header) if next_idx > 0 else 0
+        budget = max_chunk_bytes - reserved_hdr
+        blk_clean = blk if acc else blk.lstrip(b"\n")
+        if len(blk_clean) > budget:
+            _emit_current()
+            # Re-evaluate against fresh chunk budget after flushing
+            next_idx = len(chunks)
+            reserved_hdr = len(header) if next_idx > 0 else 0
+            budget = max_chunk_bytes - reserved_hdr
+            blk_clean = blk.lstrip(b"\n")
+            if len(blk_clean) > budget:
+                # Single unsplittable block > budget: never break brackets mid-block
+                continue
+            acc = [blk_clean]
+            acc_len = len(blk_clean)
+            continue
+
+        if acc and (acc_len + len(blk_clean)) > budget:
+            _emit_current()
+            next_idx = len(chunks)
+            reserved_hdr = len(header) if next_idx > 0 else 0
+            budget = max_chunk_bytes - reserved_hdr
+            blk_clean = blk.lstrip(b"\n")
+            if len(blk_clean) > budget:
+                continue
+            acc = [blk_clean]
+            acc_len = len(blk_clean)
+        else:
+            acc.append(blk_clean)
+            acc_len += len(blk_clean)
+
+    _emit_current()
+    return chunks
+
+
+def prechunk_document(
+    text: str,
+    lang_id: int,
+    max_chunk_bytes: int = 3800,
+    max_header_bytes: int = 256,
+    highlight_syntax_delims: bool = True,
+) -> list[PreChunk]:
+    """Unified lossless pre-chunker routing `lang_id in {0,1,2}` to prose and `{3,4,5}` to lexical code."""
+    if lang_id in (3, 4, 5):
+        return chunk_code_lossless(
+            text,
+            lang_id=lang_id,
+            max_chunk_bytes=max_chunk_bytes,
+            max_header_bytes=max_header_bytes,
+            highlight_syntax_delims=highlight_syntax_delims,
+        )
+    prose_chunks = chunk_prose_lossless(text, max_chunk_bytes=max_chunk_bytes, min_chunk_bytes=1)
+    return [
+        PreChunk(
+            raw_bytes=b,
+            loss_mask_bytes=encode_fixed_point_loss_mask(b, highlight_syntax_delims=highlight_syntax_delims),
+            lang_id=lang_id,
+            max_depth=0,
+            header_byte_len=0,
+            chunk_index=idx,
+        )
+        for idx, b in enumerate(prose_chunks)
+    ]
+
+
+def stream_v3_flat_source(
+    repo_id: str,
+    *,
+    max_chunk_bytes: int = 3800,
+    min_chunk_bytes: int = 96,
+) -> Iterator[tuple[bytes, bytes, int, int]]:
+    """Stream any registered 2025-2026 high-purity source from `V3_FLAT_SOURCE_DESCRIPTORS`.
+
+    Yields `(raw_bytes, fixed_point_x10_loss_mask_bytes, source_id, max_depth)`.
+    Gracefully returns if offline/gated/unavailable.
+    """
+    desc = V3_FLAT_SOURCE_DESCRIPTORS.get(repo_id)
+    if desc is None:
+        raise KeyError(f"Unregistered v3 source descriptor: {repo_id!r}")
+    try:
+        from datasets import load_dataset
+        from data.hf_auth import hf_token_kwargs
+
+        load_args = [desc.repo_id] + ([desc.config_name] if desc.config_name else [])
+        ds = load_dataset(*load_args, split=desc.split, streaming=True, **hf_token_kwargs())
+        for row in ds:
+            text_val = ""
+            for field in desc.text_fields:
+                v = row.get(field)
+                if isinstance(v, str) and v.strip():
+                    text_val = v
+                    break
+                if field == "conversations" and isinstance(v, list):
+                    parts = [
+                        str(turn.get("value") or turn.get("content") or "").strip()
+                        for turn in v
+                        if isinstance(turn, dict)
+                    ]
+                    joined = "\n\n".join(p for p in parts if p)
+                    if joined:
+                        text_val = joined
+                        break
+            if not text_val:
+                continue
+            for pc in prechunk_document(text_val, lang_id=desc.lang_id, max_chunk_bytes=max_chunk_bytes):
+                if len(pc.raw_bytes) >= min_chunk_bytes:
+                    yield pc.raw_bytes, pc.loss_mask_bytes, desc.source_id, pc.max_depth
+    except Exception as exc:
+        print(f"  [INFO] v3 source {repo_id} skipped ({type(exc).__name__}); falling back.", flush=True)
+    finally:
+        gc.collect()
 
 
 def _chunk_bounded_paragraphs(text: str, min_b: int, max_b: int) -> Iterator[bytes]:

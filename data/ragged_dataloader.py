@@ -13,18 +13,29 @@ Implements Deliverable 2 of the DCPA Data Infrastructure & Curriculum Pipeline:
 
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import dataclass
+import heapq
 import os
 import random
+import sys
 import threading
 from pathlib import Path
 from typing import Iterator, Optional, Sequence
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, Sampler, get_worker_info
+from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler, get_worker_info
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_TRAIN_PY = _REPO_ROOT / "dcpa-train-py"
+if _TRAIN_PY.is_dir() and str(_TRAIN_PY) not in sys.path:
+    sys.path.insert(0, str(_TRAIN_PY))
 
 from data import wug_generator
+from data.cognitive_v2_sources import V3_FLAT_SOURCE_STAGE_TIERS, prechunk_document
 from data.wug_generator import sample_wug_episode_fast
+from dcpa.interfaces import StaticGridBatch, decode_fixed_point_loss_mask
 
 # Exact 16-byte little-endian structured record layout for {split}.idx (Spec 3.2: 100% backward-compatible!)
 # Old `<QIBBH` files with max_depth in 0..16 store 0x00 in byte 15, which reads cleanly as style_id=0 (neutral).
@@ -75,6 +86,7 @@ SOURCE_STAGE_TIERS: dict[int, int] = {
     35: 3,  # long_essays_and_criticism (Stage 3)
     36: 3,  # complex_formal_proofs (Stage 3)
     37: 3,  # sql_cte_analytic_and_complex_schemas (Stage 3)
+    **V3_FLAT_SOURCE_STAGE_TIERS,
 }
 
 
@@ -771,5 +783,482 @@ def create_ragged_dataloader(
         batch_size=None,
         num_workers=num_workers,
         pin_memory=False,
+        persistent_workers=(num_workers > 0),
+    )
+
+
+# =============================================================================
+# DCPA-Flat v3.3 Static-Grid FFD Minimum-Load Lane Packer (WS-1)
+# =============================================================================
+
+# Fast uint8 -> float32 lookup table identical to `dcpa.interfaces.decode_fixed_point_loss_mask`:
+#   0 -> 0.0, 1 (legacy) -> 1.0, 10 -> 1.0, 15 -> 1.5, 30 -> 3.0
+_LOSS_MASK_DECODE_LUT: np.ndarray = np.arange(256, dtype=np.float32) * np.float32(0.1)
+_LOSS_MASK_DECODE_LUT[1] = np.float32(1.0)
+
+
+@dataclass(slots=True)
+class _GridDocItem:
+    """Candidate document (either mmap-backed or losslessly pre-chunked in memory)."""
+
+    offset: int
+    length: int
+    lang_id: int
+    style_id: int
+    source_id: int
+    raw_bytes: Optional[bytes] = None
+    mask_bytes: Optional[bytes] = None
+
+
+def static_grid_batch_to_dict(batch: StaticGridBatch) -> dict[str, torch.Tensor]:
+    """Convert a `StaticGridBatch` dataclass to a plain tensor dict."""
+    return {
+        "x_bytes": batch.x_bytes,
+        "doc_id_byte": batch.doc_id_byte,
+        "doc_start_byte": batch.doc_start_byte,
+        "doc_end_byte": batch.doc_end_byte,
+        "loss_weight": batch.loss_weight,
+        "doc_meta": batch.doc_meta,
+    }
+
+
+def static_grid_batch_from_dict(d: dict[str, torch.Tensor]) -> StaticGridBatch:
+    """Reconstruct a `StaticGridBatch` dataclass from a plain tensor dict."""
+    return StaticGridBatch(
+        x_bytes=d["x_bytes"],
+        doc_id_byte=d["doc_id_byte"],
+        doc_start_byte=d["doc_start_byte"],
+        doc_end_byte=d["doc_end_byte"],
+        loss_weight=d["loss_weight"],
+        doc_meta=d["doc_meta"],
+    )
+
+
+class StaticGridByteDataset(IterableDataset):
+    """DCPA-Flat v3.3 static `[P, T]` grid dataset with FFD minimum-load greedy lane packing.
+
+    Guarantees:
+      - ZERO mid-document truncation: documents `<= T` are packed whole; any unchunked shard
+        document exceeding `T` is split on-the-fly with the lossless paragraph/code pre-chunker
+        and queued into `carry_deque`.
+      - ZERO dropped documents: candidates that do not fit into any lane overflow cleanly into
+        cross-batch `carry_deque` and are prioritized on the very next batch.
+      - Fixed-point x10 `.loss_mask.bin` decoding (`0/1/10/15/30 -> 0.0/1.0/1.0/1.5/3.0`).
+      - Lane-tail padding strictly uses `x_bytes=0x00`, `doc_id_byte=-1`,
+        `doc_start_byte=False`, `doc_end_byte=False`, `loss_weight=0.0`.
+      - Emits `dcpa.interfaces.StaticGridBatch` (or dict when `return_dict=True`).
+    """
+
+    def __init__(
+        self,
+        bin_path: str | Path,
+        idx_path: str | Path,
+        *,
+        grid_lanes: int = 32,
+        grid_bytes: int = 4096,
+        doc_meta_cap_per_lane: int = 64,
+        domain_weights: Optional[dict[int, float]] = None,
+        max_stage_tier: int = 0,
+        num_batches: Optional[int] = 10000,
+        seed: int = 42,
+        allow_drive_fuse: bool = False,
+        pool_fill_ratio: float = 0.95,
+        return_dict: bool = False,
+    ) -> None:
+        super().__init__()
+        if grid_lanes < 1:
+            raise ValueError(f"grid_lanes (P) must be >= 1, got {grid_lanes}")
+        if grid_bytes < 64:
+            raise ValueError(f"grid_bytes (T) must be >= 64, got {grid_bytes}")
+        if doc_meta_cap_per_lane < 1:
+            raise ValueError(f"doc_meta_cap_per_lane must be >= 1, got {doc_meta_cap_per_lane}")
+        if not (0.5 <= pool_fill_ratio <= 2.0):
+            raise ValueError(f"pool_fill_ratio must be in [0.5, 2.0], got {pool_fill_ratio}")
+
+        self.bin_path = Path(bin_path)
+        self.idx_path = Path(idx_path)
+        cand_mask = self.bin_path.with_suffix(".loss_mask.bin")
+        self.mask_path: Optional[Path] = (
+            cand_mask
+            if (
+                cand_mask.is_file()
+                and self.bin_path.is_file()
+                and cand_mask.stat().st_size == self.bin_path.stat().st_size
+            )
+            else None
+        )
+        if not allow_drive_fuse:
+            assert_not_drive_mmap(self.bin_path)
+            assert_not_drive_mmap(self.idx_path)
+            if self.mask_path is not None:
+                assert_not_drive_mmap(self.mask_path)
+
+        if not self.bin_path.exists():
+            raise FileNotFoundError(f"Missing binary shard: {self.bin_path}")
+        if not self.idx_path.exists():
+            raise FileNotFoundError(f"Missing index shard: {self.idx_path}")
+
+        self.grid_lanes = int(grid_lanes)
+        self.grid_bytes = int(grid_bytes)
+        self.doc_meta_cap_per_lane = int(doc_meta_cap_per_lane)
+        self.max_stage_tier = max(0, int(max_stage_tier))
+        self.num_batches = int(num_batches) if (num_batches is not None and num_batches > 0) else None
+        self.seed = int(seed)
+        self.pool_fill_ratio = float(pool_fill_ratio)
+        self.return_dict = bool(return_dict)
+        self._explicit_domain_weights = domain_weights is not None
+
+        idx_mm = np.memmap(self.idx_path, dtype=IDX_DTYPE, mode="r")
+        offsets = np.array(idx_mm["offset"], dtype=np.int64, copy=True)
+        lengths = np.array(idx_mm["length"], dtype=np.int64, copy=True)
+        lang_ids = np.array(idx_mm["lang_id"], dtype=np.int64, copy=True)
+        source_ids = np.array(idx_mm["source_id"], dtype=np.int64, copy=True)
+        style_ids = np.array(idx_mm["style_id"], dtype=np.int64, copy=True)
+        del idx_mm
+
+        if len(offsets) == 0:
+            raise ValueError(f"Index {self.idx_path} contains zero documents.")
+
+        doc_tiers = infer_doc_stage_tiers(source_ids, lengths) if self.max_stage_tier > 0 else None
+        valid_mask = lengths > 0
+        if doc_tiers is not None:
+            tier_ok = valid_mask & (doc_tiers <= self.max_stage_tier)
+            if np.any(tier_ok):
+                valid_mask = tier_ok
+
+        self._offsets = offsets[valid_mask]
+        self._lengths = lengths[valid_mask]
+        self._lang_ids = lang_ids[valid_mask]
+        self._source_ids = source_ids[valid_mask]
+        self._style_ids = style_ids[valid_mask]
+        self.num_docs = int(len(self._offsets))
+
+        self._by_lang: dict[int, np.ndarray] = {}
+        for lid in sorted(set(self._lang_ids.tolist())):
+            self._by_lang[int(lid)] = np.nonzero(self._lang_ids == lid)[0]
+
+        self._langs, self._cum_weights = _normalize_domain_weights(
+            list(self._by_lang.keys()), domain_weights
+        )
+
+    def _draw_next_doc_idx(
+        self,
+        rng: random.Random,
+        np_rng: np.random.Generator,
+        all_perm: list[np.ndarray],
+        all_pos: list[int],
+        lang_perms: dict[int, np.ndarray],
+        lang_pos: dict[int, int],
+    ) -> int:
+        if not self._explicit_domain_weights:
+            if all_pos[0] >= len(all_perm[0]):
+                all_perm[0] = np_rng.permutation(self.num_docs)
+                all_pos[0] = 0
+            idx = int(all_perm[0][all_pos[0]])
+            all_pos[0] += 1
+            return idx
+
+        if len(self._langs) == 1:
+            lid = self._langs[0]
+        else:
+            u = rng.random()
+            lid = self._langs[-1]
+            for cand_lid, cw in zip(self._langs, self._cum_weights):
+                if u <= cw:
+                    lid = cand_lid
+                    break
+
+        pool = self._by_lang[lid]
+        pos = lang_pos[lid]
+        perm = lang_perms[lid]
+        if pos >= len(perm):
+            perm = pool[np_rng.permutation(len(pool))]
+            lang_perms[lid] = perm
+            pos = 0
+        idx = int(perm[pos])
+        lang_pos[lid] = pos + 1
+        return idx
+
+    def _pull_doc_item(
+        self,
+        mm: np.memmap,
+        mask_mm: Optional[np.memmap],
+        carry_deque: deque[_GridDocItem],
+        rng: random.Random,
+        np_rng: np.random.Generator,
+        all_perm: list[np.ndarray],
+        all_pos: list[int],
+        lang_perms: dict[int, np.ndarray],
+        lang_pos: dict[int, int],
+        *,
+        allow_carry: bool = True,
+    ) -> Optional[_GridDocItem]:
+        if allow_carry and carry_deque:
+            return carry_deque.popleft()
+
+        T = self.grid_bytes
+        for _ in range(64):
+            doc_idx = self._draw_next_doc_idx(rng, np_rng, all_perm, all_pos, lang_perms, lang_pos)
+            off = int(self._offsets[doc_idx])
+            doc_len = int(self._lengths[doc_idx])
+            lid = int(self._lang_ids[doc_idx])
+            sid = int(self._style_ids[doc_idx])
+            src = int(self._source_ids[doc_idx])
+
+            if doc_len <= T:
+                return _GridDocItem(
+                    offset=off,
+                    length=doc_len,
+                    lang_id=lid,
+                    style_id=sid,
+                    source_id=src,
+                )
+
+            # Oversized unchunked doc (> T): split losslessly on-the-fly so ZERO mid-doc truncation occurs
+            raw_b = bytes(mm[off : off + doc_len])
+            try:
+                text = raw_b.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                continue
+            pieces = prechunk_document(text, lang_id=lid, max_chunk_bytes=T)
+            if not pieces:
+                continue
+            first_item: Optional[_GridDocItem] = None
+            for pc in pieces:
+                if len(pc.raw_bytes) == 0 or len(pc.raw_bytes) > T:
+                    continue
+                if mask_mm is not None:
+                    eff_mask: Optional[bytes] = pc.loss_mask_bytes
+                elif pc.header_byte_len > 0:
+                    eff_mask = (b"\x00" * pc.header_byte_len) + (b"\x01" * (len(pc.raw_bytes) - pc.header_byte_len))
+                else:
+                    eff_mask = None
+                item = _GridDocItem(
+                    offset=0,
+                    length=len(pc.raw_bytes),
+                    lang_id=lid,
+                    style_id=sid,
+                    source_id=src,
+                    raw_bytes=pc.raw_bytes,
+                    mask_bytes=eff_mask,
+                )
+                if first_item is None:
+                    first_item = item
+                else:
+                    carry_deque.append(item)
+            if first_item is not None:
+                return first_item
+        return None
+
+    def _materialize_grid(
+        self,
+        mm: np.memmap,
+        mask_mm: Optional[np.memmap],
+        lane_docs: list[list[_GridDocItem]],
+    ) -> StaticGridBatch | dict[str, torch.Tensor]:
+        P = self.grid_lanes
+        T = self.grid_bytes
+        meta_cap = P * self.doc_meta_cap_per_lane
+
+        x_grid = np.zeros((P, T), dtype=np.uint8)
+        doc_id_grid = np.full((P, T), -1, dtype=np.int32)
+        doc_start_grid = np.zeros((P, T), dtype=np.bool_)
+        doc_end_grid = np.zeros((P, T), dtype=np.bool_)
+        loss_w_grid = np.zeros((P, T), dtype=np.float32)
+        doc_meta = np.zeros((meta_cap, 3), dtype=np.int32)
+
+        doc_id = 0
+        for p in range(P):
+            pos = 0
+            for item in lane_docs[p]:
+                ln = item.length
+                end = pos + ln
+                if item.raw_bytes is not None:
+                    x_grid[p, pos:end] = np.frombuffer(item.raw_bytes, dtype=np.uint8)
+                    if item.mask_bytes is not None:
+                        loss_w_grid[p, pos:end] = _LOSS_MASK_DECODE_LUT[
+                            np.frombuffer(item.mask_bytes, dtype=np.uint8)
+                        ]
+                    else:
+                        loss_w_grid[p, pos:end] = 1.0
+                else:
+                    off = item.offset
+                    x_grid[p, pos:end] = mm[off : off + ln]
+                    if mask_mm is not None:
+                        loss_w_grid[p, pos:end] = _LOSS_MASK_DECODE_LUT[mask_mm[off : off + ln]]
+                    else:
+                        loss_w_grid[p, pos:end] = 1.0
+
+                doc_id_grid[p, pos:end] = doc_id
+                doc_start_grid[p, pos] = True
+                doc_end_grid[p, end - 1] = True
+                doc_meta[doc_id, 0] = item.lang_id
+                doc_meta[doc_id, 1] = item.style_id
+                doc_meta[doc_id, 2] = item.source_id
+                doc_id += 1
+                pos = end
+
+        batch = StaticGridBatch(
+            x_bytes=torch.from_numpy(x_grid),
+            doc_id_byte=torch.from_numpy(doc_id_grid),
+            doc_start_byte=torch.from_numpy(doc_start_grid),
+            doc_end_byte=torch.from_numpy(doc_end_grid),
+            loss_weight=torch.from_numpy(loss_w_grid),
+            doc_meta=torch.from_numpy(doc_meta),
+        )
+        return static_grid_batch_to_dict(batch) if self.return_dict else batch
+
+    def __iter__(self) -> Iterator[StaticGridBatch | dict[str, torch.Tensor]]:
+        winfo = get_worker_info()
+        worker_id = winfo.id if winfo is not None else 0
+        num_workers = winfo.num_workers if winfo is not None else 1
+
+        if self.num_batches is None:
+            worker_batches: Optional[int] = None
+        else:
+            base_q, rem_q = divmod(self.num_batches, num_workers)
+            worker_batches = base_q + (1 if worker_id < rem_q else 0)
+            if worker_batches <= 0:
+                return
+
+        w_seed = self.seed + worker_id * 1000003
+        rng = random.Random(w_seed)
+        np_rng = np.random.default_rng(w_seed)
+
+        all_perm = [np_rng.permutation(self.num_docs)]
+        all_pos = [0]
+        lang_perms = {
+            lid: pool[np_rng.permutation(len(pool))] for lid, pool in self._by_lang.items()
+        }
+        lang_pos = {lid: 0 for lid in self._by_lang}
+
+        P = self.grid_lanes
+        T = self.grid_bytes
+        grid_cap = P * T
+        max_docs = P * self.doc_meta_cap_per_lane
+        pool_target = max(T, int(round(self.pool_fill_ratio * grid_cap)))
+        topup_target = int(round(0.985 * grid_cap))
+        max_topup_misses = max(8, P // 2)
+
+        mm = np.memmap(self.bin_path, dtype=np.uint8, mode="r")
+        mask_mm = np.memmap(self.mask_path, dtype=np.uint8, mode="r") if self.mask_path is not None else None
+        carry_deque: deque[_GridDocItem] = deque()
+
+        emitted = 0
+        try:
+            while worker_batches is None or emitted < worker_batches:
+                # 1. Fill candidate pool (carry_deque first, then fresh corpus docs) to ~pool_fill_ratio capacity
+                candidates: list[_GridDocItem] = []
+                pool_bytes = 0
+                while carry_deque and pool_bytes < pool_target and len(candidates) < max_docs:
+                    item = carry_deque.popleft()
+                    candidates.append(item)
+                    pool_bytes += item.length
+
+                while pool_bytes < pool_target and len(candidates) < max_docs:
+                    item = self._pull_doc_item(
+                        mm, mask_mm, carry_deque, rng, np_rng, all_perm, all_pos, lang_perms, lang_pos,
+                        allow_carry=False,
+                    )
+                    if item is None:
+                        break
+                    candidates.append(item)
+                    pool_bytes += item.length
+
+                if not candidates:
+                    break
+
+                # 2. First-Fit-Decreasing (FFD) minimum-load greedy lane packing
+                candidates.sort(key=lambda c: c.length, reverse=True)
+                lanes_heap: list[tuple[int, int]] = [(0, p) for p in range(P)]
+                lane_docs: list[list[_GridDocItem]] = [[] for _ in range(P)]
+                overflow: list[_GridDocItem] = []
+                total_placed = 0
+                packed_bytes = 0
+
+                for item in candidates:
+                    min_used, best_lane = lanes_heap[0]
+                    if total_placed < max_docs and (T - min_used) >= item.length:
+                        heapq.heapreplace(lanes_heap, (min_used + item.length, best_lane))
+                        lane_docs[best_lane].append(item)
+                        total_placed += 1
+                        packed_bytes += item.length
+                    else:
+                        overflow.append(item)
+
+                # 3. Bounded gap-fill pass (places any fitting docs into remaining tails; non-fitting -> carry_deque)
+                misses = 0
+                while (
+                    not carry_deque
+                    and packed_bytes < topup_target
+                    and total_placed < max_docs
+                    and (T - lanes_heap[0][0]) >= 32
+                    and misses < max_topup_misses
+                ):
+                    item = self._pull_doc_item(
+                        mm, mask_mm, carry_deque, rng, np_rng, all_perm, all_pos, lang_perms, lang_pos,
+                        allow_carry=False,
+                    )
+                    if item is None:
+                        break
+                    min_used, best_lane = lanes_heap[0]
+                    if (T - min_used) >= item.length:
+                        heapq.heapreplace(lanes_heap, (min_used + item.length, best_lane))
+                        lane_docs[best_lane].append(item)
+                        total_placed += 1
+                        packed_bytes += item.length
+                    else:
+                        overflow.append(item)
+                        misses += 1
+
+                # Preserve ALL unplaced documents across batch boundaries (ZERO dropped docs)
+                if overflow:
+                    carry_deque.extend(overflow)
+
+                yield self._materialize_grid(mm, mask_mm, lane_docs)
+                emitted += 1
+        finally:
+            del mm
+            if mask_mm is not None:
+                del mask_mm
+
+
+def build_static_grid_dataloader(
+    bin_path: str | Path,
+    idx_path: str | Path,
+    *,
+    grid_lanes: int = 32,
+    grid_bytes: int = 4096,
+    doc_meta_cap_per_lane: int = 64,
+    domain_weights: Optional[dict[int, float]] = None,
+    max_stage_tier: int = 0,
+    num_batches: Optional[int] = 10000,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    seed: int = 42,
+    allow_drive_fuse: bool = False,
+    pool_fill_ratio: float = 0.95,
+    return_dict: bool = False,
+) -> DataLoader:
+    """Create a DataLoader yielding static `[P, T]` `StaticGridBatch` grids packed with FFD."""
+    ds = StaticGridByteDataset(
+        bin_path=bin_path,
+        idx_path=idx_path,
+        grid_lanes=grid_lanes,
+        grid_bytes=grid_bytes,
+        doc_meta_cap_per_lane=doc_meta_cap_per_lane,
+        domain_weights=domain_weights,
+        max_stage_tier=max_stage_tier,
+        num_batches=num_batches,
+        seed=seed,
+        allow_drive_fuse=allow_drive_fuse,
+        pool_fill_ratio=pool_fill_ratio,
+        return_dict=return_dict,
+    )
+    return DataLoader(
+        ds,
+        batch_size=None,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         persistent_workers=(num_workers > 0),
     )

@@ -35,6 +35,7 @@ for _p in (str(_REPO_ROOT), str(_TRAIN_PY)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from data.cognitive_v2_sources import V3_FLAT_SOURCE_DESCRIPTORS
 from data.ragged_dataloader import IDX_RECORD_FMT, IDX_RECORD_SIZE
 
 
@@ -55,6 +56,7 @@ class DataProfileSpec:
     min_free_gb: float
     cognitive_v2: bool = False
     cap_code_mb: float = 0.0
+    v3_flat: bool = False
 
 
 PROFILES: dict[str, DataProfileSpec] = {
@@ -169,6 +171,111 @@ PROFILES: dict[str, DataProfileSpec] = {
         cognitive_v2=True,
         cap_code_mb=120.0,
     ),
+    "v3_flat_5g": DataProfileSpec(
+        name="v3_flat_5g",
+        description=(
+            "DCPA-Flat v3.3 ~5.5 GB rapid killgate corpus (for 48M 5,000-step 3-way killgate & quick Colab CPU forge; "
+            "2025-2026 6-domain lossless pre-chunking + fixed-point x10 .loss_mask.bin + capability/SFT shards)."
+        ),
+        smoke_quota=False,
+        corpus_scale_factor=10.0,
+        stem_upgrade=True,
+        corpus_workers=6,
+        cap_reasoning_mb=180.0,
+        cap_instruct_mb=60.0,
+        cap_writing_mb=140.0,
+        cap_toolcall_mb=80.0,
+        sft_train_mb=80.0,
+        sft_val_mb=4.0,
+        min_free_gb=14.0,
+        cognitive_v2=True,
+        cap_code_mb=180.0,
+        v3_flat=True,
+    ),
+    "v3_flat_18g": DataProfileSpec(
+        name="v3_flat_18g",
+        description=(
+            "DCPA-Flat v3.3 18 GB edge-production corpus (for DCPA-Flat-48M ~32 GB stream / ~9.5B tokens; "
+            "2025-2026 high-purity 6-domain lossless pre-chunking + fixed-point x10 .loss_mask.bin)."
+        ),
+        smoke_quota=False,
+        corpus_scale_factor=36.0,
+        stem_upgrade=True,
+        corpus_workers=6,
+        cap_reasoning_mb=550.0,
+        cap_instruct_mb=220.0,
+        cap_writing_mb=420.0,
+        cap_toolcall_mb=220.0,
+        sft_train_mb=200.0,
+        sft_val_mb=8.0,
+        min_free_gb=38.0,
+        cognitive_v2=True,
+        cap_code_mb=550.0,
+        v3_flat=True,
+    ),
+    "v3_flat_45g": DataProfileSpec(
+        name="v3_flat_45g",
+        description=(
+            "DCPA-Flat v3.3 45 GB golden corpus (2025-2026 high-purity 6-domain Nemotron-CC/FineWeb2-HQ/"
+            "OpenCSG-ZH/CCI3-HQ/Swallow-Code-v2/OpenCodeReasoning + lossless pre-chunking + fixed-point x10 .loss_mask.bin)."
+        ),
+        smoke_quota=False,
+        corpus_scale_factor=90.0,
+        stem_upgrade=True,
+        corpus_workers=6,
+        cap_reasoning_mb=1400.0,
+        cap_instruct_mb=600.0,
+        cap_writing_mb=1000.0,
+        cap_toolcall_mb=600.0,
+        sft_train_mb=500.0,
+        sft_val_mb=16.0,
+        min_free_gb=90.0,
+        cognitive_v2=True,
+        cap_code_mb=1400.0,
+        v3_flat=True,
+    ),
+    "v3_flat_90g": DataProfileSpec(
+        name="v3_flat_90g",
+        description=(
+            "DCPA-Flat v3.3 90 GB flagship 206M golden corpus (full 2025-2026 high-purity 6-domain sources + "
+            "lossless syntax/paragraph pre-chunking + fixed-point x10 .loss_mask.bin + full capability/SFT shards)."
+        ),
+        smoke_quota=False,
+        corpus_scale_factor=180.0,
+        stem_upgrade=True,
+        corpus_workers=6,
+        cap_reasoning_mb=2800.0,
+        cap_instruct_mb=1200.0,
+        cap_writing_mb=2000.0,
+        cap_toolcall_mb=1200.0,
+        sft_train_mb=800.0,
+        sft_val_mb=32.0,
+        min_free_gb=180.0,
+        cognitive_v2=True,
+        cap_code_mb=2800.0,
+        v3_flat=True,
+    ),
+    "v3_flat_160g": DataProfileSpec(
+        name="v3_flat_160g",
+        description=(
+            "DCPA-Flat v3.3 160 GB one-shot master corpus (covers 48M + 206M flagship + future 650M ~90B token runs "
+            "without ever re-forging data; full 2025-2026 6-domain lossless pre-chunking + capability/SFT shards)."
+        ),
+        smoke_quota=False,
+        corpus_scale_factor=320.0,
+        stem_upgrade=True,
+        corpus_workers=8,
+        cap_reasoning_mb=4800.0,
+        cap_instruct_mb=2000.0,
+        cap_writing_mb=3600.0,
+        cap_toolcall_mb=2000.0,
+        sft_train_mb=1400.0,
+        sft_val_mb=48.0,
+        min_free_gb=320.0,
+        cognitive_v2=True,
+        cap_code_mb=4800.0,
+        v3_flat=True,
+    ),
 }
 
 
@@ -219,7 +326,12 @@ def verify_shard_triplet(
     return True, f"ok ({idx_size // IDX_RECORD_SIZE} docs, {bin_size / (1024 * 1024):.2f} MB)"
 
 
-def verify_all_shards(nvme_root: Path, *, include_cap_code: bool = False) -> dict[str, dict[str, Any]]:
+def verify_all_shards(
+    nvme_root: Path,
+    *,
+    include_cap_code: bool = False,
+    corpus_has_loss_mask: bool = False,
+) -> dict[str, dict[str, Any]]:
     """Verify shard groups (`data`, `cap_reasoning`, `cap_instruct`, `cap_writing`, `cap_toolcall`, optional `cap_code`, `sft`)."""
     data_dir = nvme_root / "data"
     cap_dir = nvme_root / "cap_data"
@@ -227,8 +339,16 @@ def verify_all_shards(nvme_root: Path, *, include_cap_code: bool = False) -> dic
 
     checks: dict[str, list[tuple[Path, Path, Optional[Path]]]] = {
         "corpus_5domain": [
-            (data_dir / "train.bin", data_dir / "train.idx", None),
-            (data_dir / "val.bin", data_dir / "val.idx", None),
+            (
+                data_dir / "train.bin",
+                data_dir / "train.idx",
+                (data_dir / "train.loss_mask.bin") if corpus_has_loss_mask else None,
+            ),
+            (
+                data_dir / "val.bin",
+                data_dir / "val.idx",
+                (data_dir / "val.loss_mask.bin") if corpus_has_loss_mask else None,
+            ),
         ],
         "cap_reasoning": [
             (
@@ -356,6 +476,8 @@ def build_job_plan(
         corpus_cmd.append("--stem-upgrade")
     if spec.cognitive_v2:
         corpus_cmd.append("--cognitive-v2")
+    if spec.v3_flat:
+        corpus_cmd.extend(["--v3-flat", "--write-loss-mask"])
     if offline_synthetic:
         corpus_cmd.append("--offline")
 
@@ -505,7 +627,11 @@ def prepare_vast_corpus(
     }
 
     has_cap_code = spec.cap_code_mb > 0.0
-    existing_status = verify_all_shards(root, include_cap_code=has_cap_code) if root.exists() else {}
+    existing_status = (
+        verify_all_shards(root, include_cap_code=has_cap_code, corpus_has_loss_mask=spec.v3_flat)
+        if root.exists()
+        else {}
+    )
 
     if dry_run:
         free_gb = None
@@ -516,6 +642,8 @@ def prepare_vast_corpus(
             "dry_run": True,
             "profile": spec.name,
             "description": spec.description,
+            "v3_flat": spec.v3_flat,
+            "v3_sources": sorted(V3_FLAT_SOURCE_DESCRIPTORS.keys()) if spec.v3_flat else [],
             "nvme_root": str(root),
             "data_dir": str(root / "data"),
             "cap_data_dir": str(root / "cap_data"),
@@ -542,7 +670,7 @@ def prepare_vast_corpus(
     if from_archive:
         _restore_from_archive(from_archive, root)
 
-    status = verify_all_shards(root, include_cap_code=has_cap_code)
+    status = verify_all_shards(root, include_cap_code=has_cap_code, corpus_has_loss_mask=spec.v3_flat)
     pending_jobs: list[tuple[str, list[str]]] = []
     for job_name, cmd in plan.items():
         if not force and status.get(job_name, {}).get("valid", False):
@@ -617,7 +745,7 @@ def prepare_vast_corpus(
                 msg_lines.append(f"  * {j_name} (exit={rc}, log={log_path}):\n    {tail}")
             raise RuntimeError("\n".join(msg_lines))
 
-    final_status = verify_all_shards(root, include_cap_code=has_cap_code)
+    final_status = verify_all_shards(root, include_cap_code=has_cap_code, corpus_has_loss_mask=spec.v3_flat)
     invalid = [k for k, v in final_status.items() if not v["valid"]]
     if invalid:
         raise RuntimeError(f"Shard integrity verification failed for {invalid}: {json.dumps(final_status, indent=2)}")

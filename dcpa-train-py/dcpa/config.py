@@ -15,14 +15,20 @@ from pathlib import Path
 from typing import Any
 
 
-LANG_DOMAINS: dict[str, int] = {
-    "zh": 0,
-    "en": 1,
-    "ja": 2,
-    "python": 3,
-    "rust": 4,
-    "synthetic": 5,
-}
+from dcpa.interfaces import (
+    IDX_RECORD_FMT,
+    IDX_RECORD_SIZE,
+    LANG_DOMAINS_V3,
+    LANG_ID_TO_NAME_V3,
+    STYLE_DOMAINS_V3,
+    STYLE_ID_TO_NAME_V3,
+)
+
+# Canonical DCPA-Flat v3.3 6-domain and 5-style ID mappings (mirrored from dcpa.interfaces SSOT)
+LANG_DOMAINS: dict[str, int] = dict(LANG_DOMAINS_V3)
+LANG_ID_TO_NAME: dict[int, str] = dict(LANG_ID_TO_NAME_V3)
+STYLE_DOMAINS: dict[str, int] = dict(STYLE_DOMAINS_V3)
+STYLE_ID_TO_NAME: dict[int, str] = dict(STYLE_ID_TO_NAME_V3)
 
 
 @dataclass

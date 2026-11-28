@@ -37,6 +37,20 @@ SCRATCH_CTRL_BYTE: int = 0x1D
 TOOL_CALL_BYTE: int = 0x11
 TOOL_OBS_BYTE: int = 0x12
 TOOL_SUSPEND_BYTE: int = 0x13
+TOOL_PAGING_BYTE: int = 0x14
+
+ALLOWED_PROTOCOL_CTRL_BYTES: frozenset[int] = frozenset(
+    {
+        TURN_EOT_BYTE,
+        TOOL_CALL_BYTE,
+        TOOL_OBS_BYTE,
+        TOOL_SUSPEND_BYTE,
+        TOOL_PAGING_BYTE,
+        SCRATCH_CTRL_BYTE,
+        TURN_USER_BYTE,
+        TURN_ASST_BYTE,
+    }
+)
 
 TURN_USER_PREFIX: bytes = b"\x1eU\n"
 TURN_ASST_PREFIX: bytes = b"\x1fA\n"
@@ -60,46 +74,53 @@ def format_tool_observation_after_suspend(result_text: str) -> bytes:
     return b"\n" + TOOL_OBS_PREFIX + clean.encode("utf-8", errors="strict") + b"\n" + TURN_ASST_PREFIX
 
 
-LANG_NAME_TO_ID: dict[str, int] = {
+# Canonical DCPA-Flat v3.3 6-domain and 5-style IDs (matching dcpa.interfaces SSOT)
+LANG_DOMAINS: dict[str, int] = {
     "en": 0,
     "zh": 1,
-    "ja": 2,
     "formal": 2,
+    "python": 3,
+    "sql_struct": 4,
+    "javascript": 5,
+}
+LANG_ID_TO_NAME: dict[int, str] = {v: k for k, v in LANG_DOMAINS.items()}
+
+# Lookup table with backwards-compatible aliases
+LANG_NAME_TO_ID: dict[str, int] = {
+    **LANG_DOMAINS,
+    "ja": 2,
     "fol": 2,
     "math": 2,
     "lean": 2,
     "py": 3,
-    "python": 3,
+    "sql": 4,
+    "json": 4,
+    "struct": 4,
     "rs": 4,
     "rust": 4,
-    "sql": 4,
     "js": 5,
-    "javascript": 5,
-}
-LANG_ID_TO_NAME: dict[int, str] = {
-    0: "en",
-    1: "zh",
-    2: "ja",
-    3: "py",
-    4: "rs",
-    5: "js",
+    "ts": 5,
+    "typescript": 5,
 }
 
+STYLE_DOMAINS: dict[str, int] = {
+    "rigorous": 0,
+    "concise_memo": 1,
+    "expository": 2,
+    "literary": 3,
+    "strict_eng": 4,
+}
+STYLE_ID_TO_NAME: dict[int, str] = {v: k for k, v in STYLE_DOMAINS.items()}
+
+# Lookup table with backwards-compatible aliases
 STYLE_NAME_TO_ID: dict[str, int] = {
+    **STYLE_DOMAINS,
     "neutral": 0,
     "memo": 1,
-    "expository": 2,
     "narrative": 3,
     "strict_code_tool": 4,
     "code": 4,
     "tool": 4,
-}
-STYLE_ID_TO_NAME: dict[int, str] = {
-    0: "neutral",
-    1: "memo",
-    2: "expository",
-    3: "narrative",
-    4: "strict_code_tool",
 }
 
 # Source-ID tag marking 40% latent implicit reasoning samples (`ponder_tax_scale = 0.0`)
@@ -110,21 +131,67 @@ SOURCE_ID_TOOLCALL_CHAIN: int = 13
 SOURCE_ID_TOOLCALL_RETRY: int = 14
 SOURCE_ID_TOOLCALL_NEGATIVE: int = 15
 
-# Precomputed translation table stripping all ASCII < 32 except \t (0x09) and \n (0x0A)
+# Precomputed translation table stripping all ASCII < 32 except \t (0x09) and \n (0x0A), plus 0x7F (DEL)
 _CTRL_STRIP_TABLE: dict[int, None] = {
-    c: None for c in range(32) if c not in (0x09, 0x0A)
+    **{c: None for c in range(32) if c not in (0x09, 0x0A)},
+    0x7F: None,
 }
 
 
 def sanitize_raw_text(text: str) -> str:
-    """Red Line #1: Normalize to NFC and strip all ASCII < 32 control bytes except `\\t` and `\\n`."""
-    nfc = unicodedata.normalize("NFC", text)
+    """Stage-1 pre-framing sanitization: NFC normalize, CRLF/CR -> LF, strip ASCII < 32 (except \\t,\\n) and 0x7F."""
+    nfc = unicodedata.normalize("NFC", text).replace("\r\n", "\n").replace("\r", "\n")
     return nfc.translate(_CTRL_STRIP_TABLE)
 
 
 def sanitize_raw_bytes(raw: bytes) -> bytes:
-    """Strip all ASCII < 32 bytes except `0x09` (`\\t`) and `0x0A` (`\\n`) from raw UTF-8 bytes."""
+    """Strip disallowed ASCII control bytes from raw UTF-8 bytes after NFC + LF normalization."""
     return sanitize_raw_text(raw.decode("utf-8", errors="ignore")).encode("utf-8", errors="strict")
+
+
+def validate_framed_record(raw: bytes, max_scratch_inner_bytes: int = 260) -> tuple[bool, str]:
+    """Stage-2 post-framing validator (parity with `dcpa-data-forge::validate_framed_record`).
+
+    Allows the 8 protected protocol control bytes (`ALLOWED_PROTOCOL_CTRL_BYTES`) plus `\\t`/`\\n`,
+    rejects any other ASCII `< 0x20` or `0x7F`, enforces strict UTF-8, and verifies that every
+    `\\x1dS\\n` ... `\\x1dE\\n` scratchpad frame is properly paired/closed with inner span `<= 260` bytes.
+    """
+    try:
+        raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return False, "invalid utf-8"
+
+    n = len(raw)
+    scratch_inner_start: Optional[int] = None
+    i = 0
+    while i < n:
+        b = raw[i]
+        if (b < 0x20 and b not in (0x09, 0x0A) and b not in ALLOWED_PROTOCOL_CTRL_BYTES) or b == 0x7F:
+            return False, f"disallowed control byte 0x{b:02x} at offset {i}"
+        if b == SCRATCH_CTRL_BYTE:
+            if raw[i : i + 3] == SCRATCH_START:
+                if scratch_inner_start is not None:
+                    return False, "nested or unclosed scratchpad frame"
+                scratch_inner_start = i + 3
+                i += 3
+                continue
+            if raw[i : i + 3] == SCRATCH_END:
+                if scratch_inner_start is None:
+                    return False, "unmatched scratchpad end"
+                inner_len = i - scratch_inner_start
+                if inner_len > max_scratch_inner_bytes:
+                    return False, f"scratchpad inner span {inner_len} exceeds {max_scratch_inner_bytes} bytes"
+                scratch_inner_start = None
+                i += 3
+                continue
+            return False, "malformed 0x1D scratchpad delimiter"
+        if scratch_inner_start is not None and b in (TURN_EOT_BYTE, TURN_USER_BYTE):
+            return False, "unclosed scratchpad frame before turn boundary"
+        i += 1
+
+    if scratch_inner_start is not None:
+        return False, "unclosed scratchpad frame at end of record"
+    return True, "ok"
 
 
 def compute_stack_reset_mask(
@@ -451,4 +518,4 @@ def verify_mask_alignment(raw_bytes: bytes, loss_mask: np.ndarray | bytes) -> bo
                 break
         else:
             return False
-    return bool(np.array_equal(mask_arr, expected))
+    return bool(np.array_equal((mask_arr > 0).astype(np.uint8), expected))

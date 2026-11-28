@@ -568,10 +568,15 @@ def _restore_from_archive(archive_src: str, nvme_root: Path) -> None:
 
     print(f"[prepare_vast] Extracting {local_archive} into {nvme_root} ...", flush=True)
     if local_archive.name.endswith(".zst"):
-        subprocess.run(
-            ["tar", "-I", "zstd -d -T0", "-xf", str(local_archive), "-C", str(nvme_root)],
-            check=True,
-        )
+        # Portable pipe works identically on both Linux GNU tar and macOS BSD tar
+        p_zstd = subprocess.Popen(["zstd", "-dc", "-T0", str(local_archive)], stdout=subprocess.PIPE)
+        p_tar = subprocess.Popen(["tar", "-xf", "-", "-C", str(nvme_root)], stdin=p_zstd.stdout)
+        assert p_zstd.stdout is not None
+        p_zstd.stdout.close()
+        rc_tar = p_tar.wait()
+        rc_zstd = p_zstd.wait()
+        if rc_zstd != 0 or rc_tar != 0:
+            raise RuntimeError(f"zstd/tar extract failed (zstd={rc_zstd}, tar={rc_tar}) for {local_archive}")
     else:
         subprocess.run(["tar", "-xzf", str(local_archive), "-C", str(nvme_root)], check=True)
 
@@ -584,10 +589,21 @@ def _pack_archive(nvme_root: Path, out_archive: Path) -> None:
     out_archive.parent.mkdir(parents=True, exist_ok=True)
     print(f"[prepare_vast] Packing shards into {out_archive} ...", flush=True)
     if out_archive.name.endswith(".zst") and shutil.which("zstd"):
-        subprocess.run(
-            ["tar", "-I", "zstd -T0 -3", "-cf", str(out_archive), "-C", str(nvme_root), "data", "cap_data", "sft_data"],
-            check=True,
+        # Portable pipe works identically on both Linux GNU tar and macOS BSD tar
+        p_tar = subprocess.Popen(
+            ["tar", "-cf", "-", "-C", str(nvme_root), "data", "cap_data", "sft_data"],
+            stdout=subprocess.PIPE,
         )
+        p_zstd = subprocess.Popen(
+            ["zstd", "-T0", "-3", "-f", "-o", str(out_archive)],
+            stdin=p_tar.stdout,
+        )
+        assert p_tar.stdout is not None
+        p_tar.stdout.close()
+        rc_zstd = p_zstd.wait()
+        rc_tar = p_tar.wait()
+        if rc_tar != 0 or rc_zstd != 0:
+            raise RuntimeError(f"tar/zstd pack failed (tar={rc_tar}, zstd={rc_zstd}) for {out_archive}")
     else:
         subprocess.run(
             ["tar", "-czf", str(out_archive), "-C", str(nvme_root), "data", "cap_data", "sft_data"],

@@ -410,10 +410,14 @@ class DCPAModelFlat(nn.Module):
             ).view(P, T)
             loss_sgsc_prior = (prior_ce_raw * eff_w_byte).sum() / eff_w_byte.sum().clamp_min(1.0)
 
-            # Spike rate regularization towards target_spike_rate (~1/9.5)
+            # Spike rate regularization via STE: locks zero-loss equilibrium strictly to TRUE discrete
+            # spike rate (eliminating tau_s=1.0 sigmoid tail bias toward fixed max_seg_len=16 chunking!)
             valid_f = valid_byte.float()
-            spike_rate_smooth = (bridge.s_tilde.float() * valid_f).sum() / valid_f.sum().clamp_min(1.0)
-            loss_rate = (spike_rate_smooth - float(cfg.target_spike_rate)).pow(2)
+            valid_denom = valid_f.sum().clamp_min(1.0)
+            spike_rate_hard = (bridge.spikes.float() * valid_f).sum() / valid_denom
+            spike_rate_smooth = (bridge.s_tilde.float() * valid_f).sum() / valid_denom
+            spike_rate_ste = spike_rate_hard.detach() + (spike_rate_smooth - spike_rate_smooth.detach())
+            loss_rate = (spike_rate_ste - float(cfg.target_spike_rate)).pow(2)
             overflow_ratio = bridge.byte_overflow.float().mean()
 
         # Fast Stage-1 sensory warmup path (identical warmup snapshot for 3-way 5k killgate!)
@@ -622,10 +626,10 @@ class DCPAModelFlat(nn.Module):
             unc_err = F.smooth_l1_loss(pred_out.u_n.float(), seg_difficulty, reduction="none")
             loss_unc = (unc_err * seg_v_f).sum() / seg_v_denom
 
-            # Concept variance hinge on `x3` across valid segments to prevent latent collapse
-            x3_f = x3.float()
-            x3_mean = (x3_f * seg_v_f.unsqueeze(-1)).sum(dim=(0, 1)) / seg_v_denom
-            x3_var = ((x3_f - x3_mean.view(1, 1, -1)).pow(2) * seg_v_f.unsqueeze(-1)).sum(dim=(0, 1)) / seg_v_denom
+            # Concept variance hinge on scale-invariant Unit-RMSNorm `x3` (immune to norm_l3_out.weight inflation!)
+            x3_u = self._unit_rmsnorm(x3, eps=cfg.eps)
+            x3_mean = (x3_u * seg_v_f.unsqueeze(-1)).sum(dim=(0, 1)) / seg_v_denom
+            x3_var = ((x3_u - x3_mean.view(1, 1, -1)).pow(2) * seg_v_f.unsqueeze(-1)).sum(dim=(0, 1)) / seg_v_denom
             x3_std = torch.sqrt(x3_var + 1e-6)
             loss_var = F.relu(1.0 - x3_std).mean()
 

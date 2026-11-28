@@ -141,6 +141,11 @@
    - `train_flat.py` 将日志步双 `.item()` 合并为单次 `torch.stack(...).to("cpu")`，非日志 CUDA 步合并为单次 1 字节布尔归约并补齐 `grad_norm_t <= max_healthy_gn` 拦截（消除 9/10 步的 Watchdog 盲区）。
    - `run_flat_killgate_5k.py` 为 Run A / B / C 统一增加 200 步线性 LR 微预热（`0.1 -> 1.0`），并将 `opt` 构造前置到 `enable_compiled_submodules()` 之前。
 
+5. **插件 `moe.norm` 度量空间对齐、`loss_rate` STE 纠偏与 `loss_var` 防缩放作弊（第三轮去重补漏，零 Rust/架构改动）**
+   - [train_plugin.py](../../dcpa-train-py/dcpa/train_plugin.py)：`_collect_layer_hidden_samples` 显式先过 `mod.norm(x)` 再 L2 归一化（修复训练后 `norm.weight` 通道尺度分化导致原型/死区阈值与前向 `DecoupledPluggableMoE` 错位、破坏 Gate E 零漂移契约的隐患）；锚点采样改用全量收集（`max_per_layer=0`）消除前 1,024 截断盲区；默认锚点在 2 批固定网格内按泳道轮转铺满 `en / zh / formal / python / javascript` 5 个通用域（不增加耗时且不与 SQL 目标冲突）。
+   - [model_flat.py](../../dcpa-train-py/dcpa/model_flat.py)：`loss_rate` 改为直通估计 `spike_rate_ste = spike_rate_hard.detach() + (spike_rate_smooth - spike_rate_smooth.detach())`，消除 `tau_s=1.0` Sigmoid 尾部偏置导致的固定 16 字节退化。
+   - [model_flat.py](../../dcpa-train-py/dcpa/model_flat.py)：`loss_var` 改为作用在无参 `_unit_rmsnorm(x3)` 上，彻底封堵通过放大免 WD 的 `norm_l3_out.weight` 绕过方差铰链的漏洞。
+
 ### 留待 5k 门禁通过后、206M 五阶段大训前实施（不阻塞 5k 门禁）
 - **Stage 4 海马体 35GB Autograd 显存炸弹排雷**：利用 `evict_weight` 严格仅 `(u*, v*)` 2 槽非零的数学性质，将理解侧缓冲与表达侧三角求解从 `K=8` 无损化简为 `2` 槽（显存降 4 倍、表达侧求解从 `256³` 降为 `64³`），叠加 `C=32` 块级 Checkpointing、删死张量 `prec_bu_seq`、以及 `is_assim` 保护高显著度 `elig_f`（同步 Rust `absorb_segment`）。
 - **Stage 4 Window Dropout / 长距 Wug 混采** + **Stage 5 同步冻结 `sgsc.theta_raw` 与词干投影** + **Stage 4 海马体新解冻参数组 2x–3x LR 补偿**。

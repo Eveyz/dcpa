@@ -98,16 +98,24 @@ class TrainablePluginModule(nn.Module):
 def _collect_layer_hidden_samples(
     model: DCPAModelFlat,
     batches: Sequence[StaticGridBatch],
-    max_per_layer: int = 1024,
+    max_per_layer: int = 2048,
 ) -> list[torch.Tensor]:
-    """Capture normalized pre-MoE hidden representations `[N_i, D]` across all 8 cortical layers."""
+    """Capture normalized post-`moe.norm` hidden representations `[N_i, D]` across all 8 cortical layers.
+
+    IMPORTANT: `DecoupledPluggableMoE._compute_plugin_residual` and Rust `run_decoupled_moe` compute
+    dead-zone cosines on `x_n = moe.norm(x)`, NOT raw pre-norm `x`. Applying `mod.norm(...)` here
+    keeps prototype initialization, anchor repulsion, and final `tau_floor` strictly aligned on trained bases.
+    """
     n_layers = model.cfg.n_layers
     buckets: list[list[torch.Tensor]] = [[] for _ in range(n_layers)]
     hooks = []
+    quota = max(1, max_per_layer // max(len(batches), 1)) if max_per_layer > 0 else 0
 
     def _make_hook(layer_idx: int):
         def _hook(mod: nn.Module, inp: tuple[torch.Tensor, ...], kw: dict[str, Any]) -> None:
-            x = inp[0].detach().float()
+            raw_x = inp[0].detach()
+            norm_fn = getattr(mod, "norm", None)
+            x = (norm_fn(raw_x) if callable(norm_fn) else raw_x).float()
             x_flat = x.reshape(-1, x.shape[-1])
             mask = kw.get("sample_mask", None)
             if mask is not None:
@@ -116,7 +124,10 @@ def _collect_layer_hidden_samples(
                     x_flat = x_flat[m_flat]
             if x_flat.shape[0] > 0:
                 x_hat = F.normalize(x_flat, dim=-1, eps=1e-6)
-                buckets[layer_idx].append(x_hat[: max(1, max_per_layer // max(len(batches), 1))])
+                if quota > 0 and x_hat.shape[0] > quota:
+                    stride = max(1, x_hat.shape[0] // quota)
+                    x_hat = x_hat[::stride][:quota]
+                buckets[layer_idx].append(x_hat)
         return _hook
 
     for idx, layer in enumerate(model.cortical.layers):
@@ -137,7 +148,9 @@ def _collect_layer_hidden_samples(
     dev = next(model.parameters()).device
     for idx in range(n_layers):
         if buckets[idx]:
-            cat = torch.cat(buckets[idx], dim=0)[:max_per_layer]
+            cat = torch.cat(buckets[idx], dim=0)
+            if max_per_layer > 0:
+                cat = cat[:max_per_layer]
             out.append(cat.to(device=dev))
         else:
             out.append(torch.zeros((1, model.cfg.d_concept), device=dev, dtype=torch.float32))
@@ -159,8 +172,8 @@ def calibrate_plugin_initialization(
     t_min = float(model.cfg.plugin_tau_min if tau_min is None else tau_min)
     dev = next(model.parameters()).device
 
-    target_h = _collect_layer_hidden_samples(model, target_batches)
-    anchor_h = _collect_layer_hidden_samples(model, anchor_batches)
+    target_h = _collect_layer_hidden_samples(model, target_batches, max_per_layer=2048)
+    anchor_h = _collect_layer_hidden_samples(model, anchor_batches, max_per_layer=0)
 
     proto_keys = torch.zeros((n_layers, experts_per_layer, D), device=dev, dtype=torch.float32)
     tau_mat = torch.full((n_layers, experts_per_layer), t_min, device=dev, dtype=torch.float32)
@@ -393,14 +406,17 @@ def load_base_flat_model_from_dir(
 
 
 def _build_default_anchor_batches(cfg: "DCPAFlatConfig", device: torch.device) -> list[StaticGridBatch]:
-    """Built-in general-domain probe anchors guarding non-target 0.0 bit drift during sleep/domain training."""
+    """Built-in 5-domain general probe anchors (en/zh/formal/python/js) packed across 2 static grids."""
     probes = [
         (0, b"The scientific method relies on reproducible experiments, clear hypotheses, and falsifiable measurements.\n\n"),
         (1, "科学方法依赖可重复实验、清晰假设与可证伪的量化检验，任何结论都必须经得起独立复核。\n\n".encode("utf-8")),
+        (2, b"Theorem: If f is continuous on [a, b] and differentiable on (a, b), there exists c with f'(c) = (f(b)-f(a))/(b-a).\n\n"),
+        (3, b"def fib(n: int) -> int:\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n\n"),
+        (5, b"export function debounce(fn, delayMs) {\n  let timer = null;\n  return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), delayMs); };\n}\n\n"),
     ]
     P, T = cfg.grid_lanes, cfg.grid_bytes
     out: list[StaticGridBatch] = []
-    for lid, payload in probes:
+    for batch_idx in range(2):
         x = torch.zeros((P, T), dtype=torch.uint8)
         doc_id = torch.full((P, T), -1, dtype=torch.int32)
         doc_start = torch.zeros((P, T), dtype=torch.bool)
@@ -409,6 +425,7 @@ def _build_default_anchor_batches(cfg: "DCPAFlatConfig", device: torch.device) -
         doc_meta = torch.zeros((P * cfg.doc_meta_cap_per_lane, 3), dtype=torch.int32)
         cur = 0
         for p in range(P):
+            lid, payload = probes[(p + batch_idx * P) % len(probes)]
             pos = 0
             while pos + len(payload) <= T and cur < doc_meta.shape[0]:
                 L = len(payload)

@@ -660,11 +660,12 @@ def prepare_vast_corpus(
         (root / sub).mkdir(parents=True, exist_ok=True)
 
     free_gb = shutil.disk_usage(root).free / (1024**3)
-    # Streaming restore from local/Drive archive or packing directly to Drive needs ~1.1x unpacked size
-    # rather than ~2.0x (unpacked + local compressed copy + build scratch).
+    # spec.min_free_gb already tracks ~1.05x unpacked size (.bin + .loss_mask.bin).
+    # Packing .tar.zst onto the same local NVMe needs extra ~0.25x headroom for the compressed archive.
     pack_off_nvme = bool(pack_archive) and str(pack_archive).startswith(("/content/drive", "/mnt/gdrive"))
     restore_local = bool(from_archive) and not str(from_archive).startswith(("http://", "https://"))
-    eff_min_free_gb = max(4.0, spec.min_free_gb * 0.62) if (restore_local or pack_off_nvme) else spec.min_free_gb
+    local_pack = bool(pack_archive) and not pack_off_nvme
+    eff_min_free_gb = spec.min_free_gb * (1.25 if (local_pack and not restore_local) else 1.0)
     if free_gb < eff_min_free_gb:
         raise RuntimeError(
             f"Insufficient free NVMe space in {root}: {free_gb:.1f} GB available, "

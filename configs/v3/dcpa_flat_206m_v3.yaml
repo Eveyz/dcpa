@@ -17,7 +17,7 @@ model:
   max_seg_len: 16
   d_s: 192
   d_concept: 768
-  n_heads: 8
+  n_heads: 12
   k_slots: 8
   d_r: 32
   d_merge: 256
@@ -68,7 +68,7 @@ data:
 hardware:
   bf16: true
   allow_tf32: true
-  compile_chunks: false
+  compile_chunks: true
   grad_checkpoint: auto      # False on RTX Pro 6000 96G / A100 80G; True on <= 40GB GPUs
   grad_accum_steps: 2        # 262 KB/step global batch (2 x [32, 4096])
 

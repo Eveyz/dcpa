@@ -175,7 +175,7 @@ def _run_textbook_dense_reference_single_doc(
         q_vec[q_idx[0]] = q_val[0]
         f_hip_t = q_vec @ M_l  # [d_s]
         g_sem_t = (q_vec.pow(2) * u_sem).sum().clamp(0.0, 1.0)
-        rho_out_t = torch.sigmoid(hip.alpha_out * (g_sem_t - hip.theta_out))
+        rho_out_t = g_sem_t * torch.sigmoid(hip.alpha_out * (g_sem_t - hip.theta_out))
         out_f_hip.append(f_hip_t)
         out_rho_out.append(rho_out_t)
 
@@ -193,7 +193,7 @@ def _run_textbook_dense_reference_single_doc(
         ach_t = (1.0 - g_slow_t) * (1.0 - g_hip_t)
         mu_t = g_hip_t / (g_slow_t + g_hip_t + cfg.eps)
         c_fused_t = (1.0 - mu_t) * x3_doc[t].float() + mu_t * c_hip_t
-        pi_cort_t = F.softplus(F.linear(x3_doc[t].float(), hip.f_prec_cort.weight.float(), hip.f_prec_cort.bias.float())) + 1e-4
+        pi_cort_t = torch.ones_like(x3_doc[t].float())
         prec_bu_t = (1.0 - ach_t) * pi_cort_t
 
         out_c_hip.append(c_hip_t)
@@ -686,7 +686,7 @@ def test_gradient_flow_scalar_gates_and_whitening() -> None:
     assert torch.isfinite(loss)
     loss.backward()
 
-    # Check ALL trainable parameters (scalar gates, f_prec_cort, and W_whiten) have finite non-zero gradients
+    # Check ALL trainable parameters (scalar gates and W_whiten) have finite non-zero gradients
     for name, param in hip.named_parameters():
         assert param.grad is not None, f"Missing gradient for {name}"
         assert torch.isfinite(param.grad).all(), f"Non-finite gradient for {name}"

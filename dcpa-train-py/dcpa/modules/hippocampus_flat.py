@@ -408,11 +408,6 @@ class HippocampusFlat(nn.Module):
         self.alpha_out = nn.Parameter(torch.tensor(8.0, dtype=torch.float32))
         self.theta_out = nn.Parameter(torch.tensor(0.35, dtype=torch.float32))
 
-        # Bottom-up cortical precision projection pi_cort = Softplus(f_prec_cort(c_slow)) + 1e-4
-        self.f_prec_cort = nn.Linear(D, D, bias=True)
-        nn.init.normal_(self.f_prec_cort.weight, std=0.01)
-        nn.init.constant_(self.f_prec_cort.bias, 0.5413)
-
     def scalar_gate_parameters(self) -> list[nn.Parameter]:
         return [
             self.alpha_1,
@@ -453,16 +448,7 @@ class HippocampusFlat(nn.Module):
         )
 
     def _compute_pi_cort(self, c_slow: torch.Tensor) -> torch.Tensor:
-        return (
-            F.softplus(
-                F.linear(
-                    c_slow.float(),
-                    self.f_prec_cort.weight.float(),
-                    self.f_prec_cort.bias.float() if self.f_prec_cort.bias is not None else None,
-                )
-            )
-            + 1e-4
-        )
+        return torch.ones_like(c_slow, dtype=torch.float32)
 
     def _compute_gamma_slow(self, sem_norm: torch.Tensor, mean_info: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(
@@ -1094,9 +1080,17 @@ class HippocampusFlat(nn.Module):
                     rhs_c = beta_s.unsqueeze(-1) * (ev_t.float() - old_c)  # [P, K, D]
                     gram_c = torch.bmm(e_dense, e_dense.transpose(1, 2))   # [P, K, K]
                     l_c = torch.tril(beta_s.unsqueeze(-1) * gram_c, diagonal=-1)
-                    delta_c = torch.linalg.solve_triangular(
-                        eye_k + l_c, rhs_c, upper=False, unitriangular=True
-                    )  # [P, K, D]
+                    if K <= 8:
+                        # Exact nilpotent identity for K<=8 strictly lower-triangular L (L^8 == 0):
+                        # (I + L)^(-1) = (I - L)(I + L^2)(I + L^4) — zero cuSOLVER launch overhead & compile-native!
+                        l2 = torch.bmm(l_c, l_c)
+                        l4 = torch.bmm(l2, l2)
+                        inv_c = torch.bmm(torch.bmm(eye_k - l_c, eye_k + l2), eye_k + l4)
+                        delta_c = torch.bmm(inv_c, rhs_c)  # [P, K, D]
+                    else:
+                        delta_c = torch.linalg.solve_triangular(
+                            eye_k + l_c, rhs_c, upper=False, unitriangular=True
+                        )  # [P, K, D]
 
                     # Functional out-of-place update of fixed-shape intra-chunk buffer
                     step_b4 = eye_c_bool[s_loc].view(1, Cc, 1, 1)
@@ -1384,7 +1378,11 @@ class HippocampusFlat(nn.Module):
                         gamma_hip=gamma,
                     )
                 gamma_sem_c = torch.stack(gamma_sem_steps, dim=1)
-                rho_out_c = torch.sigmoid(self.alpha_out * (gamma_sem_c - self.theta_out)) * val_c.to(torch.float32)
+                rho_out_c = (
+                    gamma_sem_c
+                    * torch.sigmoid(self.alpha_out * (gamma_sem_c - self.theta_out))
+                    * val_c.to(torch.float32)
+                )
                 rho_out_chunks.append(rho_out_c)
 
                 # Chunk-end fold into m_l_base ONLY for writes matching ending doc & group
@@ -1486,7 +1484,7 @@ class HippocampusFlat(nn.Module):
                 f_hip_raw = torch.einsum("ps,psd->pd", q_val.float(), cols_l) * valid.to(torch.float32).unsqueeze(-1)
                 f_hip_out = f_hip_raw.to(q_concept.dtype)
                 g_sem = (q_val.float().pow(2) * u_sem.gather(1, q_idx)).sum(dim=-1).clamp(0.0, 1.0)
-                rho_out = torch.sigmoid(self.alpha_out * (g_sem - self.theta_out)) * valid.to(torch.float32)
+                rho_out = g_sem * torch.sigmoid(self.alpha_out * (g_sem - self.theta_out)) * valid.to(torch.float32)
 
             # 2. Comprehension read HIPR strictly BEFORE this step's writes
             cur_state = HippocampusChunkState(

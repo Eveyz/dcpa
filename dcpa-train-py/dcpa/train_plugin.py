@@ -106,16 +106,21 @@ def _collect_layer_hidden_samples(
     hooks = []
 
     def _make_hook(layer_idx: int):
-        def _hook(mod: nn.Module, inp: tuple[torch.Tensor, ...]) -> None:
+        def _hook(mod: nn.Module, inp: tuple[torch.Tensor, ...], kw: dict[str, Any]) -> None:
             x = inp[0].detach().float()
             x_flat = x.reshape(-1, x.shape[-1])
+            mask = kw.get("sample_mask", None)
+            if mask is not None:
+                m_flat = mask.detach().reshape(-1).bool()
+                if m_flat.shape[0] == x_flat.shape[0]:
+                    x_flat = x_flat[m_flat]
             if x_flat.shape[0] > 0:
                 x_hat = F.normalize(x_flat, dim=-1, eps=1e-6)
                 buckets[layer_idx].append(x_hat[: max(1, max_per_layer // max(len(batches), 1))])
         return _hook
 
     for idx, layer in enumerate(model.cortical.layers):
-        hooks.append(layer.moe.register_forward_pre_hook(_make_hook(idx)))
+        hooks.append(layer.moe.register_forward_pre_hook(_make_hook(idx), with_kwargs=True))
 
     was_training = model.training
     model.eval()

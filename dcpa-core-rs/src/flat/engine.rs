@@ -244,15 +244,31 @@ impl DcpaFlatEngine {
             0.0
         };
 
-        // 2. Causal diagonal sensory recurrence: h_new = alpha * h + (1 - alpha) * silu(W_u u)
-        let u = &self.weights.sgsc_embed[b_usize * d_s..(b_usize + 1) * d_s];
+        // 2. Doc-masked causal k=3 depthwise byte conv + diagonal sensory recurrence:
+        //    u = w0 * embed[b_t] + w1 * embed[b_{t-1}] + w2 * embed[b_{t-2}] (0 across doc start)
+        let u0 = &self.weights.sgsc_embed[b_usize * d_s..(b_usize + 1) * d_s];
+        let cw0 = &self.weights.sgsc_conv_w[0..d_s];
+        let cw1 = &self.weights.sgsc_conv_w[d_s..2 * d_s];
+        let cw2 = &self.weights.sgsc_conv_w[2 * d_s..3 * d_s];
+        let b_m1 = self.sgsc.prev2_bytes[1];
+        let b_m2 = self.sgsc.prev2_bytes[0];
+        for i in 0..d_s {
+            let mut val = u0[i] * cw0[i];
+            if b_m1 >= 0 {
+                val += self.weights.sgsc_embed[(b_m1 as usize) * d_s + i] * cw1[i];
+            }
+            if b_m2 >= 0 {
+                val += self.weights.sgsc_embed[(b_m2 as usize) * d_s + i] * cw2[i];
+            }
+            self.scratch.ds_c[i] = val;
+        }
         linear_f32(
-            u,
+            &self.scratch.ds_c,
             &self.weights.sgsc_w_alpha_w,
             Some(&self.weights.sgsc_w_alpha_b),
             &mut self.scratch.ds_a,
         );
-        linear_f32(u, &self.weights.sgsc_w_u, None, &mut self.scratch.ds_b);
+        linear_f32(&self.scratch.ds_c, &self.weights.sgsc_w_u, None, &mut self.scratch.ds_b);
         for i in 0..d_s {
             let a = sigmoid(self.scratch.ds_a[i]);
             let b_inj = (1.0 - a) * silu(self.scratch.ds_b[i]);
@@ -572,7 +588,7 @@ impl DcpaFlatEngine {
         let u_n = dot_f32(&self.weights.w_unc_w, &self.scratch.cort_z_hat_6) + self.weights.w_unc_b;
         let refined = u_n > self.tau_think;
         let refine_gate = if refined {
-            sigmoid(u_n - self.tau_think)
+            tanhf(2.0 * (u_n - self.tau_think))
         } else {
             0.0
         };
@@ -633,7 +649,7 @@ impl DcpaFlatEngine {
             if s_idx == 0 {
                 self.scratch.f_hip.fill(0.0);
                 let g_sem = 0.0f32;
-                let rho = sigmoid(self.weights.hip_alpha_out * (g_sem - self.weights.hip_theta_out));
+                let rho = g_sem * sigmoid(self.weights.hip_alpha_out * (g_sem - self.weights.hip_theta_out));
                 for i in 0..d_s {
                     let f_cort = self.scratch.f_slow[i] + self.scratch.f_copy[i];
                     self.scratch.f_out[i] = (1.0 - rho) * f_cort;
@@ -653,7 +669,7 @@ impl DcpaFlatEngine {
                     &self.scratch.phi_val,
                     &mut self.scratch.f_hip,
                 );
-                let rho = sigmoid(self.weights.hip_alpha_out * (g_sem - self.weights.hip_theta_out));
+                let rho = g_sem * sigmoid(self.weights.hip_alpha_out * (g_sem - self.weights.hip_theta_out));
                 for i in 0..d_s {
                     let f_cort = self.scratch.f_slow[i] + self.scratch.f_copy[i];
                     self.scratch.f_out[i] = (1.0 - rho) * f_cort + rho * self.scratch.f_hip[i];
@@ -1081,23 +1097,28 @@ impl DcpaFlatEngine {
             // 5f. End-of-step lazy gamma_hip decay on M(C<-L), M(L<-C), u_lex, u_sem
             self.fast_mem.advance_step();
 
-            // 5g. Update eligibility traces after Write-Before-Merge (`slot_info = None` adapter)
+            // 5g. Update eligibility traces after Write-Before-Merge using true G2 slot attribution & merge pair
             let kappa = cfg.kappa_quench;
             let lam = cfg.lambda_eta;
             for k in 0..k_slots {
                 let eta_q = ((1.0 - kappa * self.scratch.hip_beta[k]) * self.elig.elig_eta[k]).clamp(0.0, 1.0);
                 self.elig.elig_eta[k] = eta_q * lam;
             }
-            // slot_star = argmax_k dot(next_g2.slots[k], c_fused)
-            let mut slot_star = 0usize;
-            let mut best_sim = f32::NEG_INFINITY;
-            for k in 0..k_slots {
-                let sim = dot_f32(&self.g2.slots[k * d_c..(k + 1) * d_c], &self.scratch.hip_c_fused);
-                if sim > best_sim {
-                    best_sim = sim;
-                    slot_star = k;
+            // Asymmetric argmax inheritance into merged parent slot `win_i` (u_star) when merge active
+            if self.scratch.car_merge_active {
+                let wi = self.scratch.car_win_i.min(k_slots - 1);
+                let wj = self.scratch.car_win_j.min(k_slots - 1);
+                let p_star = if self.elig.elig_eta[wi] >= self.elig.elig_eta[wj] { wi } else { wj };
+                if p_star != wi {
+                    let (src_i, dst_i) = (p_star * s_act, wi * s_act);
+                    self.elig.elig_idx.copy_within(src_i..src_i + s_act, dst_i);
+                    self.elig.elig_val.copy_within(src_i..src_i + s_act, dst_i);
+                    let (src_f, dst_f) = (p_star * d_s, wi * d_s);
+                    self.elig.elig_f.copy_within(src_f..src_f + d_s, dst_f);
+                    self.elig.elig_eta[wi] = self.elig.elig_eta[p_star];
                 }
             }
+            let slot_star = self.scratch.car_slot_star.min(k_slots - 1);
             if ach >= self.elig.elig_eta[slot_star] || self.scratch.car_evict_w[slot_star] > 0.5 {
                 self.elig.elig_idx[slot_star * s_act..(slot_star + 1) * s_act]
                     .copy_from_slice(&self.scratch.psi_idx);
@@ -2404,11 +2425,23 @@ fn step_carrier_single(
         scratch.car_edges_mrg[diag..diag + d_r].fill(0.0);
     }
 
-    // Write-Before-Merge eviction weight (G2 -> Hippocampus)
+    // Write-Before-Merge eviction weight & exact dominant slot attribution (G2 -> Hippocampus)
     let ev_int = sigma_full * (1.0 - g_assim);
     scratch.car_evict_w.fill(0.0);
     scratch.car_evict_w[u_star] = ev_int;
     scratch.car_evict_w[v_star] = ev_int;
+    let is_assim = g_assim >= 0.5;
+    let is_merge = !is_assim && (sigma_full >= 0.5);
+    scratch.car_slot_star = if is_assim {
+        k_star
+    } else if is_merge {
+        v_star
+    } else {
+        k_cold
+    };
+    scratch.car_win_i = u_star;
+    scratch.car_win_j = v_star;
+    scratch.car_merge_active = is_merge;
 
     // ------------------------------------------------------------------
     // Smooth interpolation: Stage 1 (assim) vs Stage 2 (empty vs merge)

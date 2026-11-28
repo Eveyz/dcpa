@@ -42,7 +42,8 @@ for _p in (str(_REPO_ROOT), str(_TRAIN_PY)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from data.ragged_dataloader import StaticGridByteDataset
+from data.ragged_dataloader import StaticGridByteDataset, build_static_grid_dataloader
+from dcpa.compile_utils import get_clean_state_dict
 from dcpa.config import DCPAConfig
 from dcpa.interfaces import (
     DCPAFlatConfig,
@@ -52,7 +53,7 @@ from dcpa.interfaces import (
 from dcpa.model import DCPAModel
 from dcpa.model_flat import DCPAModelFlat
 from dcpa.train_plugin import train_additive_plugin_pack
-from utils.device import get_device, synchronize
+from utils.device import amp_autocast, configure_cuda_tf32, get_device, is_bf16_enabled, synchronize
 
 
 @dataclass
@@ -60,10 +61,12 @@ class RunMetrics:
     name: str
     steps_run: int
     avg_kb_s: float
+    steady_kb_s: float
     train_bpc_final: float
     val_bpc_en_zh: float
     val_bpc_code: float
     overflow_ratio: float
+    overflow_byte_ratio: float
     empty_write_rate: float
     expert_cv: float
     unc_nll_corr: float
@@ -132,15 +135,17 @@ def _make_synthetic_grid_batch(
     ).to(device=device)
 
 
-def _eval_flat_bpc(model: DCPAModelFlat, batches: list[StaticGridBatch]) -> tuple[float, float]:
+def _eval_flat_bpc(model: DCPAModelFlat, batches: list[StaticGridBatch], *, use_bf16: bool = False) -> tuple[float, float]:
     """Return `(mean_bpc, pearson_corr(u_n, seg_nll))` in eval threshold mode."""
     model.eval()
+    dev = next(model.parameters()).device
     total_ce = 0.0
     us_all: list[torch.Tensor] = []
     nlls_all: list[torch.Tensor] = []
     with torch.no_grad():
         for b in batches:
-            out = model(b, stage="cortex", hip_enabled=False)
+            with amp_autocast(dev, enabled=use_bf16):
+                out = model(b, stage="cortex", hip_enabled=False)
             total_ce += float(out.loss_lang.item())
             if out.pred is not None:
                 v = out.bridge.seg_valid
@@ -168,16 +173,26 @@ def _eval_flat_bpc(model: DCPAModelFlat, batches: list[StaticGridBatch]) -> tupl
     return bpc, corr
 
 
-def _eval_legacy_bpc(model: DCPAModel, batches: list[StaticGridBatch]) -> float:
-    """Evaluate legacy `DCPAModel` (Run A) on the first lane slice of each `StaticGridBatch`."""
+def _legacy_lane_inputs(b: StaticGridBatch, num_lang_domains: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Extract pad-masked `(raw_bytes, true_lane_lang_ids, valid_loss_weights)` for fair Run A legacy evaluation."""
+    raw = b.x_bytes
+    first_doc_ids = b.doc_id_byte[:, 0].clamp(0, b.doc_meta.shape[0] - 1).to(torch.long)
+    langs = b.doc_meta[first_doc_ids, 0].to(dtype=torch.long).clamp(0, num_lang_domains - 1)
+    # Strictly zero out lane-tail 0x00 padding AND multi-doc stitch boundaries for fair apples-to-apples CE!
+    valid_mask = (b.doc_id_byte >= 0).float() * b.loss_weight.float()
+    return raw, langs, valid_mask
+
+
+def _eval_legacy_bpc(model: DCPAModel, batches: list[StaticGridBatch], *, use_bf16: bool = False) -> float:
+    """Evaluate legacy `DCPAModel` (Run A) with strict pad-masking & true per-lane `lang_ids`."""
     model.eval()
+    dev = next(model.parameters()).device
     total_ce = 0.0
     with torch.no_grad():
         for b in batches:
-            # Evaluate on valid non-padded prefix of each lane for apples-to-apples BPC
-            raw = b.x_bytes
-            langs = b.doc_meta[: raw.shape[0], 0].to(dtype=torch.long).clamp(0, model.cfg.num_lang_domains - 1)
-            out = model(raw, lang_ids=langs, stage="B", use_broca_cq=False)
+            raw, langs, lw = _legacy_lane_inputs(b, model.cfg.num_lang_domains)
+            with amp_autocast(dev, enabled=use_bf16):
+                out = model(raw, lang_ids=langs, stage="B", use_broca_cq=False, loss_weights=lw)
             total_ce += float(out.loss_lang.item())
     return (total_ce / max(len(batches), 1)) / math.log(2.0)
 
@@ -228,69 +243,121 @@ def _run_gate_b_512_step_stress(model: DCPAModelFlat, device: torch.device, stre
     }
 
 
+def _make_batch_stream(
+    cfg: DCPAFlatConfig,
+    *,
+    bin_path: Optional[str],
+    idx_path: Optional[str],
+    total_batches: int,
+    seed: int,
+    device: torch.device,
+    domain_weights: Optional[dict[int, float]] = None,
+) -> Any:
+    """Create a streaming batch iterator (zero multi-GB VRAM pre-allocation on real shards)."""
+    if bin_path and idx_path:
+        use_cuda = device.type == "cuda"
+        loader = build_static_grid_dataloader(
+            bin_path=bin_path,
+            idx_path=idx_path,
+            grid_lanes=cfg.grid_lanes,
+            grid_bytes=cfg.grid_bytes,
+            doc_meta_cap_per_lane=cfg.doc_meta_cap_per_lane,
+            domain_weights=domain_weights,
+            num_batches=total_batches,
+            num_workers=2 if use_cuda else 0,
+            pin_memory=use_cuda,
+            seed=seed,
+        )
+        for b in loader:
+            yield b.to(device=device, non_blocking=use_cuda)
+    else:
+        synth = [
+            _make_synthetic_grid_batch(cfg, lang_id=lid, seed=seed + i, device=device)
+            for i, lid in enumerate((0, 1, 3, 5, 0, 1, 2, 4))
+        ]
+        for idx in range(total_batches):
+            yield synth[idx % len(synth)]
+
+
 def _train_flat_branch(
     name: str,
     cfg: DCPAFlatConfig,
     sensory_state: dict[str, torch.Tensor],
-    train_batches: list[StaticGridBatch],
+    batch_factory: Any,
     val_en_zh: list[StaticGridBatch],
     val_code: list[StaticGridBatch],
     *,
     steps: int,
     device: torch.device,
+    use_bf16: bool = False,
+    compile_chunks: bool = False,
 ) -> tuple[DCPAModelFlat, RunMetrics]:
     """Train one DCPA-Flat branch starting from the shared Step-800 sensory warmup snapshot."""
     torch.manual_seed(42)
     model = DCPAModelFlat(cfg).to(device=device)
-    # Load shared sensory warmup weights (strict=False only for optional sem_ring delta)
     model.sgsc.load_state_dict(sensory_state["sgsc"])
     model.pmd.load_state_dict(sensory_state["pmd"])
     model.set_stage_mode("cortex")
+    if compile_chunks and device.type == "cuda":
+        model.enable_compiled_submodules(device)
     model.train()
 
     opt = torch.optim.AdamW(model.parameter_groups())
 
     total_bytes = 0
+    steady_bytes = 0
+    steady_start = min(20, max(0, int(steps) // 5))
     synchronize(device)
     t0 = time.perf_counter()
+    t_steady = t0
 
     last_out = None
     expert_count_acc: Optional[torch.Tensor] = None
-    for s_idx in range(int(steps)):
-        b = train_batches[s_idx % len(train_batches)]
+    for s_idx, b in enumerate(batch_factory(steps)):
+        if s_idx == steady_start:
+            synchronize(device)
+            t_steady = time.perf_counter()
         opt.zero_grad(set_to_none=True)
-        out = model(b, stage="cortex", hip_enabled=False)
+        with amp_autocast(device, enabled=use_bf16):
+            out = model(b, stage="cortex", hip_enabled=False)
         out.loss_total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
         opt.step()
         model.post_optimizer_step(out)
-        total_bytes += int(b.x_bytes.numel())
+        n_b = int(b.x_bytes.numel())
+        total_bytes += n_b
+        if s_idx >= steady_start:
+            steady_bytes += n_b
         last_out = out
         if out.expert_counts:
             stacked = torch.stack([c.detach().float() for c in out.expert_counts], dim=0)
             expert_count_acc = stacked if expert_count_acc is None else (expert_count_acc + stacked)
 
     synchronize(device)
-    dt = max(time.perf_counter() - t0, 1e-6)
-    kb_s = (total_bytes / 1024.0) / dt
+    t_end = time.perf_counter()
+    kb_s = (total_bytes / 1024.0) / max(t_end - t0, 1e-6)
+    steady_kb_s = (steady_bytes / 1024.0) / max(t_end - t_steady, 1e-6) if steady_bytes > 0 else kb_s
 
-    val_bpc_ez, corr = _eval_flat_bpc(model, val_en_zh)
-    val_bpc_cd, _ = _eval_flat_bpc(model, val_code)
+    val_bpc_ez, corr = _eval_flat_bpc(model, val_en_zh, use_bf16=use_bf16)
+    val_bpc_cd, _ = _eval_flat_bpc(model, val_code, use_bf16=use_bf16)
 
     m = last_out.materialize_metrics() if last_out is not None else {}
     cv = 0.0
     if expert_count_acc is not None:
         mean_c = expert_count_acc.mean(dim=-1, keepdim=True).clamp_min(1e-6)
         cv = float((expert_count_acc.std(dim=-1) / mean_c.squeeze(-1)).mean().item())
+    ovf = float(m.get("overflow_byte_ratio", 0.0))
 
     return model, RunMetrics(
         name=name,
         steps_run=int(steps),
         avg_kb_s=kb_s,
+        steady_kb_s=steady_kb_s,
         train_bpc_final=float(m.get("loss_lang", 0.0)) / math.log(2.0),
         val_bpc_en_zh=val_bpc_ez,
         val_bpc_code=val_bpc_cd,
-        overflow_ratio=float(m.get("overflow_byte_ratio", 0.0)),
+        overflow_ratio=ovf,
+        overflow_byte_ratio=ovf,
         empty_write_rate=float(m.get("empty_write_rate", 0.0)),
         expert_cv=cv,
         unc_nll_corr=corr,
@@ -299,14 +366,15 @@ def _train_flat_branch(
 
 def _train_legacy_branch(
     legacy_cfg: DCPAConfig,
-    train_batches: list[StaticGridBatch],
+    batch_factory: Any,
     val_en_zh: list[StaticGridBatch],
     val_code: list[StaticGridBatch],
     *,
     steps: int,
     device: torch.device,
+    use_bf16: bool = False,
 ) -> RunMetrics:
-    """Run A: legacy `DCPAModel` baseline over the same number of steps & data stream."""
+    """Run A: legacy `DCPAModel` baseline over the same pad-masked data stream & steps."""
     torch.manual_seed(42)
     model = DCPAModel(legacy_cfg).to(device=device)
     model.train()
@@ -316,12 +384,11 @@ def _train_legacy_branch(
     synchronize(device)
     t0 = time.perf_counter()
     last_loss = 0.0
-    for s_idx in range(int(steps)):
-        b = train_batches[s_idx % len(train_batches)]
-        raw = b.x_bytes
-        langs = b.doc_meta[: raw.shape[0], 0].to(dtype=torch.long).clamp(0, legacy_cfg.num_lang_domains - 1)
+    for b in batch_factory(steps):
+        raw, langs, lw = _legacy_lane_inputs(b, legacy_cfg.num_lang_domains)
         opt.zero_grad(set_to_none=True)
-        out = model(raw, lang_ids=langs, stage="B", use_broca_cq=False)
+        with amp_autocast(device, enabled=use_bf16):
+            out = model(raw, lang_ids=langs, stage="B", use_broca_cq=False, loss_weights=lw)
         out.loss_total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), legacy_cfg.grad_clip_norm)
         opt.step()
@@ -336,10 +403,12 @@ def _train_legacy_branch(
         name="Run_A_Legacy_Baseline",
         steps_run=int(steps),
         avg_kb_s=kb_s,
+        steady_kb_s=kb_s,
         train_bpc_final=last_loss / math.log(2.0),
-        val_bpc_en_zh=_eval_legacy_bpc(model, val_en_zh),
-        val_bpc_code=_eval_legacy_bpc(model, val_code),
+        val_bpc_en_zh=_eval_legacy_bpc(model, val_en_zh, use_bf16=use_bf16),
+        val_bpc_code=_eval_legacy_bpc(model, val_code, use_bf16=use_bf16),
         overflow_ratio=0.0,
+        overflow_byte_ratio=0.0,
         empty_write_rate=0.0,
         expert_cv=0.0,
         unc_nll_corr=0.0,
@@ -357,8 +426,11 @@ def run_killgate(
     val_bin_path: Optional[str] = None,
     val_idx_path: Optional[str] = None,
     out_json: Optional[str] = None,
+    compile_chunks: bool = True,
 ) -> dict[str, Any]:
     device = torch.device("cpu") if smoke else get_device()
+    configure_cuda_tf32(device, allow=True)
+    use_bf16 = False if smoke else is_bf16_enabled(device, enabled=True)
     if smoke:
         cfg_c = DCPAFlatConfig.flat_micro()
         cfg_b = DCPAFlatConfig.flat_micro()
@@ -378,35 +450,39 @@ def run_killgate(
         eff_plugin = int(plugin_steps)
         stress_steps = 512
 
-    # Build data batches (real shards if supplied, otherwise deterministic multi-domain synthetic batches)
-    if bin_path and idx_path:
-        ds = StaticGridByteDataset(
+    def _train_stream(n_steps: int, seed_offset: int = 0) -> Any:
+        return _make_batch_stream(
+            cfg_c,
             bin_path=bin_path,
             idx_path=idx_path,
-            grid_lanes=cfg_c.grid_lanes,
-            grid_bytes=cfg_c.grid_bytes,
-            num_batches=max(eff_warmup + eff_steps, 16),
-            seed=42,
+            total_batches=n_steps,
+            seed=42 + seed_offset,
+            device=device,
         )
-        train_batches = [b.to(device=device) for b in ds]
-    else:
-        train_batches = [
-            _make_synthetic_grid_batch(cfg_c, lang_id=lid, seed=100 + i, device=device)
-            for i, lid in enumerate((0, 1, 3, 5, 0, 1, 2, 4))
-        ]
 
     if val_bin_path and val_idx_path:
-        v_ds = StaticGridByteDataset(
-            bin_path=val_bin_path,
-            idx_path=val_idx_path,
-            grid_lanes=cfg_c.grid_lanes,
-            grid_bytes=cfg_c.grid_bytes,
-            num_batches=4,
-            seed=999,
+        val_en_zh = list(
+            _make_batch_stream(
+                cfg_c,
+                bin_path=val_bin_path,
+                idx_path=val_idx_path,
+                total_batches=4,
+                seed=999,
+                device=device,
+                domain_weights={0: 0.5, 1: 0.5},
+            )
         )
-        val_all = [b.to(device=device) for b in v_ds]
-        val_en_zh = val_all[:2]
-        val_code = val_all[2:] if len(val_all) > 2 else val_all
+        val_code = list(
+            _make_batch_stream(
+                cfg_c,
+                bin_path=val_bin_path,
+                idx_path=val_idx_path,
+                total_batches=4,
+                seed=1999,
+                device=device,
+                domain_weights={3: 0.5, 5: 0.5},
+            )
+        )
     else:
         val_en_zh = [
             _make_synthetic_grid_batch(cfg_c, lang_id=LANG_DOMAINS_V3["en"], seed=701, device=device),
@@ -423,29 +499,52 @@ def run_killgate(
     warmup_model.set_stage_mode("sensory")
     warmup_model.train()
     w_opt = torch.optim.AdamW(warmup_model.parameter_groups())
-    for w_i in range(eff_warmup):
-        b = train_batches[w_i % len(train_batches)]
+    for b in _train_stream(eff_warmup, seed_offset=0):
         w_opt.zero_grad(set_to_none=True)
-        w_out = warmup_model(b, stage="sensory", hip_enabled=False)
+        with amp_autocast(device, enabled=use_bf16):
+            w_out = warmup_model(b, stage="sensory", hip_enabled=False)
         w_out.loss_total.backward()
         torch.nn.utils.clip_grad_norm_(warmup_model.parameters(), cfg_c.grad_clip_norm)
         w_opt.step()
 
     sensory_state = {
-        "sgsc": {k: v.detach().clone() for k, v in warmup_model.sgsc.state_dict().items()},
-        "pmd": {k: v.detach().clone() for k, v in warmup_model.pmd.state_dict().items()},
+        "sgsc": {k: v.detach().clone() for k, v in get_clean_state_dict(warmup_model.sgsc).items()},
+        "pmd": {k: v.detach().clone() for k, v in get_clean_state_dict(warmup_model.pmd).items()},
     }
+    del warmup_model, w_opt
 
-    # Three-way homologous fork: Run A (legacy), Run B (Flat pure K=8), Run C (Flat + 3-layer W=128)
+    # Three-way homologous fork on identical deterministic post-warmup stream (seed_offset=1000)
+    fork_stream = lambda n: _train_stream(n, seed_offset=1000)
     run_a = _train_legacy_branch(
-        legacy_cfg, train_batches, val_en_zh, val_code, steps=eff_steps, device=device
+        legacy_cfg, fork_stream, val_en_zh, val_code, steps=eff_steps, device=device, use_bf16=use_bf16
     )
     _, run_b = _train_flat_branch(
-        "Run_B_Flat_Pure_K8", cfg_b, sensory_state, train_batches, val_en_zh, val_code, steps=eff_steps, device=device
+        "Run_B_Flat_Pure_K8",
+        cfg_b,
+        sensory_state,
+        fork_stream,
+        val_en_zh,
+        val_code,
+        steps=eff_steps,
+        device=device,
+        use_bf16=use_bf16,
+        compile_chunks=(compile_chunks and not smoke),
     )
     model_c, run_c = _train_flat_branch(
-        "Run_C_Flat_W128_3Layer", cfg_c, sensory_state, train_batches, val_en_zh, val_code, steps=eff_steps, device=device
+        "Run_C_Flat_W128_3Layer",
+        cfg_c,
+        sensory_state,
+        fork_stream,
+        val_en_zh,
+        val_code,
+        steps=eff_steps,
+        device=device,
+        use_bf16=use_bf16,
+        compile_chunks=(compile_chunks and not smoke),
     )
+
+    # Unwrap compiled submodules before variable-shape Gate B (P=2, S=512) & Gate E plugin training
+    model_c.disable_compiled_submodules()
 
     # Gate B: 512-step (128-step in smoke) long-horizon Carrier gradient check
     gate_b = _run_gate_b_512_step_stress(model_c, device=device, stress_steps=stress_steps)
@@ -502,6 +601,7 @@ def main() -> None:
     ap.add_argument("--val-bin", dest="val_bin_path", default=None)
     ap.add_argument("--val-idx", dest="val_idx_path", default=None)
     ap.add_argument("--out-json", default=None)
+    ap.add_argument("--no-compile", action="store_true", help="Disable torch.compile on CUDA branches")
     args = ap.parse_args()
 
     res = run_killgate(
@@ -514,6 +614,7 @@ def main() -> None:
         val_bin_path=args.val_bin_path,
         val_idx_path=args.val_idx_path,
         out_json=args.out_json,
+        compile_chunks=(not args.no_compile),
     )
     print(json.dumps(res, indent=2))
     assert res["gate_b_stress"]["passed"], f"Gate B failed: {res['gate_b_stress']}"

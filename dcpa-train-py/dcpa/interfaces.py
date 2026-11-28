@@ -178,7 +178,7 @@ class DCPAFlatConfig:
     lambda_unc: float = 0.1
     lambda_dg: float = 0.05
     lambda_rate: float = 2.0
-    lambda_halt: float = 1.0
+    lambda_halt: float = 0.2
     lambda_var: float = 1.0
     lambda_sgsc_prior: float = 0.2
 
@@ -300,7 +300,7 @@ class DCPAFlatConfig:
             hip_chunk_size=32,
             d_s=192,
             d_concept=768,
-            n_heads=8,
+            n_heads=12,
             k_slots=8,
             d_r=32,
             d_merge=256,
@@ -328,7 +328,7 @@ class DCPAFlatConfig:
             hip_chunk_size=32,
             d_s=256,
             d_concept=1024,
-            n_heads=8,
+            n_heads=16,
             k_slots=8,
             d_r=32,
             d_merge=384,

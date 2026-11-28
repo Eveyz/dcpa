@@ -247,6 +247,7 @@ pub struct DcpaFlatWeights {
     pub sgsc_w_alpha_w: Vec<f32>,  // [d_s, d_s]
     pub sgsc_w_alpha_b: Vec<f32>,  // [d_s]
     pub sgsc_w_u: Vec<f32>,        // [d_s, d_s]
+    pub sgsc_conv_w: Vec<f32>,     // [3 * d_s] doc-masked causal k=3 depthwise conv
     pub sgsc_theta_raw: f32,
     pub sgsc_w_q: Vec<f32>,        // [d_s, d_s]
     pub sgsc_w_k: Vec<f32>,        // [d_s, d_s]
@@ -292,8 +293,6 @@ pub struct DcpaFlatWeights {
     pub hip_theta_q: f32,
     pub hip_alpha_out: f32,
     pub hip_theta_out: f32,
-    pub hip_f_prec_cort_w: Vec<f32>, // [D, D]
-    pub hip_f_prec_cort_b: Vec<f32>, // [D]
 
     // Module 4.5: Pure f_stem HolographicCopyRing
     pub copy_norm_q: Vec<f32>,  // [D]
@@ -531,6 +530,7 @@ impl DcpaFlatWeights {
             sgsc_w_alpha_w: take_vec(&mut map, "sgsc.w_alpha.weight")?,
             sgsc_w_alpha_b: take_vec(&mut map, "sgsc.w_alpha.bias")?,
             sgsc_w_u: take_vec(&mut map, "sgsc.w_u.weight")?,
+            sgsc_conv_w: take_vec(&mut map, "sgsc.conv_w")?,
             sgsc_theta_raw: take_scalar(&mut map, "sgsc.theta_raw")?,
             sgsc_w_q: take_vec(&mut map, "sgsc.w_q.weight")?,
             sgsc_w_k: take_vec(&mut map, "sgsc.w_k.weight")?,
@@ -573,8 +573,6 @@ impl DcpaFlatWeights {
             hip_theta_q: take_scalar(&mut map, "hippocampus.theta_q")?,
             hip_alpha_out: take_scalar(&mut map, "hippocampus.alpha_out")?,
             hip_theta_out: take_scalar(&mut map, "hippocampus.theta_out")?,
-            hip_f_prec_cort_w: take_vec(&mut map, "hippocampus.f_prec_cort.weight")?,
-            hip_f_prec_cort_b: take_vec(&mut map, "hippocampus.f_prec_cort.bias")?,
 
             copy_norm_q: take_vec(&mut map, "copy_ring.norm_q.weight")?,
             copy_w_q: take_vec(&mut map, "copy_ring.w_q.weight")?,

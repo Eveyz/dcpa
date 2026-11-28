@@ -207,6 +207,15 @@ class ContractiveGraphCarrier(nn.Module):
         self.register_buffer("off_diag_mask", off_diag.view(1, K, K, 1), persistent=False)
 
         self._init_weights()
+        self._compiled_forward_chunk: Any = None
+
+    def enable_compiled_chunk(self, **compile_kwargs: Any) -> None:
+        """Compile static `C = c_scan` chunk step for CUDA acceleration."""
+        if hasattr(torch, "compile"):
+            self._compiled_forward_chunk = torch.compile(self.forward_chunk, **compile_kwargs)
+
+    def disable_compiled_chunk(self) -> None:
+        self._compiled_forward_chunk = None
 
     def _init_weights(self) -> None:
         K, D = self.k_slots, self.d_concept
@@ -285,14 +294,8 @@ class ContractiveGraphCarrier(nn.Module):
         pin_trig: Optional[torch.Tensor] = None,
         unpin_trig: Optional[torch.Tensor] = None,
         hip_inject: Optional[torch.Tensor] = None,
-    ) -> tuple[
-        CarrierGraphState,
-        CarrierGraphState,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+        return_slot_info: bool = False,
+    ) -> tuple[Any, ...]:
         """Execute one strictly branchless contractive graph transition step.
 
         Args:
@@ -634,6 +637,19 @@ class ContractiveGraphCarrier(nn.Module):
             slot0_pinned=pinned_next,
         )
         out_state = prior_state if self.return_prior else next_state
+        if return_slot_info:
+            is_assim = g_assim.squeeze(-1) >= 0.5
+            is_merge = (~is_assim) & (sigma_full >= 0.5)
+            u_star = torch.minimum(win_i, win_j)
+            v_star = torch.maximum(win_i, win_j)
+            slot_star = torch.where(is_assim, k_star, torch.where(is_merge, v_star, k_cold))
+            slot_info = {
+                "slot_assign": slot_star,
+                "win_i": u_star,
+                "win_j": v_star,
+                "merge_active": is_merge,
+            }
+            return next_state, out_state, evict_weight, slots_pre, empty_write, has_empty_valid, slot_info
         return next_state, out_state, evict_weight, slots_pre, empty_write, has_empty_valid
 
     def forward_chunk(
@@ -724,7 +740,8 @@ class ContractiveGraphCarrier(nn.Module):
         torch.Tensor,
     ]:
         st = CarrierGraphState(slots=slots, edges=edges, occ=occ, slot0_pinned=pinned)
-        s_seq, e_seq, o_seq, nxt, ew_seq, et_seq, ew_num, ew_den = self.forward_chunk(
+        chunk_fn = self._compiled_forward_chunk if self._compiled_forward_chunk is not None else self.forward_chunk
+        s_seq, e_seq, o_seq, nxt, ew_seq, et_seq, ew_num, ew_den = chunk_fn(
             st, x_chunk, reset_chunk, valid_chunk, pin_chunk, unpin_chunk, hip_chunk
         )
         return (
@@ -815,7 +832,8 @@ class ContractiveGraphCarrier(nn.Module):
                 )
                 cur = CarrierGraphState(slots=ns, edges=ne, occ=no, slot0_pinned=npin)
             else:
-                s_seq, e_seq, o_seq, cur, ew_seq, et_seq, ew_num, ew_den = self.forward_chunk(
+                chunk_fn = self._compiled_forward_chunk if self._compiled_forward_chunk is not None else self.forward_chunk
+                s_seq, e_seq, o_seq, cur, ew_seq, et_seq, ew_num, ew_den = chunk_fn(
                     cur, xc, rc, vc, pc, uc, hc
                 )
 

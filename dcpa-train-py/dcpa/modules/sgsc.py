@@ -471,6 +471,9 @@ class SGSCFlat(nn.Module):
         raw_init = math.log(math.expm1(target_delta)) / max(cfg.lif_theta_scale, 1e-6)
         self.theta_raw = nn.Parameter(torch.tensor(raw_init, dtype=torch.float32))
 
+        # Doc-masked causal k=3 depthwise conv weights [3, d_s] (tap 0=cur, 1=t-1, 2=t-2)
+        self.conv_w = nn.Parameter(torch.zeros((3, d_s), dtype=torch.float32))
+
         # Holographic RoPE phase-bound stem extractor
         self.w_q = nn.Linear(d_s, d_s, bias=False)
         self.w_k = nn.Linear(d_s, d_s, bias=False)
@@ -508,6 +511,9 @@ class SGSCFlat(nn.Module):
         nn.init.xavier_uniform_(self.w_alpha.weight)
         nn.init.constant_(self.w_alpha.bias, 1.0)
         nn.init.xavier_uniform_(self.w_u.weight, gain=math.sqrt(2.0))
+        with torch.no_grad():
+            self.conv_w.zero_()
+            self.conv_w[0].fill_(1.0)
         nn.init.xavier_uniform_(self.w_q.weight)
         nn.init.xavier_uniform_(self.w_k.weight)
         nn.init.xavier_uniform_(self.w_f.weight)
@@ -579,7 +585,21 @@ class SGSCFlat(nn.Module):
             scan_reset = torch.ones((P, T), device=device, dtype=torch.bool)
 
         byte_ids = raw_bytes.to(torch.long)
-        u = self.embed(byte_ids)  # [P, T, d_s]
+        u0 = self.embed(byte_ids)  # [P, T, d_s]
+        # Strictly document-isolated causal k=3 depthwise shift (never leaks across lane doc boundaries!)
+        if T > 1:
+            valid_m1 = (~scan_reset) & byte_valid
+            u_m1 = torch.cat([torch.zeros_like(u0[:, :1, :]), u0[:, :-1, :]], dim=1) * valid_m1.unsqueeze(-1).to(u0.dtype)
+        else:
+            u_m1 = torch.zeros_like(u0)
+        if T > 2:
+            prev_not_rst = torch.cat([torch.zeros((P, 1), device=device, dtype=torch.bool), ~scan_reset[:, :-1]], dim=1)
+            valid_m2 = (~scan_reset) & prev_not_rst & byte_valid
+            u_m2 = torch.cat([torch.zeros((P, 2, d_s), device=device, dtype=u0.dtype), u0[:, :-2, :]], dim=1) * valid_m2.unsqueeze(-1).to(u0.dtype)
+        else:
+            u_m2 = torch.zeros_like(u0)
+        cw = self.conv_w.to(dtype=u0.dtype)
+        u = u0 * cw[0] + u_m1 * cw[1] + u_m2 * cw[2]
         alpha = torch.sigmoid(self.w_alpha(u))
         b_inj = (1.0 - alpha) * F.silu(self.w_u(u))
 
@@ -770,7 +790,7 @@ class SGSCFlat(nn.Module):
             utf8_rem=torch.zeros((B,), device=dev, dtype=torch.int32),
             ast_depth=torch.zeros((B,), device=dev, dtype=torch.int32),
             seg_start_depth=torch.zeros((B,), device=dev, dtype=torch.int32),
-            prev2_bytes=torch.zeros((B, 2), device=dev, dtype=torch.int32),
+            prev2_bytes=torch.full((B, 2), -1, device=dev, dtype=torch.int32),
             seg_pin=torch.zeros((B,), device=dev, dtype=torch.bool),
             seg_unpin=torch.zeros((B,), device=dev, dtype=torch.bool),
             seg_h_buf=torch.zeros((B, self.cfg.max_seg_len, self.cfg.d_s), device=dev, dtype=dtype),
@@ -801,7 +821,13 @@ class SGSCFlat(nn.Module):
         b_long = byte_val.to(torch.long).view(B)
         b_i32 = byte_val.to(torch.int32).view(B)
 
-        u = self.embed(b_long)  # [B, d_s]
+        u0 = self.embed(b_long)  # [B, d_s]
+        b_m1 = state.prev2_bytes[:, 1]
+        b_m2 = state.prev2_bytes[:, 0]
+        u_m1 = self.embed(b_m1.clamp_min(0).to(torch.long)) * (b_m1 >= 0).unsqueeze(-1).to(u0.dtype)
+        u_m2 = self.embed(b_m2.clamp_min(0).to(torch.long)) * (b_m2 >= 0).unsqueeze(-1).to(u0.dtype)
+        cw = self.conv_w.to(dtype=u0.dtype)
+        u = u0 * cw[0] + u_m1 * cw[1] + u_m2 * cw[2]
         alpha = torch.sigmoid(self.w_alpha(u))
         b_inj = (1.0 - alpha) * F.silu(self.w_u(u))
 

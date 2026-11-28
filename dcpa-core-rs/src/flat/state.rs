@@ -100,7 +100,7 @@ impl FlatSgscState {
             utf8_rem: 0,
             ast_depth: 0,
             seg_start_depth: 0,
-            prev2_bytes: [0, 0],
+            prev2_bytes: [-1, -1],
             seg_pin: false,
             seg_unpin: false,
             seg_h_buf: vec![0.0f32; cfg.max_seg_len * cfg.d_s],
@@ -117,7 +117,7 @@ impl FlatSgscState {
         self.utf8_rem = 0;
         self.ast_depth = 0;
         self.seg_start_depth = 0;
-        self.prev2_bytes = [0, 0];
+        self.prev2_bytes = [-1, -1];
         self.seg_pin = false;
         self.seg_unpin = false;
         self.seg_h_buf.fill(0.0);
@@ -423,6 +423,10 @@ pub struct FlatScratchPool {
     pub car_delta_m: Vec<f32>,    // [D]
     pub car_evict_w: Vec<f32>,    // [K]
     pub car_g_sum: Vec<f32>,      // [D]
+    pub car_slot_star: usize,
+    pub car_win_i: usize,
+    pub car_win_j: usize,
+    pub car_merge_active: bool,
 
     // Shared Graph KV scratch (`K_G`, `V_G`, `occ_log_prior`, `rel_bias`)
     pub gkv_k: Vec<f32>,        // [H * K * Dh]
@@ -588,6 +592,10 @@ impl FlatScratchPool {
             car_delta_m: vec![0.0; d],
             car_evict_w: vec![0.0; k],
             car_g_sum: vec![0.0; d],
+            car_slot_star: 0,
+            car_win_i: 0,
+            car_win_j: 0,
+            car_merge_active: false,
 
             gkv_k: vec![0.0; h * k * cfg.d_head()],
             gkv_v: vec![0.0; h * k * cfg.d_head()],

@@ -123,20 +123,14 @@ class DCPAModelFlat(nn.Module):
         # Sensory warmup bypass head (Stage 1: maps x0_prev -> f_out_seg when bypassing cortex/carriers)
         self.w_sensory_bypass = nn.Linear(D, d_s, bias=False)
 
-        # 7. JEPA predictive head + slow EMA target encoder on L3 output (`x3`)
+        # 7. JEPA predictive head on strictly causal `z_hat` -> parameter-free Unit-RMSNorm(`x3.detach()`)
         self.jepa_pred = nn.Sequential(
             nn.Linear(D, D, bias=False),
             nn.SiLU(),
             nn.Linear(D, D, bias=False),
         )
-        self.jepa_target_online = nn.Linear(D, D, bias=False)
-        self.jepa_target_ema = nn.Linear(D, D, bias=False)
-        self.jepa_norm = RMSNorm(D, eps=cfg.eps)
 
         self._init_top_weights()
-        self._sync_jepa_ema(momentum=0.0)
-        for p in self.jepa_target_ema.parameters():
-            p.requires_grad_(False)
 
     def _init_top_weights(self) -> None:
         nn.init.normal_(self.bos_concept, std=0.02)
@@ -144,15 +138,14 @@ class DCPAModelFlat(nn.Module):
         nn.init.xavier_uniform_(self.w_delta_syn.weight, gain=0.2)
         nn.init.zeros_(self.w_delta_syn.bias)
         nn.init.xavier_uniform_(self.w_sensory_bypass.weight, gain=0.5)
-        nn.init.eye_(self.jepa_target_online.weight)
         nn.init.xavier_uniform_(self.jepa_pred[0].weight)
         nn.init.normal_(self.jepa_pred[2].weight, std=0.02)
 
-    @torch.no_grad()
-    def _sync_jepa_ema(self, momentum: Optional[float] = None) -> None:
-        m = float(self.cfg.jepa_ema_momentum if momentum is None else momentum)
-        for p_ema, p_on in zip(self.jepa_target_ema.parameters(), self.jepa_target_online.parameters()):
-            p_ema.data.mul_(m).add_(p_on.data, alpha=1.0 - m)
+    @staticmethod
+    def _unit_rmsnorm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """Parameter-free Unit-RMSNorm: norm = sqrt(D), O(1) per-dim MSE, immune to scale collapse."""
+        xf = x.float()
+        return xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
 
     def _g2_carrier_step_adapter(
         self,
@@ -163,8 +156,8 @@ class DCPAModelFlat(nn.Module):
         pin_trig: torch.Tensor,
         unpin_trig: torch.Tensor,
     ) -> tuple[CarrierGraphState, CarrierGraphState, torch.Tensor, torch.Tensor, Any]:
-        """Bridge `ContractiveGraphCarrier.step_single` (6-tuple) to `HippocampusFlat`'s `CarrierStepFn` (5-tuple)."""
-        next_state, prior_state, evict_weight, evict_target, _empty_write, _has_empty = (
+        """Bridge `ContractiveGraphCarrier.step_single(..., return_slot_info=True)` to `HippocampusFlat`."""
+        next_state, prior_state, evict_weight, evict_target, _empty_write, _has_empty, slot_info = (
             self.carrier_g2.step_single(
                 state=state,
                 x_in=x_in,
@@ -172,9 +165,10 @@ class DCPAModelFlat(nn.Module):
                 seg_valid=valid,
                 pin_trig=pin_trig,
                 unpin_trig=unpin_trig,
+                return_slot_info=True,
             )
         )
-        return next_state, prior_state, evict_weight, evict_target, None
+        return next_state, prior_state, evict_weight, evict_target, slot_info
 
     # ------------------------------------------------------------------
     # Plugin Hot-Mount & Stage Freeze Controls
@@ -198,8 +192,6 @@ class DCPAModelFlat(nn.Module):
         """Configure trainable parameters for developmental stages."""
         for p in self.parameters():
             p.requires_grad_(True)
-        for p in self.jepa_target_ema.parameters():
-            p.requires_grad_(False)
         if mode == "sensory":
             for mod in (self.carrier_g1, self.carrier_g2, self.cortical, self.hippocampus, self.copy_ring):
                 for p in mod.parameters():
@@ -232,8 +224,7 @@ class DCPAModelFlat(nn.Module):
         cort_n = _count_all(self.cortical)
         hip_n = _count_all(self.hippocampus)
         ring_n = _count_all(self.copy_ring)
-        ema_ids = {id(p) for p in self.jepa_target_ema.parameters()}
-        trainable_total = sum(p.numel() for p in self.parameters() if id(p) not in ema_ids)
+        trainable_total = sum(p.numel() for p in self.parameters())
         buffers_total = sum(b.numel() for b in self.buffers())
 
         # Average active parameters per segment:
@@ -266,42 +257,104 @@ class DCPAModelFlat(nn.Module):
         }
 
     def parameter_groups(self) -> list[dict[str, Any]]:
-        """Three-group optimizer schedule: micro_cores, concept_core, scalar_gates (zero weight decay)."""
+        """Five-group optimizer schedule with strict zero weight decay on all 1D/0D norms, biases,
+        scalars, stack/carrier gate parameters, and initial graph/motor state vectors."""
         scalar_params: list[nn.Parameter] = [
             self.sgsc.theta_raw,
             self.sgsc.log_temp_sgsc,
             self.pmd.log_temp_pmd,
         ] + self.hippocampus.scalar_gate_parameters()
         scalar_ids = {id(p) for p in scalar_params}
-        ema_ids = {id(p) for p in self.jepa_target_ema.parameters()}
 
-        seen: set[int] = set(scalar_ids) | ema_ids
-        micro_params: list[nn.Parameter] = []
+        # Initial state matrices (`ndim >= 2` but must NEVER be shrunk toward zero by weight decay)
+        no_decay_explicit_ids: set[int] = {
+            id(self.carrier_g1.init_slots_raw),
+            id(self.carrier_g1.init_edges_raw),
+            id(self.carrier_g2.init_slots_raw),
+            id(self.carrier_g2.init_edges_raw),
+            id(self.sgsc.conv_w),
+        }
+
+        seen: set[int] = set(scalar_ids)
+        micro_decay: list[nn.Parameter] = []
+        micro_no_decay: list[nn.Parameter] = []
         for mod in (self.sgsc, self.pmd):
             for p in mod.parameters():
-                if id(p) not in seen and p.requires_grad:
-                    micro_params.append(p)
-                    seen.add(id(p))
+                pid = id(p)
+                if pid in seen or not p.requires_grad:
+                    continue
+                seen.add(pid)
+                if p.ndim < 2 or pid in no_decay_explicit_ids:
+                    micro_no_decay.append(p)
+                else:
+                    micro_decay.append(p)
 
-        concept_params: list[nn.Parameter] = []
+        concept_decay: list[nn.Parameter] = []
+        concept_no_decay: list[nn.Parameter] = []
         for p in self.parameters():
-            if id(p) not in seen and p.requires_grad:
-                concept_params.append(p)
-                seen.add(id(p))
+            pid = id(p)
+            if pid in seen or not p.requires_grad:
+                continue
+            seen.add(pid)
+            if p.ndim < 2 or pid in no_decay_explicit_ids:
+                concept_no_decay.append(p)
+            else:
+                concept_decay.append(p)
 
         scalar_trainable = [p for p in scalar_params if p.requires_grad]
-        return [
-            {"name": "micro_cores", "params": micro_params, "lr": self.cfg.lr_micro, "weight_decay": self.cfg.weight_decay},
-            {"name": "concept_core", "params": concept_params, "lr": self.cfg.lr_concept, "weight_decay": self.cfg.weight_decay},
-            {"name": "scalar_gates", "params": scalar_trainable, "lr": self.cfg.lr_scalar_gate, "weight_decay": 0.0},
+        groups: list[dict[str, Any]] = [
+            {"name": "micro_cores_decay", "params": micro_decay, "lr": self.cfg.lr_micro, "base_lr": self.cfg.lr_micro, "weight_decay": self.cfg.weight_decay},
+            {"name": "micro_cores_no_decay", "params": micro_no_decay, "lr": self.cfg.lr_micro, "base_lr": self.cfg.lr_micro, "weight_decay": 0.0},
+            {"name": "concept_core_decay", "params": concept_decay, "lr": self.cfg.lr_concept, "base_lr": self.cfg.lr_concept, "weight_decay": self.cfg.weight_decay},
+            {"name": "concept_core_no_decay", "params": concept_no_decay, "lr": self.cfg.lr_concept, "base_lr": self.cfg.lr_concept, "weight_decay": 0.0},
+            {"name": "scalar_gates", "params": scalar_trainable, "lr": self.cfg.lr_scalar_gate, "base_lr": self.cfg.lr_scalar_gate, "weight_decay": 0.0},
         ]
+        return [g for g in groups if g["params"]]
+
+    def enable_compiled_submodules(
+        self,
+        device: torch.device,
+        *,
+        mode: str = "default",
+        cache_size_limit: int = 64,
+    ) -> list[str]:
+        """Selectively `torch.compile` static-grid submodules (CUDA only) while preserving clean checkpointing."""
+        if device.type != "cuda" or not hasattr(torch, "compile"):
+            return []
+        if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "config"):
+            torch._dynamo.config.cache_size_limit = max(int(cache_size_limit), 64)
+            if hasattr(torch._dynamo.config, "accumulated_cache_size_limit"):
+                torch._dynamo.config.accumulated_cache_size_limit = max(int(cache_size_limit) * 4, 256)
+        compiled: list[str] = []
+        compile_kw: dict[str, Any] = {"dynamic": False, "mode": mode}
+        self.sgsc = torch.compile(self.sgsc, **compile_kw)  # type: ignore[assignment]
+        compiled.append("sgsc")
+        self.carrier_g1.enable_compiled_chunk(**compile_kw)
+        compiled.append("carrier_g1.chunk")
+        self.carrier_g2.enable_compiled_chunk(**compile_kw)
+        compiled.append("carrier_g2.chunk")
+        self.copy_ring = torch.compile(self.copy_ring, **compile_kw)  # type: ignore[assignment]
+        compiled.append("copy_ring")
+        self.pmd = torch.compile(self.pmd, **compile_kw)  # type: ignore[assignment]
+        compiled.append("pmd")
+        return compiled
+
+    def disable_compiled_submodules(self) -> None:
+        """Unwrap any `torch.compile` submodule wrappers cleanly (e.g. before CPU export or shape-change eval)."""
+        from dcpa.compile_utils import unwrap_compiled_module
+
+        self.sgsc = unwrap_compiled_module(self.sgsc)  # type: ignore[assignment]
+        self.copy_ring = unwrap_compiled_module(self.copy_ring)  # type: ignore[assignment]
+        self.pmd = unwrap_compiled_module(self.pmd)  # type: ignore[assignment]
+        self.carrier_g1.disable_compiled_chunk()
+        self.carrier_g2.disable_compiled_chunk()
 
     @torch.no_grad()
-    def post_optimizer_step(self, out: DCPAFlatForwardOutput) -> None:
-        """Non-gradient post-step updates: MoE `b_bal`, JEPA EMA target, and DG homeostasis."""
-        if out.expert_counts:
-            self.cortical.update_all_balance_biases(out.expert_counts)
-        self._sync_jepa_ema()
+    def post_optimizer_step(self, out: DCPAFlatForwardOutput, expert_counts_override: Optional[list[torch.Tensor]] = None) -> None:
+        """Non-gradient post-step updates: MoE `b_bal` (supports micro-batch accumulated counts)."""
+        counts = out.expert_counts if expert_counts_override is None else expert_counts_override
+        if counts:
+            self.cortical.update_all_balance_biases(counts)
 
     # ------------------------------------------------------------------
     # Forward Pass
@@ -539,17 +592,18 @@ class DCPAModelFlat(nn.Module):
             seg_v_f = bridge.seg_valid.float()
             seg_v_denom = seg_v_f.sum().clamp_min(1.0)
 
-            # JEPA predictive target loss: predict slow EMA representation of current `x3` from strictly causal `z_hat`
-            jepa_hat = self.jepa_norm(self.jepa_pred(pred_out.z_hat).float())
-            with torch.no_grad():
-                jepa_tgt = self.jepa_norm(self.jepa_target_ema(x3.detach()).float())
-            # Online projection receives gentle alignment gradient to keep EMA target non-trivial & matched to `x3`
-            jepa_on = self.jepa_norm(self.jepa_target_online(x3).float())
-            seg_jepa_err = (jepa_hat - jepa_tgt).pow(2).mean(dim=-1)  # [P, S]
-            on_align = (jepa_on - self.jepa_norm(x3.detach().float())).pow(2).mean(dim=-1)
-            loss_jepa = ((seg_jepa_err + 0.1 * on_align) * seg_v_f).sum() / seg_v_denom
+            # JEPA predictive target loss using parameter-free Unit-RMSNorm (norm = sqrt(D), O(1) MSE, collapse-proof)
+            jepa_hat = self._unit_rmsnorm(self.jepa_pred(pred_out.z_hat), eps=cfg.eps)
+            jepa_tgt = self._unit_rmsnorm(x3.detach(), eps=cfg.eps)
+            seg_jepa_err = (jepa_hat - jepa_tgt).pow(2).mean(dim=-1)  # [P, S] O(1)
+            loss_jepa = (seg_jepa_err * seg_v_f).sum() / seg_v_denom
 
-            # R5: Self-supervised cognitive uncertainty regression target from actual per-segment NLL + JEPA error
+            # Decoupled pre-refinement (L6) JEPA difficulty term to avoid L7-L8 thermostat feedback
+            with torch.no_grad():
+                jepa_hat_6 = self._unit_rmsnorm(self.jepa_pred(pred_out.z_hat_6.detach()), eps=cfg.eps)
+                seg_jepa_err_6 = (jepa_hat_6 - jepa_tgt).pow(2).mean(dim=-1)
+
+            # R5: Self-supervised cognitive uncertainty regression target from per-segment NLL + pre-refine JEPA error
             seg_lens_nll = static_segment_scatter_add(valid_byte.float(), bridge.byte_to_seg, S)
             seg_nll = static_segment_mean(
                 pmd_out.per_byte_ce.float() * valid_byte.float(),
@@ -557,7 +611,7 @@ class DCPAModelFlat(nn.Module):
                 seg_lens_nll,
                 S,
             )  # [P, S]
-            seg_difficulty = (0.5 * seg_nll + 0.5 * seg_jepa_err).detach().clamp(0.0, 12.0)
+            seg_difficulty = (0.5 * seg_nll + 0.5 * seg_jepa_err_6).detach().clamp(0.0, 12.0)
             unc_err = F.smooth_l1_loss(pred_out.u_n.float(), seg_difficulty, reduction="none")
             loss_unc = (unc_err * seg_v_f).sum() / seg_v_denom
 
@@ -775,7 +829,7 @@ class DCPAModelFlat(nn.Module):
                     cols_l = m_l_pre.gather(1, q_idx.unsqueeze(-1).expand(1, cfg.s_active, d_s))
                     f_hip_s = torch.einsum("ps,psd->pd", q_val.float(), cols_l)
                     g_sem = (q_val.float().pow(2) * u_sem_pre.gather(1, q_idx)).sum(dim=-1).clamp(0.0, 1.0)
-                    rho_s = torch.sigmoid(self.hippocampus.alpha_out * (g_sem - self.hippocampus.theta_out))
+                    rho_s = g_sem * torch.sigmoid(self.hippocampus.alpha_out * (g_sem - self.hippocampus.theta_out))
                     f_out_s = (1.0 - rho_s.unsqueeze(-1)) * f_cort_s + rho_s.unsqueeze(-1) * f_hip_s
                 else:
                     f_hip_s = torch.zeros((1, d_s), device=device, dtype=torch.float32)

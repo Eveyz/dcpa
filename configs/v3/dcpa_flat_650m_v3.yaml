@@ -15,7 +15,7 @@ model:
   max_seg_len: 16
   d_s: 256
   d_concept: 1024
-  n_heads: 8
+  n_heads: 16
   k_slots: 8
   d_r: 32
   d_merge: 384

@@ -65,7 +65,7 @@ data:
 hardware:
   bf16: true
   allow_tf32: true
-  compile_chunks: false      # Enable --compile-chunks on Ampere/Hopper/Blackwell GPUs once warmup verified
+  compile_chunks: true       # Compiles SGSC / Carrier chunks / Cortical / PMD on CUDA GPUs
   grad_checkpoint: auto      # Auto-enables on <= 32GB GPUs (L4 / RTX 5090); off on RTX Pro 6000 96G / A100 80G
   grad_accum_steps: 2        # 262 KB/step -> 122,000 steps = 32 GB stream (~9.5B tokens)
 

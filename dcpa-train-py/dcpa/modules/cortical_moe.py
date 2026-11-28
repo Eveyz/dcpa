@@ -577,11 +577,13 @@ class PreG1CorticalLayer(nn.Module):
             mask = (valid | diag_fb).unsqueeze(2)  # [P, Nc, 1, W, 2W]
 
             scale = 1.0 / math.sqrt(float(Dh))
+            # Keep Q@K^T & Attn@V on native BF16/FP32 Tensor Cores; keep mask + softmax strictly FP32
+            scores_raw = torch.matmul(q_t, k_2w.transpose(-2, -1))
             with fp32_island(dev):
-                scores = torch.matmul(q_t.float(), k_2w.float().transpose(-2, -1)) * scale
+                scores = scores_raw.float() * scale
                 scores = torch.where(mask, scores, torch.full_like(scores, -1.0e9))
                 attn = F.softmax(scores, dim=-1)
-                ctx_t = torch.matmul(attn, v_2w.float())  # [P, Nc, H, W, Dh]
+            ctx_t = torch.matmul(attn.to(orig_dtype), v_2w)  # [P, Nc, H, W, Dh]
             ctx = ctx_t.permute(0, 1, 3, 2, 4).reshape(P, S, D).to(orig_dtype)
             x = x + self.w_o(ctx)
 
@@ -837,8 +839,10 @@ class UnifiedWindowGraphCorticalLayer(nn.Module):
         ).unsqueeze(2)  # [P, Nc, 1, W, 2W]
 
         scale = 1.0 / math.sqrt(float(Dh))
+        # Keep window Q@K^T & Attn@V on native BF16 Tensor Cores; keep unified 265-col softmax strictly FP32
+        scores_win_raw = torch.matmul(q_t, k_2w.transpose(-2, -1))  # [P, Nc, H, W, 2W]
         with fp32_island(dev):
-            scores_win = torch.matmul(q_t.float(), k_2w.float().transpose(-2, -1)) * scale  # [P, Nc, H, W, 2W]
+            scores_win = scores_win_raw.float() * scale
             scores_win = torch.where(valid_win, scores_win, torch.full_like(scores_win, -1.0e9))
 
             reg_bias = 2.0 * torch.tanh(
@@ -863,12 +867,12 @@ class UnifiedWindowGraphCorticalLayer(nn.Module):
             attn_win = all_attn[..., : 2 * W]
             attn_g = all_attn[..., 2 * W : 2 * W + K]
 
-            ctx_win = torch.matmul(attn_win, v_2w.float())  # [P, Nc, H, W, Dh]
             gv_t = graph_kv.v_g.float().view(P, n_chunks, W, H, K, Dh).permute(0, 1, 3, 2, 4, 5)
             ctx_g = torch.einsum("pnhwk,pnhwkd->pnhwd", attn_g, gv_t)
-            ctx = (ctx_win + ctx_g).permute(0, 1, 3, 2, 4).reshape(P, S, D)
+        ctx_win = torch.matmul(attn_win.to(orig_dtype), v_2w)  # [P, Nc, H, W, Dh]
+        ctx = (ctx_win + ctx_g.to(orig_dtype)).permute(0, 1, 3, 2, 4).reshape(P, S, D)
 
-        x_mid = x + self.w_o(ctx.to(orig_dtype))
+        x_mid = x + self.w_o(ctx)
         y_flat, counts = self.moe(x_mid.reshape(P * S, D), sample_mask=seg_valid.reshape(P * S))
         return y_flat.view(P, S, D), counts
 
@@ -1170,7 +1174,7 @@ class CorticalStackFlat(nn.Module):
                 valid_sel = valid_flat[top_idx]  # [k_ref] bool
                 u_sel = u_flat[top_idx]  # [k_ref] differentiable -> grads flow directly into u_n!
                 tau_det = self.tau_think.detach().float()
-                gate_sel = torch.sigmoid(u_sel - tau_det) * valid_sel.float()  # [k_ref]
+                gate_sel = torch.tanh(2.0 * F.relu(u_sel - tau_det)) * valid_sel.float()  # [k_ref] smooth dead-zone
 
             z_flat = z_hat_6.reshape(N_flat, D)
             z_sel = z_flat[top_idx]  # [k_ref, D]
@@ -1207,7 +1211,7 @@ class CorticalStackFlat(nn.Module):
             with fp32_island(dev):
                 tau_cur = self.tau_think.float()
                 refine_mask = seg_valid.bool() & (u_n > tau_cur)  # [P, S]
-                refine_gate = torch.sigmoid(u_n - tau_cur) * refine_mask.float()  # [P, S]
+                refine_gate = torch.tanh(2.0 * F.relu(u_n - tau_cur)) * refine_mask.float()  # [P, S] smooth dead-zone
 
             # L7–L8 are 100% row-independent (pure K=8 graph + per-token MoE); static full-shape eval
             # guarantees zero dynamic slicing while matching per-token active execution bit-for-bit!
@@ -1319,7 +1323,7 @@ class CorticalStackFlat(nn.Module):
             u_n = F.linear(z_hat_6.float(), self.w_unc.weight.float(), self.w_unc.bias.float()).squeeze(-1)  # [B]
             tau_cur = self.tau_think.float()
             refine_mask = u_n > tau_cur
-            refine_gate = torch.sigmoid(u_n - tau_cur) * refine_mask.float()
+            refine_gate = torch.tanh(2.0 * F.relu(u_n - tau_cur)) * refine_mask.float()
 
         # Skip L7–L8 completely when inactive in single-step streaming (0 extra FLOPs!)
         if not torch.compiler.is_compiling() and not bool(refine_mask.any()):

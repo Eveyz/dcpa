@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -34,7 +35,8 @@ for _p in (str(_REPO_ROOT), str(_TRAIN_PY)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from data.ragged_dataloader import StaticGridByteDataset
+from data.ragged_dataloader import StaticGridByteDataset, build_static_grid_dataloader
+from dcpa.compile_utils import get_clean_state_dict
 from dcpa.export import export_flat_v3_and_golden
 from dcpa.interfaces import DCPAFlatConfig, StaticGridBatch
 from dcpa.model_flat import DCPAModelFlat, FlatStageMode
@@ -211,8 +213,19 @@ class _BatchStreamPool:
             if bp.is_file() and ip.is_file() and bp.stat().st_size > 0 and ip.stat().st_size >= 16:
                 self.sft_pair = (bp, ip)
 
-    def _make_iter(self, bin_p: Path, idx_p: Path, P: int, T: int, dw: Optional[dict[int, float]], salt: int) -> Iterator[StaticGridBatch]:
-        ds = StaticGridByteDataset(
+    def _make_iter(
+        self,
+        bin_p: Path,
+        idx_p: Path,
+        P: int,
+        T: int,
+        dw: Optional[dict[int, float]],
+        salt: int,
+        *,
+        use_cuda_workers: bool = False,
+    ) -> Iterator[StaticGridBatch]:
+        nw = 0 if (self.smoke or not use_cuda_workers) else min(4, max(2, (os.cpu_count() or 2) // 2))
+        loader = build_static_grid_dataloader(
             bin_path=bin_p,
             idx_path=idx_p,
             grid_lanes=P,
@@ -220,30 +233,34 @@ class _BatchStreamPool:
             doc_meta_cap_per_lane=self.cfg.doc_meta_cap_per_lane,
             domain_weights=dw,
             num_batches=None,
+            num_workers=nw,
+            pin_memory=use_cuda_workers,
             seed=self.seed + salt,
         )
-        return iter(ds)
+        return iter(loader)
 
-    def next_batch(self, stage: StageWindow, step: int, device: torch.device) -> StaticGridBatch:
+    def next_batch(self, stage: StageWindow, step: int, device: torch.device, eff_cap_mix: Optional[float] = None) -> StaticGridBatch:
         P, T = stage.grid_lanes, stage.grid_bytes
         if self.smoke or self.data_dir is None or not (self.data_dir / "train.bin").is_file():
             sub_cfg = DCPAFlatConfig(**{**self.cfg.to_dict(), "grid_lanes": P, "grid_bytes": T, "grid_segs": stage.grid_segs})
             return _make_synthetic_grid_batch(sub_cfg, lang_id=(step % 6), seed=self.seed + step, device=device)
 
-        use_sft = stage.mode == "full" and self.sft_pair is not None and self._rng.random() < stage.cap_mix_prob * 0.5
-        use_cap = (not use_sft) and bool(self.cap_pairs) and self._rng.random() < stage.cap_mix_prob
+        use_cuda_w = device.type == "cuda"
+        cap_p = stage.cap_mix_prob if eff_cap_mix is None else float(eff_cap_mix)
+        use_sft = stage.mode == "full" and self.sft_pair is not None and self._rng.random() < cap_p * 0.5
+        use_cap = (not use_sft) and bool(self.cap_pairs) and self._rng.random() < cap_p
 
         if use_sft and self.sft_pair is not None:
             key = ("sft", P, T)
             if key not in self._iter_cache:
-                self._iter_cache[key] = self._make_iter(self.sft_pair[0], self.sft_pair[1], P, T, None, 501)
+                self._iter_cache[key] = self._make_iter(self.sft_pair[0], self.sft_pair[1], P, T, None, 501, use_cuda_workers=use_cuda_w)
             batch = next(self._iter_cache[key])
         elif use_cap:
             c_idx = self._rng.randrange(len(self.cap_pairs))
             bp, ip = self.cap_pairs[c_idx]
             key = (f"cap_{c_idx}", P, T)
             if key not in self._iter_cache:
-                self._iter_cache[key] = self._make_iter(bp, ip, P, T, None, 100 + c_idx)
+                self._iter_cache[key] = self._make_iter(bp, ip, P, T, None, 100 + c_idx, use_cuda_workers=use_cuda_w)
             batch = next(self._iter_cache[key])
         else:
             key = ("base", P, T)
@@ -255,9 +272,10 @@ class _BatchStreamPool:
                     T,
                     self.domain_weights,
                     1,
+                    use_cuda_workers=use_cuda_w,
                 )
             batch = next(self._iter_cache[key])
-        return batch.to(device=device, non_blocking=(device.type == "cuda"))
+        return batch.to(device=device, non_blocking=use_cuda_w)
 
     def eval_batches(self, P: int, T: int, S: int, device: torch.device, n_batches: int = 4) -> list[StaticGridBatch]:
         if self.smoke or self.data_dir is None or not (self.data_dir / "val.bin").is_file():
@@ -315,6 +333,8 @@ def main() -> None:
     ap.add_argument("--total-steps", type=int, default=None)
     ap.add_argument("--grad-accum-steps", type=int, default=None)
     ap.add_argument("--grad-checkpoint", choices=("auto", "on", "off"), default=None)
+    ap.add_argument("--compile-chunks", action="store_true", default=None)
+    ap.add_argument("--no-compile-chunks", dest="compile_chunks", action="store_false")
     ap.add_argument("--use-local-window-layers", choices=("true", "false"), default=None)
     ap.add_argument("--carrier-grad-guard", choices=("none", "router_sg", "soft_clip"), default=None)
     ap.add_argument("--device", default="auto")
@@ -388,7 +408,6 @@ def main() -> None:
 
     model = DCPAModelFlat(cfg).to(device=device)
     param_info = model.count_parameters()
-    base_lrs = [cfg.lr_micro, cfg.lr_concept, cfg.lr_scalar_gate]
     optimizer = torch.optim.AdamW(model.parameter_groups())
 
     start_step = 0
@@ -406,15 +425,27 @@ def main() -> None:
                 res = type("R", (), {"checkpoint": ck, "step": int(ck.get("step", 0)), "reason": str(p)})()
         if res is not None:
             ck = res.checkpoint
-            model.load_state_dict(ck["model"], strict=True)
+            # Strip any legacy `_orig_mod.` prefix defensively before loading
+            clean_sd = {k.replace("._orig_mod.", ".").removeprefix("_orig_mod."): v for k, v in ck["model"].items()}
+            model.load_state_dict(clean_sd, strict=True)
             if "optimizer" in ck:
-                optimizer.load_state_dict(ck["optimizer"])
+                try:
+                    optimizer.load_state_dict(ck["optimizer"])
+                except Exception as opt_exc:
+                    print(f"[Resume][WARN] Optimizer state skipped ({opt_exc}); starting fresh AdamW moments.", flush=True)
             start_step = int(ck.get("step", res.step))
             best_val_bpc = float(ck.get("best_val_bpc", float("inf")))
             resumed_wandb_id = ck.get("wandb_run_id")
             if "rng_state" in ck:
                 restore_rng_state(ck["rng_state"])
             print(f"[Resume] Restored DCPA-Flat checkpoint at step={start_step} ({res.reason})", flush=True)
+
+    want_compile = (
+        False
+        if args.smoke
+        else (args.compile_chunks if args.compile_chunks is not None else bool(hw_cfg.get("compile_chunks", True)))
+    )
+    compiled_mods = model.enable_compiled_submodules(device) if want_compile else []
 
     wb_settings = resolve_wandb_settings(
         yaml_wandb_cfg=raw_yaml.get("wandb"),
@@ -452,11 +483,14 @@ def main() -> None:
 
     metrics_jsonl = logs_dir / "metrics_flat.jsonl"
     active_stage_mode: Optional[FlatStageMode] = None
+    stage_enter_step: int = start_step
+    win_bytes = 0
+    win_t0 = time.perf_counter()
 
     with RunLogTee(logs_dir, drive_logs_dir=drive_logs_dir) as log_tee:
         print(
             f"[DCPA-Flat v3.3] device={device} ({hw.device_name}, {hw.vram_gb:.1f}GB) | "
-            f"bf16={use_bf16} | grad_ckpt={use_ckpt} | grad_accum={grad_accum} | "
+            f"bf16={use_bf16} | compile={compiled_mods or 'eager'} | grad_ckpt={use_ckpt} | grad_accum={grad_accum} | "
             f"trainable={param_info['trainable_total']/1e6:.2f}M | active={param_info['active_avg_per_seg']/1e6:.2f}M | "
             f"steps={start_step}..{total_steps}",
             flush=True,
@@ -465,6 +499,8 @@ def main() -> None:
         for step in range(start_step, total_steps):
             st = resolve_stage_for_step(schedule, step)
             if st.mode != active_stage_mode:
+                if active_stage_mode is not None:
+                    stage_enter_step = step
                 model.set_stage_mode(st.mode)
                 active_stage_mode = st.mode
                 print(
@@ -477,59 +513,90 @@ def main() -> None:
             cfg.grid_bytes = st.grid_bytes
             cfg.grid_segs = st.grid_segs
 
+            # Smooth stage-transition micro-warmup (prevents cold-layer gradient shock on Stage 1->2 & 3->4)
             lr_mult = cosine_lr_multiplier(step, warmup_steps=warmup_steps, total_steps=total_steps, min_ratio=min_lr_ratio)
-            for pg, base_lr in zip(optimizer.param_groups, base_lrs):
-                pg["lr"] = base_lr * lr_mult
+            if not args.smoke and stage_enter_step > 0 and (step - stage_enter_step) < 500:
+                stage_ramp = float(step - stage_enter_step + 1) / 500.0
+                lr_mult *= 0.1 + 0.9 * stage_ramp
+            for pg in optimizer.param_groups:
+                pg["lr"] = float(pg.get("base_lr", cfg.lr_concept)) * lr_mult
 
-            synchronize(device)
-            t0 = time.perf_counter()
+            # Linear cap_mix_prob ramp across first 20% of stage window (prevents sudden control-byte cliff)
+            st_span = max(st.end_step - st.start_step, 1)
+            ramp_len = max(1, int(0.20 * st_span))
+            cap_ramp = min(1.0, float(step - st.start_step + 1) / float(ramp_len))
+            eff_cap_mix = st.cap_mix_prob * cap_ramp
+
             optimizer.zero_grad(set_to_none=True)
 
             step_bytes = 0
             last_out = None
+            acc_expert_counts: Optional[list[torch.Tensor]] = None
             model.train()
             for acc_i in range(grad_accum):
-                batch = stream_pool.next_batch(st, step * grad_accum + acc_i, device=device)
+                batch = stream_pool.next_batch(st, step * grad_accum + acc_i, device=device, eff_cap_mix=eff_cap_mix)
                 step_bytes += int(batch.x_bytes.numel())
                 with amp_autocast(device, enabled=use_bf16):
                     out = model(batch, stage=st.mode, hip_enabled=st.hip_enabled, use_checkpoint=use_ckpt)
                     loss_scaled = out.loss_total / float(grad_accum)
                 loss_scaled.backward()
                 last_out = out
+                if out.expert_counts:
+                    if acc_expert_counts is None:
+                        acc_expert_counts = [c.detach().clone() for c in out.expert_counts]
+                    else:
+                        for li, c in enumerate(out.expert_counts):
+                            acc_expert_counts[li] = acc_expert_counts[li] + c.detach()
 
-            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm).item())
-            m = last_out.materialize_metrics() if last_out is not None else {}
-            loss_val = float(m.get("loss_total", float("nan")))
-            step_healthy = bool(math.isfinite(loss_val) and math.isfinite(grad_norm) and grad_norm <= max_healthy_gn)
+            grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
+            completed_step = step + 1
+            win_bytes += step_bytes
+
+            due, reason = trigger.should_save(completed_step)
+            is_final = completed_step == total_steps
+            is_log_step = (completed_step == 1) or (completed_step % 10 == 0) or (completed_step % eval_every == 0) or is_final or due
+
+            # Only pay host-device sync on health/log/save boundaries (zero per-step sync bubbles on CUDA!)
+            loss_t = last_out.loss_total.detach() if last_out is not None else torch.tensor(float("nan"), device=device)
+            if is_log_step or device.type != "cuda":
+                grad_norm = float(grad_norm_t.item())
+                loss_val = float(loss_t.item())
+                step_healthy = bool(math.isfinite(loss_val) and math.isfinite(grad_norm) and grad_norm <= max_healthy_gn)
+            else:
+                step_healthy = bool(torch.isfinite(loss_t).item() and torch.isfinite(grad_norm_t).item())
+                grad_norm = 0.0
+                loss_val = 0.0
 
             if step_healthy:
                 optimizer.step()
                 if last_out is not None:
-                    model.post_optimizer_step(last_out)
+                    model.post_optimizer_step(last_out, expert_counts_override=acc_expert_counts)
             else:
                 optimizer.zero_grad(set_to_none=True)
                 print(
-                    f"[Watchdog][SKIP] step={step + 1} unhealthy loss={loss_val:.4f} grad_norm={grad_norm:.2f} "
+                    f"[Watchdog][SKIP] step={completed_step} unhealthy loss={loss_val:.4f} grad_norm={grad_norm:.2f} "
                     "(skipping optimizer step & Drive write)",
                     flush=True,
                 )
 
-            synchronize(device)
-            dt = max(time.perf_counter() - t0, 1e-6)
-            kb_s = (step_bytes / 1024.0) / dt
-            completed_step = step + 1
-            train_bpc = float(m.get("loss_lang", 0.0)) / math.log(2.0)
-
             val_bpc: Optional[float] = None
             is_best = False
-            if completed_step % eval_every == 0 or completed_step == total_steps:
+            if completed_step % eval_every == 0 or is_final:
                 v_batches = stream_pool.eval_batches(st.grid_lanes, st.grid_bytes, st.grid_segs, device=device, n_batches=2 if args.smoke else 4)
                 val_bpc = evaluate_val_bpc(model, v_batches, st, use_bf16=use_bf16, device=device)
                 if math.isfinite(val_bpc) and val_bpc < best_val_bpc:
                     best_val_bpc = val_bpc
                     is_best = True
 
-            if completed_step == 1 or completed_step % 10 == 0 or val_bpc is not None or completed_step == total_steps:
+            if is_log_step:
+                synchronize(device)
+                dt = max(time.perf_counter() - win_t0, 1e-6)
+                kb_s = (win_bytes / 1024.0) / dt
+                win_bytes = 0
+                win_t0 = time.perf_counter()
+
+                m = last_out.materialize_metrics() if last_out is not None else {}
+                train_bpc = float(m.get("loss_lang", 0.0)) / math.log(2.0)
                 v_str = f" | val_bpc={val_bpc:.4f}" if val_bpc is not None else ""
                 print(
                     f"[Step {completed_step:>6d}/{total_steps} | {st.name}] "
@@ -538,36 +605,34 @@ def main() -> None:
                     flush=True,
                 )
 
-            rec = {
-                "step": completed_step,
-                "stage": st.name,
-                "train_bpc": train_bpc,
-                "val_bpc": val_bpc,
-                "grad_norm": grad_norm,
-                "kb_s": kb_s,
-                "lr": optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else optimizer.param_groups[0]["lr"],
-                **{k: float(v) for k, v in m.items()},
-            }
-            with metrics_jsonl.open("a", encoding="utf-8") as mf:
-                mf.write(json.dumps(rec) + "\n")
-
-            if tracker.active and (tracker.should_log_step(completed_step, total_steps=total_steps) or val_bpc is not None):
-                wb_payload = {
-                    "train/bpc": train_bpc,
-                    "train/loss_total": loss_val,
-                    "train/loss_jepa": float(m.get("loss_jepa", 0.0)),
-                    "train/loss_unc": float(m.get("loss_unc", 0.0)),
-                    "train/overflow_ratio": float(m.get("overflow_byte_ratio", 0.0)),
-                    "train/grad_norm": grad_norm,
-                    "perf/kb_per_sec": kb_s,
-                    "perf/tau_think": float(m.get("tau_think", 0.0)),
+                rec = {
+                    "step": completed_step,
+                    "stage": st.name,
+                    "train_bpc": train_bpc,
+                    "val_bpc": val_bpc,
+                    "grad_norm": grad_norm,
+                    "kb_s": kb_s,
+                    "lr": optimizer.param_groups[0]["lr"],
+                    **{k: float(v) for k, v in m.items()},
                 }
-                if val_bpc is not None:
-                    wb_payload["val/bpc"] = val_bpc
-                tracker._run.log(wb_payload, step=completed_step)  # type: ignore[union-attr]
+                with metrics_jsonl.open("a", encoding="utf-8") as mf:
+                    mf.write(json.dumps(rec) + "\n")
 
-            due, reason = trigger.should_save(completed_step)
-            is_final = completed_step == total_steps
+                if tracker.active and (tracker.should_log_step(completed_step, total_steps=total_steps) or val_bpc is not None):
+                    wb_payload = {
+                        "train/bpc": train_bpc,
+                        "train/loss_total": loss_val,
+                        "train/loss_jepa": float(m.get("loss_jepa", 0.0)),
+                        "train/loss_unc": float(m.get("loss_unc", 0.0)),
+                        "train/overflow_ratio": float(m.get("overflow_byte_ratio", 0.0)),
+                        "train/grad_norm": grad_norm,
+                        "perf/kb_per_sec": kb_s,
+                        "perf/tau_think": float(m.get("tau_think", 0.0)),
+                    }
+                    if val_bpc is not None:
+                        wb_payload["val/bpc"] = val_bpc
+                    tracker._run.log(wb_payload, step=completed_step)  # type: ignore[union-attr]
+
             if (due or is_best or is_final) and step_healthy:
                 payload = {
                     "schema_version": 3,
@@ -575,7 +640,7 @@ def main() -> None:
                     "step": completed_step,
                     "stage_name": st.name,
                     "cfg": cfg.to_dict(),
-                    "model": model.state_dict(),
+                    "model": get_clean_state_dict(model),
                     "optimizer": optimizer.state_dict(),
                     "best_val_bpc": best_val_bpc,
                     "wandb_run_id": tracker.run_id,
@@ -593,7 +658,8 @@ def main() -> None:
                     sync_file_to_drive(metrics_jsonl, drive_logs_dir, dest_name="metrics_flat.jsonl")
                 log_tee.sync_to_drive(force=is_final)
 
-        # Auto-export Rust-ready Flat v3.3 weights on completion
+        # Auto-export Rust-ready Flat v3.3 weights on completion (unwrap any torch.compile wrappers first)
+        model.disable_compiled_submodules()
         export_dir = Path(args.export_dir) if args.export_dir else (local_cache / "export")
         export_paths = export_flat_v3_and_golden(
             model,

@@ -1008,6 +1008,24 @@ class CorticalStackFlat(nn.Module):
         # Cached detached expert counts for convenient zero-arg `update_all_balance_biases()` (eager only)
         self._last_expert_counts: list[Optional[torch.Tensor]] = [None] * cfg.n_layers
 
+        # Optional method-level `torch.compile` wrappers (preserves clean `state_dict` keys)
+        self._compiled_pre_g1: Any = None
+        self._compiled_post_g1: Any = None
+        self._compiled_pred_ref: Any = None
+
+    def enable_compiled_methods(self, **compile_kw: Any) -> None:
+        """Compile the three flat cortical entrypoints without altering `state_dict` keys."""
+        if hasattr(torch, "compile"):
+            self._compiled_pre_g1 = torch.compile(self._forward_pre_g1_impl, **compile_kw)
+            self._compiled_post_g1 = torch.compile(self._forward_post_g1_impl, **compile_kw)
+            self._compiled_pred_ref = torch.compile(self._forward_predict_and_refine_impl, **compile_kw)
+
+    def disable_compiled_methods(self) -> None:
+        """Restore eager cortical methods (for CPU export, plugin hooks, or shape-changing eval)."""
+        self._compiled_pre_g1 = None
+        self._compiled_post_g1 = None
+        self._compiled_pred_ref = None
+
     def build_graph_kv(
         self,
         slots_seq: torch.Tensor,
@@ -1049,6 +1067,20 @@ class CorticalStackFlat(nn.Module):
     # Stage 3A-pre: L1 (layer 0) before Carrier G1
     # ------------------------------------------------------------------
 
+    def _forward_pre_g1_impl(
+        self,
+        x0: torch.Tensor,
+        f_stem: torch.Tensor,
+        seg_doc_id: torch.Tensor,
+        seg_end_depth: torch.Tensor,
+        seg_valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        l1: PreG1CorticalLayer = self.layers[0]  # type: ignore[assignment]
+        x1, counts0 = l1(x0, f_stem, seg_doc_id, seg_end_depth, seg_valid)
+        if not torch.compiler.is_compiling():
+            self._last_expert_counts[0] = counts0.detach()
+        return x1, counts0
+
     def forward_pre_g1(
         self,
         x0: torch.Tensor,
@@ -1058,26 +1090,25 @@ class CorticalStackFlat(nn.Module):
         seg_valid: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """L1 (layer 0): causal `W=128` local window over `f_stem` (if enabled) + MoE."""
-        l1: PreG1CorticalLayer = self.layers[0]  # type: ignore[assignment]
-        x1, counts0 = l1(x0, f_stem, seg_doc_id, seg_end_depth, seg_valid)
-        if not torch.compiler.is_compiling():
-            self._last_expert_counts[0] = counts0.detach()
+        fn = self._compiled_pre_g1 if self._compiled_pre_g1 is not None else self._forward_pre_g1_impl
+        x1, counts0 = fn(x0, f_stem, seg_doc_id, seg_end_depth, seg_valid)
         return x1, {"expert_counts": [counts0]}
 
     # ------------------------------------------------------------------
     # Stage 3A-post: L2–L3 (layers 1–2) after Carrier G1
     # ------------------------------------------------------------------
 
-    def forward_post_g1(
+    def _forward_post_g1_impl(
         self,
         x1: torch.Tensor,
-        g1_out: CarrierScanOut,
+        g1_slots: torch.Tensor,
+        g1_edges: torch.Tensor,
+        g1_occ: torch.Tensor,
         seg_l_reg: torch.Tensor,
         seg_valid: torch.Tensor,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], dict[str, Any]]:
-        """L2–L3 (layers 1–2): shared `G1` KV graph cross-attention + MoE + optional `c_kv_sem`."""
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], list[torch.Tensor], torch.Tensor]:
         P, S, _ = x1.shape
-        kv_g1 = self.build_graph_kv(g1_out.slots_seq, g1_out.edges_seq, g1_out.occ_seq, which="g1")
+        kv_g1 = self.build_graph_kv(g1_slots, g1_edges, g1_occ, which="g1")
         valid_flat = seg_valid.reshape(P * S)
 
         x = x1
@@ -1097,9 +1128,23 @@ class CorticalStackFlat(nn.Module):
         else:
             c_kv_sem = None
 
+        return x3, c_kv_sem, counts_list, torch.stack(max_slot_attn_list, dim=0).amax(dim=0)
+
+    def forward_post_g1(
+        self,
+        x1: torch.Tensor,
+        g1_out: CarrierScanOut,
+        seg_l_reg: torch.Tensor,
+        seg_valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], dict[str, Any]]:
+        """L2–L3 (layers 1–2): shared `G1` KV graph cross-attention + MoE + optional `c_kv_sem`."""
+        fn = self._compiled_post_g1 if self._compiled_post_g1 is not None else self._forward_post_g1_impl
+        x3, c_kv_sem, counts_list, max_slot_attn = fn(
+            x1, g1_out.slots_seq, g1_out.edges_seq, g1_out.occ_seq, seg_l_reg, seg_valid
+        )
         aux = {
             "expert_counts": counts_list,
-            "max_slot_attn": torch.stack(max_slot_attn_list, dim=0).amax(dim=0),
+            "max_slot_attn": max_slot_attn,
         }
         return x3, c_kv_sem, aux
 
@@ -1107,25 +1152,26 @@ class CorticalStackFlat(nn.Module):
     # Stage 3B + 3C: L4–L6 + L7–L8 (layers 3–7) around G2_prior
     # ------------------------------------------------------------------
 
-    def forward_predict_and_refine(
+    def _forward_predict_and_refine_impl(
         self,
         x_seed: torch.Tensor,
         x3_prev: torch.Tensor,
-        g2_prior: CarrierScanOut,
+        g2_slots: torch.Tensor,
+        g2_edges: torch.Tensor,
+        g2_occ: torch.Tensor,
         ring_kv: Optional[torch.Tensor],
         seg_doc_id: torch.Tensor,
         seg_start_depth: torch.Tensor,
         seg_end_depth: torch.Tensor,
         seg_l_reg: torch.Tensor,
         seg_valid: torch.Tensor,
-    ) -> CorticalPredOut:
-        """L4–L6 full prediction (with unified 265-col softmax on L4/L6 if enabled) + R5 L7–L8 refine."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
         P, S, D = x_seed.shape
         N_flat = P * S
         dev = x_seed.device
         valid_flat = seg_valid.reshape(N_flat)
 
-        kv_g2 = self.build_graph_kv(g2_prior.slots_seq, g2_prior.edges_seq, g2_prior.occ_seq, which="g2")
+        kv_g2 = self.build_graph_kv(g2_slots, g2_edges, g2_occ, which="g2")
         x = x_seed + self.w_reg_pred(seg_l_reg.to(x_seed.dtype))
 
         counts_list: list[torch.Tensor] = []
@@ -1161,7 +1207,7 @@ class CorticalStackFlat(nn.Module):
         with fp32_island(dev):
             u_n = F.linear(z_hat_6.float(), self.w_unc.weight.float(), self.w_unc.bias.float()).squeeze(-1)  # [P, S]
 
-        # L7–L8 Refinement Stack (R5 Dual Mode: Train Top-25% MoD vs Eval/Streaming Threshold)
+        # L7–L8 Refinement Stack (R5 Dual Mode: Train exact top-25% of VALID segments vs Eval/Streaming Threshold)
         refine_start = pred_end
         refine_end = refine_start + self.cfg.n_refine_layers
 
@@ -1172,9 +1218,14 @@ class CorticalStackFlat(nn.Module):
                 u_masked = torch.where(valid_flat, u_flat, torch.full_like(u_flat, -1.0e9))
                 top_u, top_idx = torch.topk(u_masked, k=k_ref, dim=0, sorted=True)  # [k_ref]
                 valid_sel = valid_flat[top_idx]  # [k_ref] bool
+                # Zero-sync static-shape GPU masking to exact top `refine_frac` of VALID segments
+                n_valid_f = valid_flat.sum().to(torch.float32)
+                target_k = torch.round(n_valid_f * float(self.cfg.refine_frac)).to(torch.long).clamp(1, k_ref)
+                rank_idx = torch.arange(k_ref, device=dev, dtype=torch.long)
+                sel_active = valid_sel & (rank_idx < target_k)  # [k_ref] bool
                 u_sel = u_flat[top_idx]  # [k_ref] differentiable -> grads flow directly into u_n!
                 tau_det = self.tau_think.detach().float()
-                gate_sel = torch.tanh(2.0 * F.relu(u_sel - tau_det)) * valid_sel.float()  # [k_ref] smooth dead-zone
+                gate_sel = torch.tanh(2.0 * F.relu(u_sel - tau_det)) * sel_active.float()  # [k_ref] smooth dead-zone
 
             z_flat = z_hat_6.reshape(N_flat, D)
             z_sel = z_flat[top_idx]  # [k_ref, D]
@@ -1185,7 +1236,7 @@ class CorticalStackFlat(nn.Module):
             h = z_sel
             for idx in range(refine_start, refine_end):
                 r_layer: GraphCrossAttnCorticalLayer = self.layers[idx]  # type: ignore[assignment]
-                h, c_l, _ = r_layer(h, kv_sel, reg_sel, sample_mask=valid_sel, x3_prev=x3_prev_sel)
+                h, c_l, _ = r_layer(h, kv_sel, reg_sel, sample_mask=sel_active, x3_prev=x3_prev_sel)
                 counts_list.append(c_l)
                 if not torch.compiler.is_compiling():
                     self._last_expert_counts[idx] = c_l.detach()
@@ -1194,15 +1245,17 @@ class CorticalStackFlat(nn.Module):
             weighted_delta = (gate_sel.unsqueeze(-1) * delta_sel.float()).to(z_hat_6.dtype)
             z_hat = z_flat.index_add(0, top_idx, weighted_delta).view(P, S, D)
 
-            refine_mask_flat = torch.zeros((N_flat,), device=dev, dtype=torch.bool).scatter(0, top_idx, valid_sel)
+            refine_mask_flat = torch.zeros((N_flat,), device=dev, dtype=torch.bool).scatter(0, top_idx, sel_active)
             refine_gate_flat = torch.zeros((N_flat,), device=dev, dtype=torch.float32).scatter(0, top_idx, gate_sel)
             refine_mask = refine_mask_flat.view(P, S)
             refine_gate = refine_gate_flat.view(P, S)
 
-            # EMA update scalar buffer `tau_think` from k-th selected valid threshold
+            # EMA update scalar buffer `tau_think` at exact valid-segment percentile index `target_k - 1`
+            # Uses static-shape 1D `gather` (zero unbacked symbols under `fullgraph=True, dynamic=False`!)
             with torch.no_grad():
-                kth_valid = valid_sel[-1]
-                kth_val = top_u[-1].detach().float()
+                target_pos = (target_k - 1).clamp(0, k_ref - 1).unsqueeze(0)
+                kth_valid = valid_sel.gather(0, target_pos).squeeze(0)
+                kth_val = top_u.gather(0, target_pos).squeeze(0).detach().float()
                 tau_f = self.tau_think.float()
                 new_tau = self.cfg.tau_think_ema * tau_f + (1.0 - self.cfg.tau_think_ema) * kth_val
                 self.tau_think.copy_(torch.where(kth_valid, new_tau, tau_f).to(self.tau_think.dtype))
@@ -1230,13 +1283,42 @@ class CorticalStackFlat(nn.Module):
             delta_full = (h - z_flat).view(P, S, D)
             z_hat = z_hat_6 + (refine_gate.unsqueeze(-1) * delta_full.float()).to(z_hat_6.dtype)
 
+        return z_hat_6, z_hat, u_n, refine_mask, refine_gate, self.tau_think.detach().clone(), counts_list
+
+    def forward_predict_and_refine(
+        self,
+        x_seed: torch.Tensor,
+        x3_prev: torch.Tensor,
+        g2_prior: CarrierScanOut,
+        ring_kv: Optional[torch.Tensor],
+        seg_doc_id: torch.Tensor,
+        seg_start_depth: torch.Tensor,
+        seg_end_depth: torch.Tensor,
+        seg_l_reg: torch.Tensor,
+        seg_valid: torch.Tensor,
+    ) -> CorticalPredOut:
+        """L4–L6 full prediction (with unified 265-col softmax on L4/L6 if enabled) + R5 L7–L8 refine."""
+        fn = self._compiled_pred_ref if self._compiled_pred_ref is not None else self._forward_predict_and_refine_impl
+        z_hat_6, z_hat, u_n, refine_mask, refine_gate, tau_out, counts_list = fn(
+            x_seed,
+            x3_prev,
+            g2_prior.slots_seq,
+            g2_prior.edges_seq,
+            g2_prior.occ_seq,
+            ring_kv,
+            seg_doc_id,
+            seg_start_depth,
+            seg_end_depth,
+            seg_l_reg,
+            seg_valid,
+        )
         return CorticalPredOut(
             z_hat_6=z_hat_6,
             z_hat=z_hat,
             u_n=u_n,
             refine_mask=refine_mask,
             refine_gate=refine_gate,
-            tau_think=self.tau_think.detach().clone(),
+            tau_think=tau_out,
             expert_counts=counts_list,
         )
 

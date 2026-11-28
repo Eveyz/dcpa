@@ -408,7 +408,10 @@ def main() -> None:
 
     model = DCPAModelFlat(cfg).to(device=device)
     param_info = model.count_parameters()
-    optimizer = torch.optim.AdamW(model.parameter_groups())
+    opt_kw: dict[str, Any] = {"betas": (0.9, 0.95)}
+    if device.type == "cuda":
+        opt_kw["fused"] = True
+    optimizer = torch.optim.AdamW(model.parameter_groups(), **opt_kw)
 
     start_step = 0
     best_val_bpc = float("inf")
@@ -556,14 +559,16 @@ def main() -> None:
             is_final = completed_step == total_steps
             is_log_step = (completed_step == 1) or (completed_step % 10 == 0) or (completed_step % eval_every == 0) or is_final or due
 
-            # Only pay host-device sync on health/log/save boundaries (zero per-step sync bubbles on CUDA!)
+            # Single D2H sync per optimizer step with full Watchdog health & `max_healthy_gn` coverage
             loss_t = last_out.loss_total.detach() if last_out is not None else torch.tensor(float("nan"), device=device)
             if is_log_step or device.type != "cuda":
-                grad_norm = float(grad_norm_t.item())
-                loss_val = float(loss_t.item())
+                stats_cpu = torch.stack([loss_t.float(), grad_norm_t.float()]).to("cpu")
+                loss_val = float(stats_cpu[0].item())
+                grad_norm = float(stats_cpu[1].item())
                 step_healthy = bool(math.isfinite(loss_val) and math.isfinite(grad_norm) and grad_norm <= max_healthy_gn)
             else:
-                step_healthy = bool(torch.isfinite(loss_t).item() and torch.isfinite(grad_norm_t).item())
+                healthy_t = torch.isfinite(loss_t) & torch.isfinite(grad_norm_t) & (grad_norm_t <= max_healthy_gn)
+                step_healthy = bool(healthy_t.item())
                 grad_norm = 0.0
                 loss_val = 0.0
 

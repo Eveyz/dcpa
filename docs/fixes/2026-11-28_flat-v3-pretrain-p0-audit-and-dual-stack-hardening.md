@@ -115,3 +115,32 @@
   - `pytest tests/test_flat_*.py`：**57/57 PASSED**（含同步参考实现后的 `tests/test_flat_ws4_hippocampus.py` 8/8）
   - `gates/run_flat_killgate_5k.py --smoke`：**PASS**
   - `train/train_flat.py --smoke`：**PASS**
+
+---
+
+## 五、二次交叉审计增量收尾（5k 门禁前必改项）
+
+在 `504998f` 之后，针对第二轮深度复审确认的 4 组漏项与新发现的动力学不动点问题，完成了以下增量加固：
+
+1. **`occ_relax = 0.995` + `full_gate_temp = 0.05` 根治 38 段静默抹除与“僵尸槽”不动点（Python / YAML / Rust 同步）**
+   - 原 `occ_relax = 0.96` 会令未命中槽在 38 段（~360B）内跌破 `full_gate_center = 0.20` 被空槽分支静默覆盖且绕过海马体淘汰信号；调至 `0.995` 将寿命延长至 ~313 段（~3,000B）并保留归并打分器的时间新旧对比度。
+   - **实测新发现**：单独把 `occ_relax` 调高至 `0.995` 时，原 `full_gate_temp = 0.10` 在 `min_free_rho = 0.603` 处仍保留 `1.75%` 的 Sigmoid 尾漏，正好与 `0.5%` 占用率衰减构成稳定不动点，持续向最冷槽混入随机向量并把范数压坍至解析值 `0.088`（5/15 随机种子在 512 步测试中触发 `< 0.15` 坍缩）。将 `full_gate_temp` 收紧至 `0.05`（最大斜率仍仅 `5.0`，尾漏降至 `0.033%`）后，15 个随机种子 × 512 步实测坍缩率从 `5/15` 降至 **`0/15`**，最差槽位范数由 `0.0762` 跃升至 **`0.6626`**。
+   - 同步更新 [interfaces.py](../../dcpa-train-py/dcpa/interfaces.py)、4 份 `configs/v3/*.yaml` 与 Rust [config.rs](../../dcpa-core-rs/src/flat/config.rs)（一并补齐 Rust `default_lambda_halt = 0.2` 与 `flat_206m().n_heads = 12`）。
+
+2. **`CorticalStackFlat` 方法级 `torch.compile` + 零同步精确有效段 `25%` 精修与第 75 百分位 `tau_think`**
+   - 为 `CorticalStackFlat` 新增 `enable_compiled_methods()` / `disable_compiled_methods()`（独立编译 `_forward_pre_g1_impl` / `_forward_post_g1_impl` / `_forward_predict_and_refine_impl` 纯张量内核，零 `_orig_mod.` 键污染）并接入 `DCPAModelFlat.enable_compiled_submodules()`，补上占 GPU 算力 70%+ 的皮层编译缺口。
+   - 训练态 `L7–L8` 保留静态 `k_ref = round(refine_frac * N_flat)`（绝不引入动态形状，也不因硬压 `0.17` 而在中文/代码高密段或 100% 有效单测中截断），在 GPU 上以零同步计算 `target_k = round(n_valid * refine_frac).clamp(1, k_ref)` 掩码 `sel_active = valid_sel & (arange(k_ref) < target_k)`，并用静态形状 1D `gather(0, (target_k - 1).unsqueeze(0))`（`fullgraph=True, dynamic=False` 原生零 unbacked symbol）更新精确的第 75 百分位 `tau_think`。
+
+3. **`SGSCFlat` 断开 `s_ste_end` 伪梯度 + 嵌入/行归一化头 WD 豁免 + `StaticGridBatch.pin_memory()`**
+   - [sgsc.py](../../dcpa-train-py/dcpa/modules/sgsc.py) 在 `norm_f(h_end + s_ste_end.detach() * agg)` 处断开残差尺度伪梯度，消除对 `theta_raw` / `log_temp_sgsc` 的噪声干扰。
+   - [model_flat.py](../../dcpa-train-py/dcpa/model_flat.py) 将 `sgsc.{embed, w_out, lang_embed, style_embed}.weight` 纳入 `weight_decay = 0.0` 显式免除清单。
+   - [interfaces.py](../../dcpa-train-py/dcpa/interfaces.py) 为 `StaticGridBatch` 补齐 `.pin_memory()`，真正激活 `DataLoader(pin_memory=True)` + `non_blocking=True` 异步 H2D。
+
+4. **训练器与 `killgate_5k` 优化器/同步/微预热收口**
+   - [train_flat.py](../../train/train_flat.py) 与 [run_flat_killgate_5k.py](../../gates/run_flat_killgate_5k.py) 统一启用 `AdamW(betas=(0.9, 0.95), fused=(device.type == "cuda"))`。
+   - `train_flat.py` 将日志步双 `.item()` 合并为单次 `torch.stack(...).to("cpu")`，非日志 CUDA 步合并为单次 1 字节布尔归约并补齐 `grad_norm_t <= max_healthy_gn` 拦截（消除 9/10 步的 Watchdog 盲区）。
+   - `run_flat_killgate_5k.py` 为 Run A / B / C 统一增加 200 步线性 LR 微预热（`0.1 -> 1.0`），并将 `opt` 构造前置到 `enable_compiled_submodules()` 之前。
+
+### 留待 5k 门禁通过后、206M 五阶段大训前实施（不阻塞 5k 门禁）
+- **Stage 4 海马体 35GB Autograd 显存炸弹排雷**：利用 `evict_weight` 严格仅 `(u*, v*)` 2 槽非零的数学性质，将理解侧缓冲与表达侧三角求解从 `K=8` 无损化简为 `2` 槽（显存降 4 倍、表达侧求解从 `256³` 降为 `64³`），叠加 `C=32` 块级 Checkpointing、删死张量 `prec_bu_seq`、以及 `is_assim` 保护高显著度 `elig_f`（同步 Rust `absorb_segment`）。
+- **Stage 4 Window Dropout / 长距 Wug 混采** + **Stage 5 同步冻结 `sgsc.theta_raw` 与词干投影** + **Stage 4 海马体新解冻参数组 2x–3x LR 补偿**。

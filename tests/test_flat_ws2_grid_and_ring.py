@@ -435,7 +435,13 @@ def test_sgsc_flat_and_pmd_flat_end_to_end_temps_overflow_and_compile() -> None:
     sgsc_prior_ce = F.cross_entropy(
         bridge2.prior_logits.reshape(-1, 256), batch.x_bytes.reshape(-1).long()
     )
-    loss = pmd_out2.ce_loss + pmd_out2.halt_loss + 0.2 * sgsc_prior_ce + 0.01 * bridge2.x0.pow(2).mean()
+    loss = (
+        pmd_out2.ce_loss
+        + pmd_out2.halt_loss
+        + 0.2 * sgsc_prior_ce
+        + 0.01 * bridge2.x0.pow(2).mean()
+        + 0.01 * bridge2.s_tilde.pow(2).mean()
+    )
     loss.backward()
     for name, param in [
         ("sgsc.log_temp_sgsc", sgsc.log_temp_sgsc),
@@ -487,18 +493,18 @@ def test_sgsc_flat_and_pmd_flat_end_to_end_temps_overflow_and_compile() -> None:
             b = StaticGridBatch(xb, did, dst, den, lw, meta)
             br = self.sgsc(b)
             po = self.pmd(b, br, br.f_stem)
-            return po.ce_loss, po.halt_loss, br.x0, po.byte_logits
+            return po.ce_loss, po.halt_loss, br.x0, br.s_tilde, po.byte_logits
 
     wrapper = _WS2BridgeModel(sgsc, pmd)
     compiled_ws2 = torch.compile(wrapper, backend="aot_eager", fullgraph=True, dynamic=False)
     sgsc.zero_grad()
     pmd.zero_grad()
-    ce_c, halt_c, x0_c, logits_c = compiled_ws2(
+    ce_c, halt_c, x0_c, s_tilde_c, logits_c = compiled_ws2(
         batch.x_bytes, batch.doc_id_byte, batch.doc_start_byte, batch.doc_end_byte, batch.loss_weight, batch.doc_meta
     )
     assert torch.allclose(ce_c, pmd_out2.ce_loss.detach(), atol=1e-4)
     assert torch.allclose(x0_c, bridge2.x0.detach(), atol=1e-4)
-    (ce_c + halt_c + 0.01 * x0_c.pow(2).mean()).backward()
+    (ce_c + halt_c + 0.01 * x0_c.pow(2).mean() + 0.01 * s_tilde_c.pow(2).mean()).backward()
     assert sgsc.log_temp_sgsc.grad is not None and torch.isfinite(sgsc.log_temp_sgsc.grad).all().item()
     assert pmd.log_temp_pmd.grad is not None and torch.isfinite(pmd.log_temp_pmd.grad).all().item()
 
@@ -734,20 +740,21 @@ def test_ws2_mps_inductor_fullgraph_compile() -> None:
             br = self.sgsc(b)
             f_cp = self.ring(br.x0, br.f_stem, br.seg_doc_id, br.seg_start_depth, br.seg_end_depth)
             po = self.pmd(b, br, br.f_stem + f_cp)
-            return po.ce_loss, po.halt_loss, f_cp
+            return po.ce_loss, po.halt_loss, f_cp, br.s_tilde
 
     mod = _FullWS2MPS()
-    eager_ce, eager_halt, eager_cp = mod(
+    eager_ce, eager_halt, eager_cp, eager_st = mod(
         batch.x_bytes, batch.doc_id_byte, batch.doc_start_byte, batch.doc_end_byte, batch.loss_weight, batch.doc_meta
     )
     compiled = torch.compile(mod, backend="inductor", fullgraph=True, dynamic=False)
-    comp_ce, comp_halt, comp_cp = compiled(
+    comp_ce, comp_halt, comp_cp, comp_st = compiled(
         batch.x_bytes, batch.doc_id_byte, batch.doc_start_byte, batch.doc_end_byte, batch.loss_weight, batch.doc_meta
     )
     assert torch.allclose(comp_ce, eager_ce, atol=1e-4)
     assert torch.allclose(comp_halt, eager_halt, atol=1e-4)
     assert torch.allclose(comp_cp, eager_cp, atol=1e-4)
-    (comp_ce + comp_halt).backward()
+    assert torch.allclose(comp_st, eager_st, atol=1e-4)
+    (comp_ce + comp_halt + 0.01 * comp_st.pow(2).mean()).backward()
     assert sgsc.log_temp_sgsc.grad is not None and torch.isfinite(sgsc.log_temp_sgsc.grad).all().item()
     assert pmd.log_temp_pmd.grad is not None and torch.isfinite(pmd.log_temp_pmd.grad).all().item()
     assert ring.b_sink.grad is not None and torch.isfinite(ring.b_sink.grad).all().item()

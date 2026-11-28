@@ -24,10 +24,10 @@ model:
   c_scan: 16
   occ_min: 0.05
   occ_max: 0.95
-  occ_relax: 0.96
+  occ_relax: 0.995
   slot_keep_max: 0.990
   full_gate_center: 0.20
-  full_gate_temp: 0.10
+  full_gate_temp: 0.05
   edge_decay: 0.97
   carrier_grad_guard: none   # Lock final value ("none" vs "router_sg") after 48M 5k Gate B
   n_layers: 8

@@ -718,7 +718,9 @@ class SGSCFlat(nn.Module):
         weighted_v = gamma.unsqueeze(-1).to(v_rot.dtype) * v_rot
         agg = static_segment_scatter_add(weighted_v, seg_map.byte_to_seg, S)  # [P, S, d_s]
 
-        f_stem_raw = self.norm_f(h_end + s_ste_end.unsqueeze(-1).to(agg.dtype) * agg)
+        # Detach s_ste_end (identically 1.0 on valid segment ends) so norm_f scale invariance never
+        # injects spurious <grad, agg> residual-balance gradients into theta_raw / prior_logits!
+        f_stem_raw = self.norm_f(h_end + s_ste_end.detach().unsqueeze(-1).to(agg.dtype) * agg)
         valid_3d = seg_map.seg_valid.unsqueeze(-1)
         f_stem = torch.where(valid_3d, f_stem_raw, torch.zeros_like(f_stem_raw))
 

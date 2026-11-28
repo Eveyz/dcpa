@@ -266,13 +266,17 @@ class DCPAModelFlat(nn.Module):
         ] + self.hippocampus.scalar_gate_parameters()
         scalar_ids = {id(p) for p in scalar_params}
 
-        # Initial state matrices (`ndim >= 2` but must NEVER be shrunk toward zero by weight decay)
+        # Initial state matrices, embeddings, & row-L2-normalized heads (`ndim >= 2` but exempt from WD)
         no_decay_explicit_ids: set[int] = {
             id(self.carrier_g1.init_slots_raw),
             id(self.carrier_g1.init_edges_raw),
             id(self.carrier_g2.init_slots_raw),
             id(self.carrier_g2.init_edges_raw),
             id(self.sgsc.conv_w),
+            id(self.sgsc.embed.weight),
+            id(self.sgsc.w_out.weight),
+            id(self.sgsc.lang_embed.weight),
+            id(self.sgsc.style_embed.weight),
         }
 
         seen: set[int] = set(scalar_ids)
@@ -333,6 +337,8 @@ class DCPAModelFlat(nn.Module):
         compiled.append("carrier_g1.chunk")
         self.carrier_g2.enable_compiled_chunk(**compile_kw)
         compiled.append("carrier_g2.chunk")
+        self.cortical.enable_compiled_methods(**compile_kw)
+        compiled.append("cortical")
         self.copy_ring = torch.compile(self.copy_ring, **compile_kw)  # type: ignore[assignment]
         compiled.append("copy_ring")
         self.pmd = torch.compile(self.pmd, **compile_kw)  # type: ignore[assignment]
@@ -348,6 +354,7 @@ class DCPAModelFlat(nn.Module):
         self.pmd = unwrap_compiled_module(self.pmd)  # type: ignore[assignment]
         self.carrier_g1.disable_compiled_chunk()
         self.carrier_g2.disable_compiled_chunk()
+        self.cortical.disable_compiled_methods()
 
     @torch.no_grad()
     def post_optimizer_step(self, out: DCPAFlatForwardOutput, expert_counts_override: Optional[list[torch.Tensor]] = None) -> None:

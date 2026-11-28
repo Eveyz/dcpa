@@ -279,6 +279,24 @@ def _make_batch_stream(
             yield synth[idx % len(synth)]
 
 
+def _make_adamw(param_groups: list[dict[str, Any]], device: torch.device) -> torch.optim.AdamW:
+    kw: dict[str, Any] = {"betas": (0.9, 0.95)}
+    if device.type == "cuda":
+        kw["fused"] = True
+    return torch.optim.AdamW(param_groups, **kw)
+
+
+def _apply_micro_warmup(opt: torch.optim.Optimizer, base_lrs: list[float], step_idx: int, warmup_steps: int) -> None:
+    if warmup_steps <= 0 or step_idx >= warmup_steps:
+        if warmup_steps > 0 and step_idx == warmup_steps:
+            for pg, blr in zip(opt.param_groups, base_lrs):
+                pg["lr"] = blr
+        return
+    mult = 0.1 + 0.9 * (float(step_idx + 1) / float(warmup_steps))
+    for pg, blr in zip(opt.param_groups, base_lrs):
+        pg["lr"] = blr * mult
+
+
 def _train_flat_branch(
     name: str,
     cfg: DCPAFlatConfig,
@@ -298,11 +316,13 @@ def _train_flat_branch(
     model.sgsc.load_state_dict(sensory_state["sgsc"])
     model.pmd.load_state_dict(sensory_state["pmd"])
     model.set_stage_mode("cortex")
-    if compile_chunks and device.type == "cuda":
-        model.enable_compiled_submodules(device)
     model.train()
 
-    opt = torch.optim.AdamW(model.parameter_groups())
+    opt = _make_adamw(model.parameter_groups(), device)
+    base_lrs = [float(pg["lr"]) for pg in opt.param_groups]
+    lr_warmup = min(200, max(1, int(steps) // 10)) if int(steps) >= 20 else 0
+    if compile_chunks and device.type == "cuda":
+        model.enable_compiled_submodules(device)
 
     total_bytes = 0
     steady_bytes = 0
@@ -317,6 +337,7 @@ def _train_flat_branch(
         if s_idx == steady_start:
             synchronize(device)
             t_steady = time.perf_counter()
+        _apply_micro_warmup(opt, base_lrs, s_idx, lr_warmup)
         opt.zero_grad(set_to_none=True)
         with amp_autocast(device, enabled=use_bf16):
             out = model(b, stage="cortex", hip_enabled=False)
@@ -378,13 +399,16 @@ def _train_legacy_branch(
     torch.manual_seed(42)
     model = DCPAModel(legacy_cfg).to(device=device)
     model.train()
-    opt = torch.optim.AdamW(model.parameter_groups())
+    opt = _make_adamw(model.parameter_groups(), device)
+    base_lrs = [float(pg["lr"]) for pg in opt.param_groups]
+    lr_warmup = min(200, max(1, int(steps) // 10)) if int(steps) >= 20 else 0
 
     total_bytes = 0
     synchronize(device)
     t0 = time.perf_counter()
     last_loss = 0.0
-    for b in batch_factory(steps):
+    for s_idx, b in enumerate(batch_factory(steps)):
+        _apply_micro_warmup(opt, base_lrs, s_idx, lr_warmup)
         raw, langs, lw = _legacy_lane_inputs(b, legacy_cfg.num_lang_domains)
         opt.zero_grad(set_to_none=True)
         with amp_autocast(device, enabled=use_bf16):
@@ -498,7 +522,7 @@ def run_killgate(
     warmup_model = DCPAModelFlat(cfg_c).to(device=device)
     warmup_model.set_stage_mode("sensory")
     warmup_model.train()
-    w_opt = torch.optim.AdamW(warmup_model.parameter_groups())
+    w_opt = _make_adamw(warmup_model.parameter_groups(), device)
     for b in _train_stream(eff_warmup, seed_offset=0):
         w_opt.zero_grad(set_to_none=True)
         with amp_autocast(device, enabled=use_bf16):

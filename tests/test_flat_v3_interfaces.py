@@ -66,7 +66,8 @@ def test_flat_config_presets_and_json_roundtrip(tmp_path: Path) -> None:
         assert cfg.grid_segs % cfg.window_size == 0
         assert cfg.grid_segs % cfg.c_scan == 0
         assert cfg.num_merge_pairs_full == cfg.k_slots * (cfg.k_slots - 1) == 56
-        assert cfg.full_gate_temp == pytest.approx(0.10)
+        assert cfg.full_gate_temp == pytest.approx(0.05)
+        assert cfg.occ_relax == pytest.approx(0.995)
         assert cfg.local_window_layers == (0, 3, 5)
         p = tmp_path / "flat_cfg.json"
         cfg.save_json(p)

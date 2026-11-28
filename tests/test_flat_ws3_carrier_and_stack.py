@@ -677,8 +677,12 @@ def test_r5_eval_threshold_matches_single_step_streaming_parity(use_win: bool) -
             x_seed_batch, x_seed_batch, g2_batch, sem_batch if use_win else None,
             seg_doc_id, seg_start_depth, seg_end_depth, seg_l_reg, seg_valid,
         )
-        # Set tau_think to exact median of u_n so ~50% refine and ~50% skip
-        stack.tau_think.copy_(pred_probe.u_n.median())
+        # Set tau_think to midpoint between central sorted u_n values (strictly ~50% refine / ~50% skip,
+        # avoiding a 0.0-ULP tie on a sample element between batched vs streaming fp32 matmul order!)
+        u_sorted = pred_probe.u_n.reshape(-1).sort().values
+        mid_idx = u_sorted.numel() // 2
+        tau_mid = 0.5 * (u_sorted[mid_idx - 1] + u_sorted[mid_idx])
+        stack.tau_think.copy_(tau_mid)
         pred_batch = stack.forward_predict_and_refine(
             x_seed_batch, x_seed_batch, g2_batch, sem_batch if use_win else None,
             seg_doc_id, seg_start_depth, seg_end_depth, seg_l_reg, seg_valid,

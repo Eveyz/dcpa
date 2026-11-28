@@ -54,7 +54,7 @@ fn default_occ_max() -> f32 {
     0.95
 }
 fn default_occ_relax() -> f32 {
-    0.96
+    0.995
 }
 fn default_slot_keep_max() -> f32 {
     0.990
@@ -63,7 +63,7 @@ fn default_full_gate_center() -> f32 {
     0.20
 }
 fn default_full_gate_temp() -> f32 {
-    0.10
+    0.05
 }
 fn default_edge_decay() -> f32 {
     0.97
@@ -237,7 +237,7 @@ fn default_lambda_rate() -> f32 {
     2.0
 }
 fn default_lambda_halt() -> f32 {
-    1.0
+    0.2
 }
 fn default_lambda_var() -> f32 {
     1.0
@@ -574,7 +574,7 @@ impl DcpaFlatConfig {
         Self {
             d_s: 192,
             d_concept: 768,
-            n_heads: 8,
+            n_heads: 12,
             k_slots: 8,
             d_r: 32,
             d_merge: 256,

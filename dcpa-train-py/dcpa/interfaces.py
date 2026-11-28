@@ -107,10 +107,10 @@ class DCPAFlatConfig:
     c_scan: int = 16
     occ_min: float = 0.05
     occ_max: float = 0.95
-    occ_relax: float = 0.96
+    occ_relax: float = 0.995
     slot_keep_max: float = 0.990
     full_gate_center: float = 0.20
-    full_gate_temp: float = 0.10  # R3: relaxed from 0.04 -> 0.10 (max derivative 2.5)
+    full_gate_temp: float = 0.05  # R3: relaxed from 0.04 -> 0.10 (max derivative 2.5)
     edge_decay: float = 0.97      # R3: explicit edge spectral contraction gamma_A in (0, 0.99]
     carrier_grad_guard: CarrierGradGuardMode = "none"
     carrier_grad_clip_rms: float = 1.0
@@ -384,6 +384,17 @@ class StaticGridBatch:
             doc_end_byte=self.doc_end_byte.to(device=device, non_blocking=non_blocking),
             loss_weight=self.loss_weight.to(device=device, non_blocking=non_blocking),
             doc_meta=self.doc_meta.to(device=device, non_blocking=non_blocking),
+        )
+
+    def pin_memory(self) -> StaticGridBatch:
+        """Enable PyTorch `DataLoader(pin_memory=True)` page-locked host memory for async H2D."""
+        return StaticGridBatch(
+            x_bytes=self.x_bytes.pin_memory(),
+            doc_id_byte=self.doc_id_byte.pin_memory(),
+            doc_start_byte=self.doc_start_byte.pin_memory(),
+            doc_end_byte=self.doc_end_byte.pin_memory(),
+            loss_weight=self.loss_weight.pin_memory(),
+            doc_meta=self.doc_meta.pin_memory(),
         )
 
     def validate(self) -> None:

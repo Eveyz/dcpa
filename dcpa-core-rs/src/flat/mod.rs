@@ -45,7 +45,8 @@ mod tests {
 
         let cfg206 = DcpaFlatConfig::flat_206m();
         assert!(cfg206.validate().is_ok());
-        assert_eq!(cfg206.copy_ring_dk(), 24);
+        assert_eq!(cfg206.d_head(), 64);
+        assert_eq!(cfg206.copy_ring_dk(), 16);
     }
 
     #[test]

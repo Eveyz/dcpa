@@ -398,13 +398,13 @@ def _stream_hf_code_alchemy(max_items: int, validator: CodeASTValidator) -> Iter
     got = 0
     ocr_cap = max(1, int(max_items * 0.55))
     try:
-        ds_ocr = load_dataset("nvidia/OpenCodeReasoning-2", split="train", streaming=True)
+        ds_ocr = load_dataset("nvidia/OpenCodeReasoning", "split_0", split="split_0", streaming=True)
         for row in ds_ocr:
             if got >= ocr_cap:
                 break
             q = str(row.get("input") or row.get("question") or row.get("prompt") or "").strip()
             out = str(row.get("output") or row.get("solution") or row.get("response") or "").strip()
-            if not q or not out or len(q.encode("utf-8", errors="ignore")) > 1200:
+            if not q or len(q) < 16 or not out or len(q.encode("utf-8", errors="ignore")) > 1200:
                 continue
             m_py = _PY_FENCE_RE.search(out)
             m_js = _JS_FENCE_RE.search(out)
@@ -432,7 +432,12 @@ def _stream_hf_code_alchemy(max_items: int, validator: CodeASTValidator) -> Iter
         if got >= max_items:
             break
         try:
-            ds_cp = load_dataset("bigcode/commitpackft", subset, split="train", streaming=True)
+            ds_cp = load_dataset(
+                "json",
+                data_files=f"hf://datasets/bigcode/commitpackft/data/{subset}/data.jsonl",
+                split="train",
+                streaming=True,
+            )
             for row in ds_cp:
                 if got >= max_items:
                     break

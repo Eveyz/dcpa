@@ -70,6 +70,8 @@ SID_SWALLOW_CODE_V2_V3 = 49
 SID_NEMOTRON_CC_CODE_V1 = 50
 SID_OPENCODEREASONING = 51
 SID_OPENCODEREASONING_2 = 52
+SID_FINEWEB_EDU_100BT_V3 = 53
+SID_STACK_SMOL_XL_JS_V3 = 54
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,8 @@ class SourceDescriptor:
     description: str
     config_name: Optional[str] = None
     split: str = "train"
+    data_dir: Optional[str] = None
+    parquet_glob: Optional[str] = None
 
 
 V3_FLAT_SOURCE_DESCRIPTORS: dict[str, SourceDescriptor] = {
@@ -93,15 +97,29 @@ V3_FLAT_SOURCE_DESCRIPTORS: dict[str, SourceDescriptor] = {
         lang_id=0,
         stage_tier=2,
         text_fields=("text", "content"),
-        description="High-purity English rephrased/filtered web prose & STEM (Nemotron-CC v2.1).",
+        description="High-purity English rephrased/filtered web prose & STEM (Nemotron-CC v2.1; gated=manual).",
+        config_name="High-Quality",
+        split="train",
+    ),
+    "HuggingFaceFW/fineweb-edu": SourceDescriptor(
+        repo_id="HuggingFaceFW/fineweb-edu",
+        source_id=SID_FINEWEB_EDU_100BT_V3,
+        lang_id=0,
+        stage_tier=2,
+        text_fields=("text", "content"),
+        description="Ungated high-purity English educational web prose (FineWeb-Edu sample-100BT).",
+        config_name="sample-100BT",
+        split="train",
     ),
     "epfml/FineWeb2-HQ": SourceDescriptor(
         repo_id="epfml/FineWeb2-HQ",
         source_id=SID_FINEWEB2_HQ,
-        lang_id=0,
+        lang_id=1,
         stage_tier=2,
         text_fields=("text", "content"),
-        description="Classifier-filtered high-quality web corpus (EPFL FineWeb2-HQ).",
+        description="Classifier-filtered high-quality Chinese web corpus (EPFL FineWeb2-HQ cmn_Hani).",
+        config_name="cmn_Hani",
+        split="train",
     ),
     "opencsg/chinese-fineweb-edu-v2": SourceDescriptor(
         repo_id="opencsg/chinese-fineweb-edu-v2",
@@ -110,6 +128,8 @@ V3_FLAT_SOURCE_DESCRIPTORS: dict[str, SourceDescriptor] = {
         stage_tier=2,
         text_fields=("text", "content"),
         description="High-score Chinese educational web prose (OpenCSG Chinese FineWeb-Edu v2).",
+        config_name=None,
+        split="train",
     ),
     "opencsg/Fineweb-Edu-Chinese-V2.2": SourceDescriptor(
         repo_id="opencsg/Fineweb-Edu-Chinese-V2.2",
@@ -117,7 +137,10 @@ V3_FLAT_SOURCE_DESCRIPTORS: dict[str, SourceDescriptor] = {
         lang_id=1,
         stage_tier=2,
         text_fields=("text", "content"),
-        description="Updated Chinese educational prose & essays (OpenCSG Fineweb-Edu-Chinese V2.2).",
+        description="Updated Chinese educational score 4-5 prose (OpenCSG Fineweb-Edu-Chinese V2.2 parquet).",
+        config_name=None,
+        split="train",
+        parquet_glob="hf://datasets/opencsg/Fineweb-Edu-Chinese-V2.2/4_5/*.parquet",
     ),
     "opencsg/chinese-cosmopedia": SourceDescriptor(
         repo_id="opencsg/chinese-cosmopedia",
@@ -126,6 +149,8 @@ V3_FLAT_SOURCE_DESCRIPTORS: dict[str, SourceDescriptor] = {
         stage_tier=2,
         text_fields=("text", "content"),
         description="Synthetic Chinese textbooks, tutorials, and conceptual essays (Chinese Cosmopedia).",
+        config_name=None,
+        split="train",
     ),
     "BAAI/CCI3-HQ": SourceDescriptor(
         repo_id="BAAI/CCI3-HQ",
@@ -133,7 +158,9 @@ V3_FLAT_SOURCE_DESCRIPTORS: dict[str, SourceDescriptor] = {
         lang_id=1,
         stage_tier=2,
         text_fields=("text", "content"),
-        description="BAAI CCI3-HQ high-purity Chinese commentary & knowledge prose.",
+        description="BAAI CCI3-HQ high-purity Chinese commentary & knowledge prose (gated=auto).",
+        config_name=None,
+        split="train",
     ),
     "BAAI/Infinity-Instruct": SourceDescriptor(
         repo_id="BAAI/Infinity-Instruct",
@@ -141,7 +168,9 @@ V3_FLAT_SOURCE_DESCRIPTORS: dict[str, SourceDescriptor] = {
         lang_id=1,
         stage_tier=3,
         text_fields=("conversations", "text", "content"),
-        description="BAAI Infinity-Instruct bilingual reasoning & instructional dialogues.",
+        description="BAAI Infinity-Instruct bilingual reasoning & instructional dialogues (7M_core; gated=auto).",
+        config_name="7M_core",
+        split="train",
     ),
     "nvidia/Nemotron-CC-Math-v1": SourceDescriptor(
         repo_id="nvidia/Nemotron-CC-Math-v1",
@@ -149,15 +178,19 @@ V3_FLAT_SOURCE_DESCRIPTORS: dict[str, SourceDescriptor] = {
         lang_id=2,
         stage_tier=3,
         text_fields=("text", "content"),
-        description="Formal math derivations, symbolic equations & proofs (Nemotron-CC-Math v1).",
+        description="Formal math derivations, symbolic equations & proofs (Nemotron-CC-Math v1 4plus; gated=auto).",
+        config_name="4plus",
+        split="train",
     ),
     "tokyotech-llm/swallow-code-v2": SourceDescriptor(
         repo_id="tokyotech-llm/swallow-code-v2",
         source_id=SID_SWALLOW_CODE_V2_V3,
         lang_id=3,
         stage_tier=2,
-        text_fields=("text", "code", "content"),
-        description="Self-contained rewritten high-clarity Python modules (Swallow-Code v2).",
+        text_fields=("text", "improved_text", "code", "content"),
+        description="Self-contained rewritten high-clarity Python modules (Swallow-Code v2 stage4-llm-rewrite).",
+        config_name="stage4-llm-rewrite",
+        split="train",
     ),
     "nvidia/Nemotron-CC-Code-v1": SourceDescriptor(
         repo_id="nvidia/Nemotron-CC-Code-v1",
@@ -165,7 +198,9 @@ V3_FLAT_SOURCE_DESCRIPTORS: dict[str, SourceDescriptor] = {
         lang_id=3,
         stage_tier=3,
         text_fields=("text", "code", "content"),
-        description="High-purity web-extracted Python & JavaScript code (Nemotron-CC-Code v1).",
+        description="High-purity web-extracted Python & JavaScript code (Nemotron-CC-Code v1; gated=manual).",
+        config_name="data",
+        split="train",
     ),
     "nvidia/OpenCodeReasoning": SourceDescriptor(
         repo_id="nvidia/OpenCodeReasoning",
@@ -173,15 +208,30 @@ V3_FLAT_SOURCE_DESCRIPTORS: dict[str, SourceDescriptor] = {
         lang_id=3,
         stage_tier=3,
         text_fields=("solution", "output", "text", "code"),
-        description="Verified algorithmic code reasoning traces & solutions (OpenCodeReasoning).",
+        description="Verified algorithmic code reasoning traces & solutions (OpenCodeReasoning split_0).",
+        config_name="split_0",
+        split="split_0",
     ),
     "nvidia/OpenCodeReasoning-2": SourceDescriptor(
         repo_id="nvidia/OpenCodeReasoning-2",
         source_id=SID_OPENCODEREASONING_2,
         lang_id=3,
         stage_tier=3,
-        text_fields=("solution", "output", "text", "code"),
-        description="Expanded verified multi-language code reasoning solutions (OpenCodeReasoning-2).",
+        text_fields=("solution", "r1_generation", "output", "text", "code"),
+        description="Expanded verified Python code reasoning solutions (OpenCodeReasoning-2 train/python).",
+        config_name="train",
+        split="python",
+    ),
+    "bigcode/the-stack-smol-xl": SourceDescriptor(
+        repo_id="bigcode/the-stack-smol-xl",
+        source_id=SID_STACK_SMOL_XL_JS_V3,
+        lang_id=5,
+        stage_tier=2,
+        text_fields=("content", "text", "code"),
+        description="Ungated permissive JavaScript source modules (The Stack Smol XL data/javascript).",
+        config_name=None,
+        split="train",
+        data_dir="data/javascript",
     ),
 }
 
@@ -1101,8 +1151,18 @@ def stream_v3_flat_source(
         from datasets import load_dataset
         from data.hf_auth import hf_token_kwargs
 
-        load_args = [desc.repo_id] + ([desc.config_name] if desc.config_name else [])
-        ds = load_dataset(*load_args, split=desc.split, streaming=True, **hf_token_kwargs())
+        if desc.parquet_glob:
+            ds = load_dataset(
+                "parquet",
+                data_files=desc.parquet_glob,
+                split=desc.split,
+                streaming=True,
+                **hf_token_kwargs(),
+            )
+        else:
+            load_args = [desc.repo_id] + ([desc.config_name] if desc.config_name else [])
+            extra_kw = {"data_dir": desc.data_dir} if desc.data_dir else {}
+            ds = load_dataset(*load_args, split=desc.split, streaming=True, **extra_kw, **hf_token_kwargs())
         for row in ds:
             text_val = ""
             for field in desc.text_fields:
@@ -1193,7 +1253,7 @@ def stream_en_finephrase_s1() -> Iterator[tuple[bytes, int]]:
         from datasets import load_dataset
         from data.hf_auth import hf_token_kwargs
 
-        ds = load_dataset("HuggingFaceFW/finephrase", split="train", streaming=True, **hf_token_kwargs())
+        ds = load_dataset("HuggingFaceFW/finephrase", "all", split="train", streaming=True, **hf_token_kwargs())
         for row in ds:
             raw = row.get("text") or row.get("rephrased_text") or row.get("content") or ""
             for chunk in _chunk_bounded_paragraphs(str(raw), min_b=80, max_b=500):
@@ -1320,9 +1380,15 @@ def stream_formal_folio_and_logic_s2(max_folio_epochs: int = 3) -> Iterator[tupl
         except Exception:
             pass
 
-        # 3. LogiQA deductive arguments
+        # 3. LogiQA deductive arguments (direct parquet branch compatible with datasets>=4.0)
         try:
-            ds_lq = load_dataset("lucasmccabe/logiqa", split="train", streaming=True, **tok_kw)
+            ds_lq = load_dataset(
+                "parquet",
+                data_files="hf://datasets/lucasmccabe/logiqa@refs/convert/parquet/default/train/*.parquet",
+                split="train",
+                streaming=True,
+                **tok_kw,
+            )
             for row in ds_lq:
                 ctx = str(row.get("context") or "").strip()
                 query = str(row.get("query") or "").strip()
@@ -1379,11 +1445,12 @@ def stream_python_edu_and_swallow() -> Iterator[tuple[str, int]]:
         except Exception as exc:
             print(f"  [INFO] smollm-corpus/python-edu skipped ({type(exc).__name__}).", flush=True)
 
-        for repo in ("tokyotech-llm/swallow-code-v2", "tokyotech-llm/swallow-code"):
+        for repo, cfg_name in (("tokyotech-llm/swallow-code-v2", "stage4-llm-rewrite"), ("tokyotech-llm/swallow-code", None)):
             try:
-                ds_sw = load_dataset(repo, split="train", streaming=True, **tok_kw)
+                args_sw = [repo] + ([cfg_name] if cfg_name else [])
+                ds_sw = load_dataset(*args_sw, split="train", streaming=True, **tok_kw)
                 for row in ds_sw:
-                    code = str(row.get("text") or row.get("code") or row.get("content") or "").strip()
+                    code = str(row.get("text") or row.get("improved_text") or row.get("code") or row.get("content") or "").strip()
                     if 160 <= len(code.encode("utf-8", errors="ignore")) <= 4096:
                         yield code, SID_SWALLOW_PY_S2
                 break

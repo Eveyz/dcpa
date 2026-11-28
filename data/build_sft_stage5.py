@@ -1009,7 +1009,12 @@ def _stream_hf_v2_code_bugfix(rng: random.Random, max_items: int, max_doc_bytes:
         if yielded >= max_items:
             break
         try:
-            ds = load_dataset("bigcode/commitpackft", lang_cfg, split="train", streaming=True)
+            ds = load_dataset(
+                "json",
+                data_files=f"hf://datasets/bigcode/commitpackft/data/{lang_cfg}/data.jsonl",
+                split="train",
+                streaming=True,
+            )
             for row in ds:
                 if yielded >= max_items:
                     break

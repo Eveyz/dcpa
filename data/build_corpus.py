@@ -1354,8 +1354,9 @@ def _populate_v3_flat_domain(
 
     if not offline:
         v3_repos_by_lang: dict[int, tuple[str, ...]] = {
-            0: ("nvidia/Nemotron-CC-v2.1", "epfml/FineWeb2-HQ"),
+            0: ("nvidia/Nemotron-CC-v2.1", "HuggingFaceFW/fineweb-edu"),
             1: (
+                "epfml/FineWeb2-HQ",
                 "opencsg/chinese-fineweb-edu-v2",
                 "opencsg/Fineweb-Edu-Chinese-V2.2",
                 "opencsg/chinese-cosmopedia",
@@ -1370,7 +1371,7 @@ def _populate_v3_flat_domain(
                 "nvidia/OpenCodeReasoning-2",
             ),
             4: (),
-            5: ("nvidia/Nemotron-CC-Code-v1",),
+            5: ("nvidia/Nemotron-CC-Code-v1", "bigcode/the-stack-smol-xl"),
         }
         for repo_id in v3_repos_by_lang.get(lang_id, ()):
             if acc.done:

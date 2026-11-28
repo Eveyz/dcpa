@@ -274,27 +274,38 @@ pub struct HippocampusFastWeights {
 
 impl HippocampusFastWeights {
     pub fn new(cfg: &DcpaConfig, precision: FastWeightPrecision) -> Self {
+        Self::new_with_dims(cfg.d_h, cfg.d_concept, cfg.d_s, cfg.gamma_hip, precision)
+    }
+
+    /// Construct column-major hippocampal fast weights directly from dimensions (shared by v2 & Flat v3.3).
+    pub fn new_with_dims(
+        d_h: usize,
+        d_concept: usize,
+        d_s: usize,
+        gamma_hip: f32,
+        precision: FastWeightPrecision,
+    ) -> Self {
         let m_c_from_l = match precision {
-            FastWeightPrecision::Bf16 => ColumnStorage::Bf16(AlignedVec::zeroed(cfg.d_h * cfg.d_concept)),
-            FastWeightPrecision::F32 => ColumnStorage::F32(AlignedVec::zeroed(cfg.d_h * cfg.d_concept)),
+            FastWeightPrecision::Bf16 => ColumnStorage::Bf16(AlignedVec::zeroed(d_h * d_concept)),
+            FastWeightPrecision::F32 => ColumnStorage::F32(AlignedVec::zeroed(d_h * d_concept)),
         };
         let m_l_from_c = match precision {
-            FastWeightPrecision::Bf16 => ColumnStorage::Bf16(AlignedVec::zeroed(cfg.d_h * cfg.d_s)),
-            FastWeightPrecision::F32 => ColumnStorage::F32(AlignedVec::zeroed(cfg.d_h * cfg.d_s)),
+            FastWeightPrecision::Bf16 => ColumnStorage::Bf16(AlignedVec::zeroed(d_h * d_s)),
+            FastWeightPrecision::F32 => ColumnStorage::F32(AlignedVec::zeroed(d_h * d_s)),
         };
         Self {
-            d_h: cfg.d_h,
-            d_concept: cfg.d_concept,
-            d_s: cfg.d_s,
-            gamma_hip: cfg.gamma_hip,
+            d_h,
+            d_concept,
+            d_s,
+            gamma_hip,
             step_count: 0,
             m_c_from_l,
             m_l_from_c,
-            u_lex: AlignedVec::zeroed(cfg.d_h),
-            u_sem: AlignedVec::zeroed(cfg.d_h),
-            col_step_lex: vec![0u64; cfg.d_h],
-            col_step_sem: vec![0u64; cfg.d_h],
-            col_hits_lex: vec![0u32; cfg.d_h],
+            u_lex: AlignedVec::zeroed(d_h),
+            u_sem: AlignedVec::zeroed(d_h),
+            col_step_lex: vec![0u64; d_h],
+            col_step_sem: vec![0u64; d_h],
+            col_hits_lex: vec![0u32; d_h],
         }
     }
 

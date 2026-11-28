@@ -12,6 +12,7 @@ extern crate alloc;
 pub mod bf16;
 pub mod config;
 pub mod engine;
+pub mod flat;
 pub mod simd;
 pub mod state;
 pub mod weights;

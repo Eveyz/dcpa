@@ -15,6 +15,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dcpa_core_rs::config::DcpaConfig;
 use dcpa_core_rs::engine::DcpaEngine;
+use dcpa_core_rs::flat::{
+    BrainSnapshotV3, DcpaFlatConfig, DcpaFlatEngine, DcpaFlatWeights, PluginExpertPackRs,
+};
 use dcpa_core_rs::state::{BrainSnapshot, FastWeightPrecision};
 use dcpa_core_rs::weights::{parse_safetensors, DcpaWeights};
 
@@ -1487,6 +1490,424 @@ fn cmd_chat(dir: &Path) {
     }
 }
 
+// =============================================================================
+// DCPA-Flat v3.3 Gate 6 Cross-Stack Parity (`verify-golden-flat`) & Benchmark (`bench-flat`)
+// =============================================================================
+
+struct FlatTraceBuffers {
+    spikes: Vec<u8>,
+    prior_logits: Vec<f32>,
+    f_stem: Vec<f32>,
+    x0: Vec<f32>,
+    x1: Vec<f32>,
+    g1_slots: Vec<f32>,
+    x3: Vec<f32>,
+    g2_prior_slots: Vec<f32>,
+    z_hat: Vec<f32>,
+    u_n: Vec<f32>,
+    f_copy: Vec<f32>,
+    f_hip: Vec<f32>,
+    rho_out: Vec<f32>,
+    f_out: Vec<f32>,
+    max_beta: Vec<f32>,
+    byte_logits: Vec<f32>,
+    p_seg_end: Vec<f32>,
+    charge_e: Vec<f32>,
+}
+
+impl FlatTraceBuffers {
+    fn with_capacity(t_len: usize, cfg: &DcpaFlatConfig) -> Self {
+        let d_s = cfg.d_s;
+        let d_c = cfg.d_concept;
+        let k = cfg.k_slots;
+        Self {
+            spikes: Vec::with_capacity(t_len),
+            prior_logits: Vec::with_capacity(t_len * 256),
+            f_stem: Vec::with_capacity(t_len * d_s),
+            x0: Vec::with_capacity(t_len * d_c),
+            x1: Vec::with_capacity(t_len * d_c),
+            g1_slots: Vec::with_capacity(t_len * k * d_c),
+            x3: Vec::with_capacity(t_len * d_c),
+            g2_prior_slots: Vec::with_capacity(t_len * k * d_c),
+            z_hat: Vec::with_capacity(t_len * d_c),
+            u_n: Vec::with_capacity(t_len),
+            f_copy: Vec::with_capacity(t_len * d_s),
+            f_hip: Vec::with_capacity(t_len * d_s),
+            rho_out: Vec::with_capacity(t_len),
+            f_out: Vec::with_capacity(t_len * d_s),
+            max_beta: Vec::with_capacity(t_len),
+            byte_logits: Vec::with_capacity(t_len * 256),
+            p_seg_end: Vec::with_capacity(t_len),
+            charge_e: Vec::with_capacity(t_len),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.spikes.clear();
+        self.prior_logits.clear();
+        self.f_stem.clear();
+        self.x0.clear();
+        self.x1.clear();
+        self.g1_slots.clear();
+        self.x3.clear();
+        self.g2_prior_slots.clear();
+        self.z_hat.clear();
+        self.u_n.clear();
+        self.f_copy.clear();
+        self.f_hip.clear();
+        self.rho_out.clear();
+        self.f_out.clear();
+        self.max_beta.clear();
+        self.byte_logits.clear();
+        self.p_seg_end.clear();
+        self.charge_e.clear();
+    }
+}
+
+/// Run exact single-pass streaming DCPA-Flat v3.3 inference into pre-allocated `out` (strictly 0 allocs!).
+fn run_flat_streaming_into(
+    engine: &mut DcpaFlatEngine,
+    raw_bytes: &[u8],
+    lang_id: usize,
+    style_id: usize,
+    out: &mut FlatTraceBuffers,
+) {
+    out.clear();
+    let t_len = raw_bytes.len();
+    let mut seg_start = 0usize;
+    let mut seg_idx: i32 = 0;
+
+    for t in 0..t_len {
+        let b = raw_bytes[t];
+        let force_end = t + 1 == t_len;
+        let b_out = engine.sgsc_ingest_byte(b, force_end);
+
+        out.prior_logits.extend_from_slice(&engine.scratch.prior_logits_256);
+        out.spikes.push(if b_out.spiked { 1u8 } else { 0u8 });
+
+        if b_out.spiked {
+            let t0 = seg_start;
+            let t1 = t + 1;
+            out.f_stem.extend_from_slice(&engine.scratch.f_stem);
+            out.x0.extend_from_slice(&engine.scratch.x0);
+
+            // (A) Strictly causal < s prediction BEFORE absorbing segment s
+            let prior_out = engine.predict_segment_prior(
+                lang_id,
+                style_id,
+                b_out.seg_start_depth,
+                seg_idx,
+                b_out.seg_unpin_trig,
+            );
+            out.z_hat.extend_from_slice(&engine.scratch.cort_z_hat);
+            out.u_n.push(prior_out.u_n);
+            out.f_copy.extend_from_slice(&engine.scratch.f_copy);
+            out.f_hip.extend_from_slice(&engine.scratch.f_hip);
+            out.rho_out.push(prior_out.rho_out);
+            out.f_out.extend_from_slice(&engine.scratch.f_out);
+
+            // (B) PMD byte-by-byte decoding over segment [t0..t1)
+            for (local_i, cur_t) in (t0..t1).enumerate() {
+                let prev_b = if cur_t == 0 { 0u8 } else { raw_bytes[cur_t - 1] };
+                let scratch_end_reset = cur_t >= 3
+                    && raw_bytes[cur_t - 3] == 0x1D
+                    && raw_bytes[cur_t - 2] == b'E'
+                    && raw_bytes[cur_t - 1] == 0x0A;
+                let extra_rst = scratch_end_reset || (cur_t == 0);
+                let pmd_out = engine.pmd_step_byte(prev_b, local_i + 1, extra_rst);
+                out.byte_logits.extend_from_slice(&engine.scratch.byte_logits_256);
+                out.p_seg_end.push(pmd_out.p_seg_end);
+                out.charge_e.push(pmd_out.charge_e);
+            }
+
+            // (C) Absorb completed segment s into stem ring, L1, G1, L2-L3, Hippocampus + G2
+            let seg_out = engine.absorb_segment(
+                seg_idx,
+                b_out.seg_end_depth,
+                b_out.seg_pin_trig,
+                b_out.seg_unpin_trig,
+                lang_id,
+                style_id,
+                b_out.sem_norm,
+                b_out.mean_info,
+            );
+            out.x1.extend_from_slice(&engine.scratch.cort_x1);
+            out.g1_slots.extend_from_slice(&engine.g1.slots);
+            out.x3.extend_from_slice(&engine.scratch.cort_x3);
+            out.g2_prior_slots.extend_from_slice(&engine.scratch.car_prior.slots);
+            out.max_beta.push(seg_out.max_beta);
+
+            seg_start = t1;
+            seg_idx += 1;
+        }
+    }
+}
+
+fn cmd_verify_golden_flat(dir: &Path) {
+    println!("=== Rust Gate 6 (DCPA-Flat v3.3): Cross-Stack Parity + Zero-Alloc + Zero-Drift Plugin ===");
+    let cfg_str = fs::read_to_string(dir.join("config.json")).expect("failed to read config.json");
+    let cfg = DcpaFlatConfig::from_json_str(&cfg_str).expect("invalid DCPAFlatConfig JSON");
+    let w_bytes = fs::read(dir.join("model.safetensors")).expect("failed to read model.safetensors");
+    let weights = DcpaFlatWeights::from_safetensors(cfg.clone(), &w_bytes)
+        .expect("failed to load model.safetensors");
+
+    let g_bytes = fs::read(dir.join("golden.safetensors")).expect("failed to read golden.safetensors");
+    let golden = parse_safetensors(&g_bytes).expect("failed to parse golden.safetensors");
+
+    let raw_bytes = &golden["raw_bytes"].data_u8;
+    let lang_id = golden["lang_id"].data_i64[0] as usize;
+    let style_id = golden["style_id"].data_i64[0] as usize;
+    let hip_enabled = golden["hip_enabled"].data_i64[0] != 0;
+
+    let mut engine = DcpaFlatEngine::new(weights, FastWeightPrecision::F32, hip_enabled);
+    let mut trace = FlatTraceBuffers::with_capacity(raw_bytes.len(), &cfg);
+    let mut snap = BrainSnapshotV3::new(&cfg);
+
+    // Strictly 0 heap allocations throughout full streaming pass + snapshot roundtrip!
+    reset_alloc_counter();
+    engine.capture_snapshot(&mut snap);
+    engine.restore_snapshot(&snap);
+    run_flat_streaming_into(&mut engine, raw_bytes, lang_id, style_id, &mut trace);
+    let hot_allocs = read_alloc_counter();
+    println!(
+        "  [ALLOC]  Base streaming pass ({} bytes, hip={}, win={}, share_ring={}) | heap_allocs = {}",
+        raw_bytes.len(),
+        hip_enabled,
+        cfg.use_local_window_layers,
+        cfg.share_stem_ring,
+        hot_allocs
+    );
+    assert_eq!(
+        hot_allocs, 0,
+        "GATE 6 FAIL: DCPA-Flat hot loop performed {} heap allocations (must be strictly 0)!",
+        hot_allocs
+    );
+
+    assert_eq!(
+        trace.spikes, golden["spikes"].data_u8,
+        "GATE 6 FAIL: SGSCFlat discrete spike sequence diverged from Python!"
+    );
+
+    check_vec_parity("prior_logits", &trace.prior_logits, &golden["prior_logits"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("f_stem", &trace.f_stem, &golden["f_stem"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("x0", &trace.x0, &golden["x0"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("x1", &trace.x1, &golden["x1"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("g1_slots", &trace.g1_slots, &golden["g1_slots"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("x3", &trace.x3, &golden["x3"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("g2_prior_slots", &trace.g2_prior_slots, &golden["g2_prior_slots"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("z_hat", &trace.z_hat, &golden["z_hat"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("u_n", &trace.u_n, &golden["u_n"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("f_copy", &trace.f_copy, &golden["f_copy"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("f_hip", &trace.f_hip, &golden["f_hip"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("rho_out", &trace.rho_out, &golden["rho_out"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("f_out", &trace.f_out, &golden["f_out"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("max_beta", &trace.max_beta, &golden["max_beta"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("byte_logits", &trace.byte_logits, &golden["byte_logits"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("p_seg_end", &trace.p_seg_end, &golden["p_seg_end"].data_f32, 1e-5, 0.9999);
+    check_vec_parity("charge_e", &trace.charge_e, &golden["charge_e"].data_f32, 1e-5, 0.9999);
+
+    let base_rust_logits = trace.byte_logits.clone();
+
+    // Optional Additive Dead-Zone plugin hot-mount, 0.0 anchor drift, & bit-exact unmount verification
+    let plugin_path = dir.join("plugin.dcpa_expert.safetensors");
+    if plugin_path.is_file() {
+        let p_bytes = fs::read(&plugin_path).expect("failed to read plugin.dcpa_expert.safetensors");
+        let pack = PluginExpertPackRs::from_safetensors("plugin", &p_bytes)
+            .expect("failed to load plugin.dcpa_expert.safetensors");
+        let pack_id = pack.pack_id.clone();
+
+        // Capture anchor baseline BEFORE mounting plugin (if anchor_bytes present)
+        let mut anc_base_rust: Option<Vec<f32>> = None;
+        let mut anc_trace: Option<FlatTraceBuffers> = None;
+        if let Some(anc_t) = golden.get("anchor_bytes") {
+            let anc_bytes = &anc_t.data_u8;
+            let anc_lang = golden["anchor_lang_id"].data_i64[0] as usize;
+            let anc_style = golden["anchor_style_id"].data_i64[0] as usize;
+            let mut at = FlatTraceBuffers::with_capacity(anc_bytes.len(), &cfg);
+            engine.reset_session();
+            reset_alloc_counter();
+            run_flat_streaming_into(&mut engine, anc_bytes, anc_lang, anc_style, &mut at);
+            assert_eq!(read_alloc_counter(), 0, "anchor base pass allocated!");
+            check_vec_parity(
+                "anchor_base_logits",
+                &at.byte_logits,
+                &golden["anchor_base_logits"].data_f32,
+                1e-5,
+                0.9999,
+            );
+            anc_base_rust = Some(at.byte_logits.clone());
+            anc_trace = Some(at);
+        }
+
+        // Mount plugin pack
+        engine.mount_expert_pack(pack).expect("failed to mount plugin pack");
+
+        // (a) Verify target input with mounted plugin matches Python plugin_byte_logits (< 1e-5, 0 allocs!)
+        engine.reset_session();
+        reset_alloc_counter();
+        run_flat_streaming_into(&mut engine, raw_bytes, lang_id, style_id, &mut trace);
+        let plug_allocs = read_alloc_counter();
+        println!("  [ALLOC]  Plugin-mounted pass ({}) | heap_allocs = {}", pack_id, plug_allocs);
+        assert_eq!(
+            plug_allocs, 0,
+            "GATE 6 FAIL: Plugin-mounted hot loop allocated {} times!",
+            plug_allocs
+        );
+        check_vec_parity(
+            "plugin_byte_logits",
+            &trace.byte_logits,
+            &golden["plugin_byte_logits"].data_f32,
+            1e-5,
+            0.9999,
+        );
+
+        // (b) Verify non-target anchor has EXACT 0.0 bit drift with plugin mounted!
+        if let (Some(anc_t), Some(ref base_anc), Some(ref mut at)) =
+            (golden.get("anchor_bytes"), anc_base_rust, &mut anc_trace)
+        {
+            let anc_bytes = &anc_t.data_u8;
+            let anc_lang = golden["anchor_lang_id"].data_i64[0] as usize;
+            let anc_style = golden["anchor_style_id"].data_i64[0] as usize;
+            engine.reset_session();
+            reset_alloc_counter();
+            run_flat_streaming_into(&mut engine, anc_bytes, anc_lang, anc_style, at);
+            assert_eq!(read_alloc_counter(), 0, "anchor plugin-mounted pass allocated!");
+            let mut max_drift = 0.0f32;
+            for (a, b) in at.byte_logits.iter().zip(base_anc.iter()) {
+                let d = (*a - *b).abs();
+                if d > max_drift {
+                    max_drift = d;
+                }
+            }
+            println!(
+                "  [DRIFT]  anchor_mounted vs anchor_base | max_abs_diff = {:.3e} (must be EXACT 0.0)",
+                max_drift
+            );
+            assert_eq!(
+                max_drift, 0.0,
+                "GATE 6 FAIL: Mounted Additive Dead-Zone plugin caused non-zero anchor drift ({:.3e})!",
+                max_drift
+            );
+            check_vec_parity(
+                "anchor_vs_py_base",
+                &at.byte_logits,
+                &golden["anchor_base_logits"].data_f32,
+                1e-5,
+                0.9999,
+            );
+        }
+
+        // (c) Verify unmounting restores bit-exact baseline (0.0 diff)!
+        assert!(engine.unmount_expert_pack(&pack_id), "unmount_expert_pack returned false!");
+        engine.reset_session();
+        reset_alloc_counter();
+        run_flat_streaming_into(&mut engine, raw_bytes, lang_id, style_id, &mut trace);
+        assert_eq!(read_alloc_counter(), 0, "unmounted pass allocated!");
+        let mut unmount_diff = 0.0f32;
+        for (a, b) in trace.byte_logits.iter().zip(base_rust_logits.iter()) {
+            let d = (*a - *b).abs();
+            if d > unmount_diff {
+                unmount_diff = d;
+            }
+        }
+        println!(
+            "  [UNMNT]  unmounted vs original base   | max_abs_diff = {:.3e} (must be EXACT 0.0)",
+            unmount_diff
+        );
+        assert_eq!(
+            unmount_diff, 0.0,
+            "GATE 6 FAIL: Unmounting plugin did not restore bit-exact baseline ({:.3e})!",
+            unmount_diff
+        );
+    }
+
+    println!("[PASS] Rust Gate 6 (DCPA-Flat v3.3): ALL modules match Python < 1e-5, 0 allocs/byte, & 0.0 plugin drift!");
+}
+
+fn cmd_bench_flat(dir: &Path) {
+    println!("=== Rust Benchmark (DCPA-Flat v3.3): Single-Core CPU Throughput & 0 Allocs/Byte ===");
+    let cfg_str = fs::read_to_string(dir.join("config.json")).expect("failed to read config.json");
+    let cfg = DcpaFlatConfig::from_json_str(&cfg_str).expect("invalid DCPAFlatConfig JSON");
+    let w_bytes = fs::read(dir.join("model.safetensors")).expect("failed to read model.safetensors");
+    let weights = DcpaFlatWeights::from_safetensors(cfg.clone(), &w_bytes)
+        .expect("failed to load model.safetensors");
+    let mut engine = DcpaFlatEngine::new(weights, FastWeightPrecision::Bf16, true);
+    let mut snap = BrainSnapshotV3::new(&cfg);
+
+    println!(
+        "Loaded DCPA-Flat v3.3: d_s={}, D={}, K={}, W={}, L={}, E={}, d_h={}, win={}, share_ring={} | Hip L3={:.2} MB | BrainSnapshotV3(BF16)={:.1} KB",
+        cfg.d_s,
+        cfg.d_concept,
+        cfg.k_slots,
+        cfg.window_size,
+        cfg.n_layers,
+        cfg.num_experts,
+        cfg.d_h,
+        cfg.use_local_window_layers,
+        cfg.share_stem_ring,
+        (engine.fast_mem.byte_footprint() as f64) / (1024.0 * 1024.0),
+        (BrainSnapshotV3::byte_size_estimate_bf16(&cfg) as f64) / 1024.0,
+    );
+
+    // 1. Benchmark O(1) BrainSnapshotV3 capture + restore (0 allocs!)
+    let snap_iters = 2000usize;
+    for _ in 0..50 {
+        engine.capture_snapshot(&mut snap);
+        engine.restore_snapshot(&snap);
+    }
+    reset_alloc_counter();
+    let t_snap = Instant::now();
+    for _ in 0..snap_iters {
+        engine.capture_snapshot(&mut snap);
+        engine.restore_snapshot(&snap);
+    }
+    let snap_us = (t_snap.elapsed().as_secs_f64() * 1e6) / (snap_iters as f64);
+    let snap_allocs = read_alloc_counter();
+    println!(
+        "  [BENCH] BrainSnapshotV3 capture+restore: {:.2} us/roundtrip | allocs = {}",
+        snap_us, snap_allocs
+    );
+    assert_eq!(snap_allocs, 0, "BrainSnapshotV3 allocated {} times!", snap_allocs);
+
+    // 2. Benchmark full streaming pipeline (SGSC + L1-L8 + G1/G2 + CopyRing + Hippocampus + PMD)
+    let sample = b"def fibonacci(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\nA zibber is a tiny emerald frog! ";
+    let bench_bytes = 2048usize;
+    let mut payload = Vec::with_capacity(bench_bytes);
+    for i in 0..bench_bytes {
+        payload.push(sample[i % sample.len()]);
+    }
+    let mut trace = FlatTraceBuffers::with_capacity(bench_bytes, &cfg);
+
+    // Warmup
+    engine.reset_session();
+    run_flat_streaming_into(&mut engine, &payload[..256], 3, 4, &mut trace);
+
+    engine.reset_session();
+    reset_alloc_counter();
+    let t0 = Instant::now();
+    run_flat_streaming_into(&mut engine, &payload, 3, 4, &mut trace);
+    let elapsed_s = t0.elapsed().as_secs_f64();
+    let stream_allocs = read_alloc_counter();
+    let bps = (bench_bytes as f64) / elapsed_s;
+    let segs = trace.u_n.len();
+
+    println!(
+        "  [BENCH] Full streaming ({} bytes -> {} segs, hip=true): {:.1} bytes/sec ({:.2} KB/s, {:.2} ms total) | heap_allocs = {} (0 allocs/byte)",
+        bench_bytes,
+        segs,
+        bps,
+        bps / 1024.0,
+        elapsed_s * 1000.0,
+        stream_allocs
+    );
+    assert_eq!(
+        stream_allocs, 0,
+        "BENCH FAIL: DCPA-Flat streaming hot loop allocated {} times (must be strictly 0)!",
+        stream_allocs
+    );
+    println!("[PASS] Rust Benchmark (DCPA-Flat v3.3): strictly 0 allocs/byte & zero-alloc snapshot!");
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
@@ -1494,6 +1915,8 @@ fn main() {
         eprintln!("  dcpa-cli verify-golden <export_dir>");
         eprintln!("  dcpa-cli bench <export_dir_or_safetensors>");
         eprintln!("  dcpa-cli chat <export_dir_or_safetensors>");
+        eprintln!("  dcpa-cli verify-golden-flat <export_dir>");
+        eprintln!("  dcpa-cli bench-flat <export_dir>");
         std::process::exit(1);
     }
     let dir = Path::new(&args[2]);
@@ -1501,6 +1924,8 @@ fn main() {
         "verify-golden" => cmd_verify_golden(dir),
         "bench" => cmd_bench(dir),
         "chat" => cmd_chat(dir),
+        "verify-golden-flat" => cmd_verify_golden_flat(dir),
+        "bench-flat" => cmd_bench_flat(dir),
         other => {
             eprintln!("Unknown command: {}", other);
             std::process::exit(1);

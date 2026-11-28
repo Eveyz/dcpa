@@ -346,3 +346,147 @@ def export_model_and_golden(
         "golden": golden_path,
         "meta": meta_path,
     }
+
+
+def extract_flat_v3_state_dict(
+    model: "DCPAModelFlat",
+    dtype: torch.dtype = torch.float32,
+) -> dict[str, torch.Tensor]:
+    """Extract canonical slow weights & frozen orthogonal buffers from `DCPAModelFlat` for `dcpa-core-rs`."""
+    skip_exact = {
+        "pmd.embed.weight",
+        "pmd.w_out.weight",
+    }
+    skip_prefixes = (
+        "jepa_",
+        "w_sensory_bypass",
+    )
+    tensors: dict[str, torch.Tensor] = {}
+    for name, tensor in get_clean_state_dict(model).items():
+        if name in skip_exact or any(name.startswith(pref) for pref in skip_prefixes):
+            continue
+        t = tensor.detach().to(device="cpu", dtype=dtype).contiguous()
+        tensors[name] = t
+    return tensors
+
+
+def export_flat_v3_and_golden(
+    model: "DCPAModelFlat",
+    out_dir: str | Path,
+    sample_text: str = "def sum_xs(xs):\n    return sum(xs)\nA zibber is a tiny frog! 你好世界",
+    lang_id: int = 3,
+    style_id: int = 4,
+    hip_enabled: bool = True,
+    export_dtype: torch.dtype = torch.float32,
+    plugin_pack: Optional["PluginExpertPack"] = None,
+    anchor_text: Optional[str] = None,
+    anchor_lang_id: int = 0,
+    anchor_style_id: int = 0,
+) -> dict[str, Path]:
+    """Export DCPA-Flat v3.3 `config.json`, `model.safetensors`, `golden.safetensors`, & optional plugin bundle."""
+    from dcpa.train_plugin import save_plugin_pack_safetensors
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    model.eval()
+    model_cpu = model.to("cpu")
+
+    cfg_path = out_path / "config.json"
+    model_cpu.cfg.save_json(cfg_path)
+
+    weights_path = out_path / "model.safetensors"
+    flat_weights = extract_flat_v3_state_dict(model_cpu, dtype=export_dtype)
+    save_file(flat_weights, str(weights_path), metadata={"format": "dcpa_flat_v3_3"})
+
+    raw_bytes = torch.tensor(list(sample_text.encode("utf-8")), dtype=torch.uint8)
+    base_trace = model_cpu.forward_streaming_sequence(
+        raw_bytes,
+        lang_id=int(lang_id),
+        style_id=int(style_id),
+        hip_enabled=bool(hip_enabled),
+    )
+
+    golden_tensors: dict[str, torch.Tensor] = {
+        "raw_bytes": base_trace["raw_bytes"].to(dtype=torch.uint8).contiguous(),
+        "lang_id": torch.tensor([int(lang_id)], dtype=torch.int64),
+        "style_id": torch.tensor([int(style_id)], dtype=torch.int64),
+        "hip_enabled": torch.tensor([1 if hip_enabled else 0], dtype=torch.int64),
+        "spikes": base_trace["spikes"].to(dtype=torch.uint8).contiguous(),
+        "prior_logits": base_trace["prior_logits"].float().contiguous(),
+        "f_stem": base_trace["f_stem"].float().contiguous(),
+        "x0": base_trace["x0"].float().contiguous(),
+        "x1": base_trace["x1"].float().contiguous(),
+        "g1_slots": base_trace["g1_slots"].float().contiguous(),
+        "x3": base_trace["x3"].float().contiguous(),
+        "g2_prior_slots": base_trace["g2_prior_slots"].float().contiguous(),
+        "z_hat": base_trace["z_hat"].float().contiguous(),
+        "u_n": base_trace["u_n"].float().contiguous(),
+        "f_copy": base_trace["f_copy"].float().contiguous(),
+        "f_hip": base_trace["f_hip"].float().contiguous(),
+        "rho_out": base_trace["rho_out"].float().contiguous(),
+        "f_out": base_trace["f_out"].float().contiguous(),
+        "max_beta": base_trace["max_beta"].float().contiguous(),
+        "byte_logits": base_trace["byte_logits"].float().contiguous(),
+        "p_seg_end": base_trace["p_seg_end"].float().contiguous(),
+        "charge_e": base_trace["charge_e"].float().contiguous(),
+    }
+
+    paths: dict[str, Path] = {
+        "config": cfg_path,
+        "weights": weights_path,
+    }
+
+    if plugin_pack is not None:
+        plugin_path = save_plugin_pack_safetensors(plugin_pack, out_path / "plugin.dcpa_expert.safetensors")
+        paths["plugin"] = plugin_path
+
+        # Record anchor baseline before mounting plugin
+        if anchor_text is not None:
+            anc_bytes = torch.tensor(list(anchor_text.encode("utf-8")), dtype=torch.uint8)
+            anc_base = model_cpu.forward_streaming_sequence(
+                anc_bytes, lang_id=int(anchor_lang_id), style_id=int(anchor_style_id), hip_enabled=bool(hip_enabled)
+            )
+            golden_tensors["anchor_bytes"] = anc_bytes.contiguous()
+            golden_tensors["anchor_lang_id"] = torch.tensor([int(anchor_lang_id)], dtype=torch.int64)
+            golden_tensors["anchor_style_id"] = torch.tensor([int(anchor_style_id)], dtype=torch.int64)
+            golden_tensors["anchor_base_logits"] = anc_base["byte_logits"].float().contiguous()
+
+        model_cpu.mount_expert_pack(plugin_pack)
+        try:
+            plug_trace = model_cpu.forward_streaming_sequence(
+                raw_bytes, lang_id=int(lang_id), style_id=int(style_id), hip_enabled=bool(hip_enabled)
+            )
+            golden_tensors["plugin_byte_logits"] = plug_trace["byte_logits"].float().contiguous()
+            if anchor_text is not None:
+                anc_plug = model_cpu.forward_streaming_sequence(
+                    anc_bytes, lang_id=int(anchor_lang_id), style_id=int(anchor_style_id), hip_enabled=bool(hip_enabled)
+                )
+                golden_tensors["anchor_plugin_logits"] = anc_plug["byte_logits"].float().contiguous()
+        finally:
+            model_cpu.unmount_expert_pack(plugin_pack.pack_id)
+
+    golden_path = out_path / "golden.safetensors"
+    save_file(golden_tensors, str(golden_path), metadata={"format": "dcpa_flat_v3_3_golden"})
+    paths["golden"] = golden_path
+
+    meta_path = out_path / "golden_meta.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "format": "dcpa_flat_v3_3",
+                "sample_text": sample_text,
+                "num_bytes": int(raw_bytes.numel()),
+                "num_segments": int(base_trace["f_stem"].shape[0]),
+                "lang_id": int(lang_id),
+                "style_id": int(style_id),
+                "hip_enabled": bool(hip_enabled),
+                "has_plugin": plugin_pack is not None,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    paths["meta"] = meta_path
+    return paths

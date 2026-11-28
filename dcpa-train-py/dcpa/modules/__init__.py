@@ -1,6 +1,7 @@
-"""Decoupled core modules of DCPA-Turbo: SGSC, CorticalSandwich, BCG-PC, Hippocampus, and PMD."""
+"""Decoupled core modules of DCPA-Turbo and DCPA-Flat v3.3."""
 
 from dcpa.modules.bcg_pc import BCGPC, BCGPCStepOutput, ClauseAccumulatorState, ConceptGraphState
+from dcpa.modules.copy_ring import HolographicCopyRing
 from dcpa.modules.cortical import (
     CorticalCarryState,
     CorticalDecoderLayer,
@@ -8,6 +9,8 @@ from dcpa.modules.cortical import (
     CorticalSandwich,
     SharedAndRoutedMoE,
 )
+from dcpa.modules.cortical_moe import CorticalPredOut, CorticalStackFlat, DecoupledPluggableMoE
+from dcpa.modules.graph_carrier import ContractiveGraphCarrier
 from dcpa.modules.hippocampus import (
     ColumnMajorFastWeights,
     CompactHouseholderState,
@@ -15,12 +18,19 @@ from dcpa.modules.hippocampus import (
     HippocampusDualMemory,
     HippocampusReadOutput,
 )
-from dcpa.modules.pmd import PMD, BrocaStepOutput, PMDDecodeOutput
-from dcpa.modules.sgsc import SGSC, SGSCOutput
+from dcpa.modules.hippocampus_flat import (
+    DualMorphemeWhitenedDG,
+    HippocampusFlat,
+    HippocampusInterleavedOut,
+    HippocampusWriteEvents,
+)
+from dcpa.modules.pmd import PMD, BrocaStepOutput, PMDDecodeOutput, PMDFlat, PMDFlatOutput
+from dcpa.modules.sgsc import SGSC, SGSCFlat, SGSCOutput
 
 __all__ = [
     "SGSC",
     "SGSCOutput",
+    "SGSCFlat",
     "CorticalSandwich",
     "CorticalEncoderLayer",
     "CorticalDecoderLayer",
@@ -38,4 +48,15 @@ __all__ = [
     "PMD",
     "BrocaStepOutput",
     "PMDDecodeOutput",
+    "PMDFlat",
+    "PMDFlatOutput",
+    "HolographicCopyRing",
+    "ContractiveGraphCarrier",
+    "DecoupledPluggableMoE",
+    "CorticalStackFlat",
+    "CorticalPredOut",
+    "DualMorphemeWhitenedDG",
+    "HippocampusFlat",
+    "HippocampusInterleavedOut",
+    "HippocampusWriteEvents",
 ]

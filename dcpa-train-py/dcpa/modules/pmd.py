@@ -18,6 +18,7 @@ Implements Engineering Blueprint Section 2.5, Chapter 3 & Theory Doc Part 4:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -27,12 +28,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from dcpa.config import DCPAConfig
+from dcpa.interfaces import DCPAFlatConfig, ScatterBridgeOut, StaticGridBatch
 from dcpa.modules.bcg_pc import ConceptGraphState
 from dcpa.ops.fp32 import fp32_island
 from dcpa.ops.ragged import ragged_local_offsets, ragged_segment_cumsum
 from dcpa.ops.rmsnorm import RMSNorm
 from dcpa.ops.rope import apply_holographic_rope
 from dcpa.ops.scan import HAS_TRITON, parallel_diag_scan, parallel_stack_scan
+from dcpa.ops.static_grid import gather_seg_to_byte, segmented_scan_4step_affine
 from dcpa.stream_carry import RowLayout, from_rows, pad_entries, to_rows
 
 
@@ -823,3 +826,341 @@ class PMD(nn.Module):
         e_in = torch.cat([f_out, delta_syn, l_reg], dim=-1).float()
         e_lin = (e_in * self.w_e_init.weight.float()).sum(dim=-1) + self.w_e_init.bias.float()
         return F.softplus(e_lin.double()).float() if e_lin.device.type == "cpu" else F.softplus(e_lin)
+
+
+@dataclass(frozen=True)
+class PMDFlatOutput:
+    """Output bundle from DCPA-Flat v3.3 single-track `PMDFlat`."""
+
+    byte_logits: torch.Tensor  # [P, T, 256] float32 calibrated cosine logits
+    per_byte_ce: torch.Tensor  # [P, T]      float32 unmasked per-byte cross-entropy
+    ce_loss: torch.Tensor      # scalar      float32 overflow-masked weighted byte CE loss
+    halt_loss: torch.Tensor    # scalar      float32 overflow-masked segment boundary BCE loss
+    eff_weight: torch.Tensor   # [P, T]      float32 loss_weight * (~byte_overflow & valid)
+    p_seg_end: torch.Tensor    # [P, T]      float32 segment termination probability
+    charge_e: torch.Tensor     # [P, T]      float32 motor charge E_{n,tau}
+    stack_xi: torch.Tensor     # [P, T, 16, 4] float32 128B differentiable pushdown stack
+    m_seq: torch.Tensor        # [P, T, d_s] motor micro-core hidden states
+
+
+class PMDFlat(nn.Module):
+    """DCPA-Flat v3.3 Single-Track Pragmatic Motor Decoder (ZERO Broca CQ!).
+
+    Features:
+      - Strictly weight-tied with `SGSCFlat` via `shared_embed` and row-L2-normalized `shared_w_out`,
+        using an independent learnable `log_temp_pmd` (init `ln(cfg.vocab_temp_init)` = `ln 8.0`).
+      - Broadcasts static `[P, S, ...]` stems & register vectors back to `[P, T, ...]` via
+        `gather_seg_to_byte` (zero trash slot `S`, zero dynamic indexing).
+      - Inverse holographic RoPE demodulation (`-intra_seg_pos`), stem-affix handoff gate `chi`,
+        128B parallel differentiable pushdown stack (`parallel_stack_scan` with multi-frame resets),
+        causal byte motor diagonal scan, and 4-step parallel intra-segment charge depletion gate.
+      - Explicitly zeroes out `byte_overflow` positions in weighted byte cross-entropy loss.
+      - Compiles cleanly under `torch.compile(..., fullgraph=True, dynamic=False)`.
+    """
+
+    def __init__(
+        self,
+        cfg: DCPAFlatConfig,
+        shared_embed: nn.Embedding,
+        shared_w_out: nn.Linear,
+    ) -> None:
+        super().__init__()
+        self.cfg = cfg
+        d_s = cfg.d_s
+        d_l = cfg.d_l
+        self.tau_e = float(getattr(cfg, "tau_e", 0.5))
+
+        # Strictly weight-tied with SGSCFlat + independent learnable log-temperature
+        self.embed = shared_embed
+        self.w_out = shared_w_out
+        self.log_temp_pmd = nn.Parameter(torch.tensor(math.log(cfg.vocab_temp_init), dtype=torch.float32))
+
+        # Single-track register-conditioned syntactic/affix drive (no Broca CQ!)
+        self.w_syn_reg = nn.Linear(d_s + d_l, d_s, bias=True)
+
+        # Holographic RoPE inverse demodulator & stem-affix handoff gate
+        self.u_demod = nn.Linear(d_s, d_s, bias=False)
+        self.w_chi = nn.Linear(3 * d_s, 1, bias=True)
+
+        # 128B Differentiable Pushdown Stack (16 x 4)
+        self.w_act = nn.Linear(d_s + d_l, 3, bias=True)  # [push, pop, hold]
+        self.w_tag = nn.Linear(d_s, cfg.stack_tag_dim, bias=True)
+        self.w_st = nn.Linear(2 * cfg.stack_tag_dim, d_s, bias=False)
+
+        # Causal byte motor micro-core
+        self.m0 = nn.Parameter(torch.zeros(d_s))
+        self.w_alpha_mot = nn.Linear(d_s, d_s, bias=True)
+        self.w_m = nn.Linear(d_s, d_s, bias=False)
+
+        # Dual motor charge depletion gate (float32)
+        self.w_e_init = nn.Linear(2 * d_s + d_l, 1, bias=True)
+        self.w_drain = nn.Linear(2 * d_s, 1, bias=True)
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.w_syn_reg.weight)
+        nn.init.zeros_(self.w_syn_reg.bias)
+        nn.init.eye_(self.u_demod.weight)
+        nn.init.xavier_uniform_(self.w_chi.weight)
+        nn.init.constant_(self.w_chi.bias, 1.0)
+        nn.init.zeros_(self.w_act.weight)
+        self.w_act.bias.data.copy_(torch.tensor([-2.0, -2.0, 2.5]))
+        nn.init.xavier_uniform_(self.w_tag.weight, gain=0.5)
+        nn.init.zeros_(self.w_tag.bias)
+        nn.init.normal_(self.w_st.weight, std=1.0 / (self.cfg.stack_tag_dim ** 0.5))
+        nn.init.xavier_uniform_(self.w_alpha_mot.weight)
+        nn.init.constant_(self.w_alpha_mot.bias, 0.5)
+        nn.init.xavier_uniform_(self.w_m.weight)
+        nn.init.xavier_uniform_(self.w_e_init.weight)
+        nn.init.constant_(self.w_e_init.bias, 2.5)
+        nn.init.xavier_uniform_(self.w_drain.weight)
+        nn.init.constant_(self.w_drain.bias, -0.5)
+
+    @property
+    def vocab_temp(self) -> torch.Tensor:
+        return self.log_temp_pmd.float().clamp(-2.0, 4.0).exp()
+
+    def _compute_byte_logits(self, m_state: torch.Tensor) -> torch.Tensor:
+        """Row-L2-normalized shared output vocab logits scaled by `exp(log_temp_pmd)` in float32."""
+        m_f = m_state.float()
+        m_n = m_f * torch.rsqrt(m_f.pow(2).sum(dim=-1, keepdim=True) + 1e-2)
+        w_f = self.w_out.weight.float()
+        w_n = w_f * torch.rsqrt(w_f.pow(2).sum(dim=-1, keepdim=True) + 1e-6)
+        return F.linear(m_n, w_n) * self.vocab_temp
+
+    def _resolve_delta_syn(
+        self,
+        f_out: torch.Tensor,
+        l_reg: torch.Tensor,
+        delta_syn: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if delta_syn is not None:
+            return delta_syn
+        return F.silu(self.w_syn_reg(torch.cat([f_out, l_reg.to(f_out.dtype)], dim=-1)))
+
+    def forward(
+        self,
+        batch: StaticGridBatch,
+        bridge: ScatterBridgeOut,
+        f_out_seg: torch.Tensor,
+        delta_syn_seg: Optional[torch.Tensor] = None,
+    ) -> PMDFlatOutput:
+        """Parallel static-grid teacher-forced byte decoding over `[P, T]`.
+
+        Args:
+          batch:         `StaticGridBatch` `[P, T]` input bytes, doc IDs, masks, loss weights.
+          bridge:        `ScatterBridgeOut` `[P, S]` segment map, `seg_l_reg`, `byte_to_seg`,
+                         `intra_seg_pos`, `byte_overflow`, `spikes`.
+          f_out_seg:     `[P, S, d_s]` target stems from cortical + hippocampal + CopyRing merge.
+          delta_syn_seg: optional `[P, S, d_s]` register/affix drive (derived from `f_out_seg` +
+                         `bridge.seg_l_reg` when omitted).
+        """
+        target_bytes = batch.x_bytes
+        P, T = target_bytes.shape
+        device = target_bytes.device
+        byte_valid = batch.doc_id_byte >= 0
+
+        if T > 1:
+            doc_change = batch.doc_id_byte[:, 1:] != batch.doc_id_byte[:, :-1]
+            eff_doc_start = torch.cat(
+                [
+                    torch.ones((P, 1), device=device, dtype=torch.bool),
+                    batch.doc_start_byte.bool()[:, 1:] | doc_change | (~byte_valid[:, 1:]),
+                ],
+                dim=1,
+            )
+        else:
+            eff_doc_start = torch.ones((P, T), device=device, dtype=torch.bool)
+
+        # Previous emitted byte y_{t-1} (BOS 0x00 at t=0, every doc start, and pad positions)
+        bos = torch.zeros((P, 1), device=device, dtype=torch.long)
+        prev_bytes = torch.cat([bos, target_bytes[:, :-1].to(torch.long)], dim=1) if T > 1 else bos[:, :T]
+        prev_bytes = torch.where(eff_doc_start | (~byte_valid), torch.zeros_like(prev_bytes), prev_bytes)
+        u_prev = self.embed(prev_bytes)  # [P, T, d_s]
+
+        # 1. Gather [P, S, ...] -> [P, T, ...] with zero trash slot & inverse holographic RoPE demod
+        l_reg_seg = bridge.seg_l_reg.to(f_out_seg.dtype)
+        delta_syn_s = self._resolve_delta_syn(f_out_seg, l_reg_seg, delta_syn_seg)
+
+        demod_seg = self.u_demod(f_out_seg)  # [P, S, d_s]
+        demod_bt = gather_seg_to_byte(demod_seg, bridge.byte_to_seg)  # [P, T, d_s]
+        d_stem = apply_holographic_rope(
+            demod_bt,
+            bridge.intra_seg_pos,
+            period=self.cfg.rope_period,
+            num_harmonics=self.cfg.rope_num_harmonics,
+            inverse=True,
+            max_pos=self.cfg.max_seg_len,
+        )  # [P, T, d_s]
+
+        delta_syn_bt = gather_seg_to_byte(delta_syn_s, bridge.byte_to_seg)  # [P, T, d_s]
+        l_reg_bt = gather_seg_to_byte(l_reg_seg, bridge.byte_to_seg)       # [P, T, 64]
+
+        # Stem-affix handoff gate chi
+        chi = torch.sigmoid(self.w_chi(torch.cat([d_stem, u_prev, delta_syn_bt], dim=-1)))  # [P, T, 1]
+        d_drive = chi * d_stem + (1.0 - chi) * delta_syn_bt  # [P, T, d_s]
+
+        # 2. 128B parallel differentiable pushdown stack with multi-frame resets
+        stack_reset_mask = _compute_multi_frame_stack_reset(
+            target_bytes, prev_bytes, doc_reset_mask=eff_doc_start
+        )
+        with fp32_island(device):
+            act_probs = F.softmax(self.w_act(torch.cat([u_prev, l_reg_bt], dim=-1)).float(), dim=-1)
+            v_tag = torch.tanh(self.w_tag(u_prev).float())
+            stack_xi = parallel_stack_scan(
+                act_probs[..., 0],
+                act_probs[..., 1],
+                act_probs[..., 2],
+                v_tag,
+                reset_mask=stack_reset_mask,
+            )  # [P, T, 16, 4] fp32
+
+        xi_top2 = stack_xi[:, :, :2, :].reshape(P, T, 2 * self.cfg.stack_tag_dim).to(u_prev.dtype)
+
+        # 3. Causal byte motor diagonal scan + calibrated row-L2-normalized shared output head
+        x_in = u_prev + d_drive + self.w_st(xi_top2)
+        alpha_mot = torch.sigmoid(self.w_alpha_mot(x_in))
+        b_mot = (1.0 - alpha_mot) * F.silu(self.w_m(x_in))
+        m_seq = parallel_diag_scan(alpha_mot, b_mot, h0=self.m0, reset_mask=eff_doc_start)  # [P, T, d_s]
+
+        with fp32_island(device):
+            byte_logits = self._compute_byte_logits(m_seq)  # [P, T, 256] fp32
+
+            # 4. Dual motor charge depletion gate via 4-step parallel intra-segment scan
+            e_in_seg = torch.cat([f_out_seg, delta_syn_s, l_reg_seg], dim=-1).float()
+            e_init_seg = F.softplus(
+                F.linear(e_in_seg, self.w_e_init.weight.float(), self.w_e_init.bias.float())
+            ).squeeze(-1)  # [P, S] fp32
+            e_init_bt = gather_seg_to_byte(e_init_seg, bridge.byte_to_seg)  # [P, T] fp32
+
+            m_f = m_seq.float()
+            m_rms = m_f * torch.rsqrt(m_f.pow(2).mean(dim=-1, keepdim=True) + self.cfg.eps)
+            drain_in = torch.cat([m_rms, d_drive.float()], dim=-1)
+            drain = F.softplus(
+                F.linear(drain_in, self.w_drain.weight.float(), self.w_drain.bias.float())
+            ).squeeze(-1)  # [P, T] fp32
+
+            seg_start_bt = (bridge.intra_seg_pos == 1) | eff_doc_start
+            scan_a = (~seg_start_bt).float()
+            cum_drain = segmented_scan_4step_affine(scan_a, drain, max_span=self.cfg.max_seg_len)  # [P, T] fp32
+            charge_e = e_init_bt - cum_drain
+            tau_denom = max(self.tau_e, 1e-4)
+            p_seg_end = torch.sigmoid(-charge_e / tau_denom)
+
+            # 5. Overflow-masked weighted byte cross-entropy & segment-halt BCE losses
+            valid_non_overflow = byte_valid & (~bridge.byte_overflow)
+            eff_weight = batch.loss_weight.float() * valid_non_overflow.float()
+            per_byte_ce = F.cross_entropy(
+                byte_logits.reshape(-1, self.cfg.vocab_size),
+                target_bytes.reshape(-1).to(torch.long),
+                reduction="none",
+            ).view(P, T)
+            ce_loss = (per_byte_ce * eff_weight).sum() / eff_weight.sum().clamp_min(1.0)
+
+            per_byte_halt = F.binary_cross_entropy_with_logits(
+                -charge_e / tau_denom,
+                bridge.spikes.float(),
+                reduction="none",
+            )
+            halt_mask = valid_non_overflow.float()
+            halt_loss = (per_byte_halt * halt_mask).sum() / halt_mask.sum().clamp_min(1.0)
+
+        return PMDFlatOutput(
+            byte_logits=byte_logits,
+            per_byte_ce=per_byte_ce,
+            ce_loss=ce_loss,
+            halt_loss=halt_loss,
+            eff_weight=eff_weight,
+            p_seg_end=p_seg_end,
+            charge_e=charge_e,
+            stack_xi=stack_xi,
+            m_seq=m_seq,
+        )
+
+    def init_segment_charge(
+        self,
+        f_out: torch.Tensor,
+        l_reg: torch.Tensor,
+        delta_syn: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Initialize motor charge `E_{n, 0} > 0` for streaming single-byte decoding."""
+        dsyn = self._resolve_delta_syn(f_out, l_reg, delta_syn)
+        e_in = torch.cat([f_out, dsyn, l_reg.to(f_out.dtype)], dim=-1).float()
+        return F.softplus(
+            F.linear(e_in, self.w_e_init.weight.float(), self.w_e_init.bias.float())
+        ).squeeze(-1)
+
+    def step_streaming_byte(
+        self,
+        prev_byte: torch.Tensor,
+        f_out: torch.Tensor,
+        l_reg: torch.Tensor,
+        tau_step: int,
+        m_prev: torch.Tensor,
+        xi_prev: torch.Tensor,
+        charge_prev: torch.Tensor,
+        delta_syn: Optional[torch.Tensor] = None,
+        extra_stack_reset: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Single-byte O(1) streaming motor step matching `PMDFlat.forward` 1-to-1.
+
+        Returns:
+          `(byte_logits [B, 256] fp32, m_new [B, d_s], xi_new [B, 16, 4] fp32,
+            charge_new [B] fp32, p_end [B] fp32)`
+        """
+        B = prev_byte.shape[0]
+        device = prev_byte.device
+        u_prev = self.embed(prev_byte.to(torch.long))  # [B, d_s]
+        l_reg_t = l_reg.to(f_out.dtype)
+        dsyn = self._resolve_delta_syn(f_out, l_reg_t, delta_syn)
+
+        tau_t = torch.full((B,), int(tau_step), device=device, dtype=torch.int32)
+        d_stem = apply_holographic_rope(
+            self.u_demod(f_out),
+            tau_t,
+            period=self.cfg.rope_period,
+            num_harmonics=self.cfg.rope_num_harmonics,
+            inverse=True,
+            max_pos=self.cfg.max_seg_len,
+        )
+        chi = torch.sigmoid(self.w_chi(torch.cat([d_stem, u_prev, dsyn], dim=-1)))
+        d_drive = chi * d_stem + (1.0 - chi) * dsyn
+
+        with fp32_island(device):
+            act = F.softmax(self.w_act(torch.cat([u_prev, l_reg_t], dim=-1)).float(), dim=-1)
+            p_push = act[:, 0:1].unsqueeze(-1)
+            p_pop = act[:, 1:2].unsqueeze(-1)
+            p_hold = act[:, 2:3].unsqueeze(-1)
+            v_tag = torch.tanh(self.w_tag(u_prev).float()).unsqueeze(1)  # [B, 1, 4]
+
+            xi_f = xi_prev.float()
+            pb_l = prev_byte.to(torch.long)
+            ctrl_reset = (pb_l == 0x04) | (pb_l == 0x13) | (pb_l == 0x1E)
+            if extra_stack_reset is not None:
+                ctrl_reset = ctrl_reset | extra_stack_reset.bool()
+            xi_f = torch.where(ctrl_reset.view(B, 1, 1), torch.zeros_like(xi_f), xi_f)
+
+            pushed = torch.cat([v_tag, xi_f[:, :-1, :]], dim=1)
+            zero_bot = torch.zeros((B, 1, self.cfg.stack_tag_dim), device=device, dtype=torch.float32)
+            popped = torch.cat([xi_f[:, 1:, :], zero_bot], dim=1)
+            xi_new = p_hold * xi_f + p_push * pushed + p_pop * popped  # [B, 16, 4] fp32
+
+        xi_top2 = xi_new[:, :2, :].reshape(B, 2 * self.cfg.stack_tag_dim).to(u_prev.dtype)
+        x_in = u_prev + d_drive + self.w_st(xi_top2)
+        alpha_mot = torch.sigmoid(self.w_alpha_mot(x_in))
+        b_mot = (1.0 - alpha_mot) * F.silu(self.w_m(x_in))
+        with fp32_island(device):
+            m_new_f = alpha_mot.float() * m_prev.float() + b_mot.float()
+            m_new = m_new_f.to(u_prev.dtype)
+            byte_logits = self._compute_byte_logits(m_new)
+
+            m_rms = m_new_f * torch.rsqrt(m_new_f.pow(2).mean(dim=-1, keepdim=True) + self.cfg.eps)
+            drain_in = torch.cat([m_rms, d_drive.float()], dim=-1)
+            drain = F.softplus(
+                F.linear(drain_in, self.w_drain.weight.float(), self.w_drain.bias.float())
+            ).squeeze(-1)
+            charge_new = charge_prev.float() - drain
+            p_end = torch.sigmoid(-charge_new / max(self.tau_e, 1e-4))
+
+        return byte_logits, m_new, xi_new, charge_new, p_end

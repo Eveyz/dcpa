@@ -1,4 +1,4 @@
-"""Low-level parallel, ragged, RoPE, and normalization operators for DCPA."""
+"""Low-level parallel, ragged, static-grid, RoPE, and normalization operators for DCPA."""
 
 from dcpa.ops.ragged import (
     build_cu_seqlens,
@@ -16,6 +16,17 @@ from dcpa.ops.scan import (
     parallel_stack_scan,
     sequential_diag_scan_ref,
 )
+from dcpa.ops.static_grid import (
+    StaticSegmentMap,
+    build_static_segment_map,
+    compute_intra_seg_pos,
+    compute_static_seg_depths_and_triggers,
+    gather_seg_to_byte,
+    static_lif_scan,
+    static_segment_mean,
+    static_segment_scatter_add,
+    static_segment_softmax,
+)
 
 __all__ = [
     "RMSNorm",
@@ -31,4 +42,13 @@ __all__ = [
     "sequential_diag_scan_ref",
     "lif_membrane_scan",
     "parallel_stack_scan",
+    "StaticSegmentMap",
+    "build_static_segment_map",
+    "compute_intra_seg_pos",
+    "compute_static_seg_depths_and_triggers",
+    "gather_seg_to_byte",
+    "static_lif_scan",
+    "static_segment_mean",
+    "static_segment_scatter_add",
+    "static_segment_softmax",
 ]

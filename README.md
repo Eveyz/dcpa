@@ -126,8 +126,8 @@ python train/train_flat.py \
   --cap-data-dir /content/nvme_cache/cap_data \
   --sft-data-dir /content/nvme_cache/sft_data \
   --local-cache-dir /content/nvme_cache/run_206m \
-  --drive-sync-dir /content/drive/MyDrive/DCPA_Flat_v3/checkpoints/flat_206m \
-  --drive-export-dir /content/drive/MyDrive/DCPA_Flat_v3/export/flat_206m \
+  --drive-sync-dir /content/drive/MyDrive/dcpa_flat/checkpoints/flat_206m \
+  --drive-export-dir /content/drive/MyDrive/dcpa_flat/export/flat_206m \
   --resume auto --wandb
 ```
 

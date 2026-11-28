@@ -1,0 +1,121 @@
+# DCPA-Flat-650M v3.3 — Scaled Multi-GPU Flagship Config (~650M trainable, 16 routed Top-1)
+# Recommended corpus: v3_flat_160g (160 GB net / 300 GB stream / ~90B tokens)
+# Recommended hardware: 4x-8x H100 SXM or 2x-4x RTX Pro 6000 96G
+
+schema_version: 3
+architecture: dcpa_flat_v3_3
+experiment_name: dcpa_flat_v3_650m_flagship
+preset: flat_650m
+
+model:
+  vocab_size: 256
+  grid_lanes: 32
+  grid_bytes: 4096
+  grid_segs: 640
+  max_seg_len: 16
+  d_s: 256
+  d_concept: 1024
+  n_heads: 8
+  k_slots: 8
+  d_r: 32
+  d_merge: 384
+  c_scan: 16
+  occ_min: 0.05
+  occ_max: 0.95
+  occ_relax: 0.96
+  slot_keep_max: 0.990
+  full_gate_center: 0.20
+  full_gate_temp: 0.10
+  edge_decay: 0.97
+  carrier_grad_guard: none
+  n_layers: 8
+  n_pre_g1_layers: 1
+  n_post_g1_layers: 2
+  n_predict_full_layers: 3
+  n_refine_layers: 2
+  refine_frac: 0.25
+  use_local_window_layers: true
+  local_window_layers: [0, 3, 5]
+  window_size: 128
+  share_stem_ring: false
+  d_sem_ring: 192
+  num_experts: 16
+  top_k_experts: 1
+  shared_hidden: 1024
+  routed_hidden: 1280
+  plugin_top_k: 2
+  plugin_tau_min: 0.35
+  d_h: 4096
+  s_active: 32
+  dg_whiten_hidden: 256
+  hip_chunk_size: 32
+
+data:
+  recommended_profile: v3_flat_160g
+  idx_format: "<QIBBBB"
+  loss_mask_fixed_point_scale: 0.1
+  domain_weights:
+    0: 0.22
+    1: 0.22
+    2: 0.16
+    3: 0.18
+    4: 0.10
+    5: 0.12
+
+hardware:
+  bf16: true
+  allow_tf32: true
+  compile_chunks: true
+  grad_checkpoint: on
+  grad_accum_steps: 4        # 524 KB/step global batch
+
+wandb:
+  enabled: true
+  project: dcpa-flat-v3
+  mode: online
+  log_every_steps: 10
+
+training:
+  total_steps: 572000        # 300 GB stream @ 524 KB/step
+  warmup_steps: 4000
+  min_lr_ratio: 0.10
+  lr_micro: 4.0e-4
+  lr_concept: 3.0e-4
+  lr_scalar_gate: 8.0e-4
+  weight_decay: 0.05
+  grad_clip_norm: 1.0
+  eval_every_steps: 1000
+  save_every_steps: 1000
+  save_every_minutes: 10.0
+  max_healthy_grad_norm: 1000.0
+  stages:
+    stage1_sensory:
+      fraction: 0.06
+      mode: sensory
+      grid: {P: 64, T: 2048, S: 512}
+      hip_enabled: false
+      cap_mix_prob: 0.0
+    stage2_cortex_skeleton:
+      fraction: 0.32
+      mode: cortex
+      grid: {P: 32, T: 4096, S: 640}
+      hip_enabled: false
+      cap_mix_prob: 0.15
+    stage3_deep_reasoning:
+      fraction: 0.36
+      mode: cortex
+      grid: {P: 32, T: 4096, S: 640}
+      hip_enabled: false
+      cap_mix_prob: 0.30
+    stage4_hippocampus:
+      fraction: 0.16
+      mode: hippocampus
+      grid: {P: 32, T: 4096, S: 640}
+      hip_enabled: true
+      cap_mix_prob: 0.35
+    stage5_polish_sft:
+      fraction: 0.10
+      mode: full
+      grid: {P: 32, T: 4096, S: 640}
+      hip_enabled: true
+      cap_mix_prob: 0.50

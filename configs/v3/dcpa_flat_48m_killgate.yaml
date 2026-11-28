@@ -1,0 +1,76 @@
+# DCPA-Flat-48M v3.3 — 5,000-Step Three-Way Killgate Configuration
+# Reference: docs/DCPA_FLAT_V3_3_SPEC.md (Section 5)
+
+architecture: dcpa_flat_v3_3
+preset: flat_48m
+
+model:
+  vocab_size: 256
+  grid_lanes: 32
+  grid_bytes: 4096
+  grid_segs: 640
+  max_seg_len: 16
+  d_s: 192
+  d_concept: 512
+  n_heads: 8
+  k_slots: 8
+  d_r: 32
+  d_merge: 256
+  c_scan: 16
+  occ_min: 0.05
+  occ_max: 0.95
+  occ_relax: 0.96
+  slot_keep_max: 0.990
+  full_gate_center: 0.20
+  full_gate_temp: 0.10
+  edge_decay: 0.97
+  carrier_grad_guard: none   # Gate B tests "none" and "router_sg" at 512 steps
+  n_layers: 8
+  n_pre_g1_layers: 1
+  n_post_g1_layers: 2
+  n_predict_full_layers: 3
+  n_refine_layers: 2
+  refine_frac: 0.25
+  use_local_window_layers: true   # Run B sets false; Run C sets true (L1+L4+L6)
+  local_window_layers: [0, 3, 5]
+  window_size: 128
+  share_stem_ring: false          # +32KB L3 semantic ring (set true for 0KB delta)
+  d_sem_ring: 128
+  num_experts: 8
+  top_k_experts: 1
+  shared_hidden: 256
+  routed_hidden: 384
+  plugin_top_k: 2
+  plugin_tau_min: 0.35
+  d_h: 4096
+  s_active: 32
+  dg_whiten_hidden: 192
+  hip_chunk_size: 32
+
+training:
+  warmup_sensory_steps: 800
+  total_steps: 5000
+  warmup_grid: {P: 64, T: 2048, S: 512}
+  main_grid: {P: 32, T: 4096, S: 640}
+  lr_micro: 6.0e-4
+  lr_concept: 5.0e-4
+  lr_scalar_gate: 1.0e-3
+  weight_decay: 0.05
+  grad_clip_norm: 1.0
+  bf16: true
+  compile_chunks: true
+
+killgate_thresholds:
+  gate_a_min_kb_s: 360.0
+  gate_a_max_overflow_ratio: 0.001
+  gate_b_min_64step_grad_ratio: 0.05
+  gate_b_stress_steps: 512
+  gate_c_min_empty_write_rate: 0.85
+  gate_c_max_non_anchor_slot_weight: 0.30
+  gate_c_max_expert_cv: 0.15
+  gate_d_min_en_zh_bpc_gain: 0.20
+  gate_d_min_code_bpc_gain: 0.15
+  gate_d_min_oov_800b_copy_acc: 0.85
+  gate_d_min_unc_nll_corr: 0.40
+  gate_e_sql_plugin_steps: 200
+  gate_e_max_non_target_drift: 1.0e-6

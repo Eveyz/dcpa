@@ -1,0 +1,132 @@
+# DCPA-Flat-206M v3.3 — Flagship Full-Lifecycle Production Configuration (~203.9M trainable, ~40.6M active)
+# Reference: docs/DCPA_FLAT_V3_3_SPEC.md
+# Recommended hardware: RTX Pro 6000 (96GB Blackwell) or A100 80GB (grad_accum=2 -> 262 KB/step)
+# Takeoff budget: 80 GB stream (~24B tokens) = 305,000 steps @ 262 KB/step (on v3_flat_45g or v3_flat_90g corpus)
+# Flagship budget: 160 GB stream (~48B tokens) = 610,000 steps @ 262 KB/step (on v3_flat_90g corpus)
+
+schema_version: 3
+architecture: dcpa_flat_v3_3
+experiment_name: dcpa_flat_v3_206m_flagship
+preset: flat_206m
+
+model:
+  vocab_size: 256
+  grid_lanes: 32
+  grid_bytes: 4096
+  grid_segs: 640
+  max_seg_len: 16
+  d_s: 192
+  d_concept: 768
+  n_heads: 8
+  k_slots: 8
+  d_r: 32
+  d_merge: 256
+  c_scan: 16
+  occ_min: 0.05
+  occ_max: 0.95
+  occ_relax: 0.96
+  slot_keep_max: 0.990
+  full_gate_center: 0.20
+  full_gate_temp: 0.10
+  edge_decay: 0.97
+  carrier_grad_guard: none   # Lock final value ("none" vs "router_sg") after 48M 5k Gate B
+  n_layers: 8
+  n_pre_g1_layers: 1
+  n_post_g1_layers: 2
+  n_predict_full_layers: 3
+  n_refine_layers: 2
+  refine_frac: 0.25
+  use_local_window_layers: true
+  local_window_layers: [0, 3, 5]
+  window_size: 128
+  share_stem_ring: false     # 114.4 KB BrainSnapshotV3 (82.4 KB if share_stem_ring=true)
+  d_sem_ring: 128
+  num_experts: 12
+  top_k_experts: 1
+  shared_hidden: 640
+  routed_hidden: 768
+  plugin_top_k: 2
+  plugin_tau_min: 0.35
+  d_h: 4096
+  s_active: 32
+  dg_whiten_hidden: 192
+  hip_chunk_size: 32
+
+data:
+  profile_takeoff: v3_flat_45g   # 45 GB net corpus / 80 GB stream (~24B tokens)
+  profile_full: v3_flat_90g      # 90 GB net corpus / 160 GB stream (~48B tokens)
+  idx_format: "<QIBBBB"
+  loss_mask_fixed_point_scale: 0.1
+  domain_weights:
+    0: 0.22  # en
+    1: 0.22  # zh
+    2: 0.16  # formal (FOL / math proofs)
+    3: 0.18  # python
+    4: 0.10  # sql_struct
+    5: 0.12  # javascript
+
+hardware:
+  bf16: true
+  allow_tf32: true
+  compile_chunks: false
+  grad_checkpoint: auto      # False on RTX Pro 6000 96G / A100 80G; True on <= 40GB GPUs
+  grad_accum_steps: 2        # 262 KB/step global batch (2 x [32, 4096])
+
+wandb:
+  enabled: true
+  project: dcpa-flat-v3
+  mode: online
+  log_every_steps: 10
+
+training:
+  total_steps: 305000        # Takeoff 80 GB stream @ 262 KB/step; set 610000 for 160 GB full flagship
+  warmup_steps: 3000
+  min_lr_ratio: 0.10
+  lr_micro: 5.0e-4
+  lr_concept: 4.0e-4
+  lr_scalar_gate: 1.0e-3
+  weight_decay: 0.05
+  grad_clip_norm: 1.0
+  eval_every_steps: 1000
+  save_every_steps: 1000
+  save_every_minutes: 10.0
+  max_healthy_grad_norm: 1000.0
+  stages:
+    stage1_sensory:
+      fraction: 0.08
+      mode: sensory
+      grid: {P: 64, T: 2048, S: 512}
+      hip_enabled: false
+      cap_mix_prob: 0.0
+    stage2_cortex_skeleton:
+      fraction: 0.32
+      mode: cortex
+      grid: {P: 32, T: 4096, S: 640}
+      hip_enabled: false
+      cap_mix_prob: 0.15
+    stage3_deep_reasoning:
+      fraction: 0.34
+      mode: cortex
+      grid: {P: 32, T: 4096, S: 640}
+      hip_enabled: false
+      cap_mix_prob: 0.30
+    stage4_hippocampus:
+      fraction: 0.16
+      mode: hippocampus
+      grid: {P: 32, T: 4096, S: 640}
+      hip_enabled: true
+      cap_mix_prob: 0.35
+    stage5_polish_sft:
+      fraction: 0.10
+      mode: full
+      grid: {P: 32, T: 4096, S: 640}
+      hip_enabled: true
+      cap_mix_prob: 0.50
+
+sleep_consolidation:
+  beta_capture_threshold: 0.25
+  ring_buffer_max_mb: 4
+  replay_old_to_new_ratio: 3
+  plugin_experts_per_layer: 1
+  plugin_hidden_dim: 384
+  anchor_max_drift_limit: 1.0e-6

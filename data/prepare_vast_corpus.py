@@ -660,10 +660,15 @@ def prepare_vast_corpus(
         (root / sub).mkdir(parents=True, exist_ok=True)
 
     free_gb = shutil.disk_usage(root).free / (1024**3)
-    if free_gb < spec.min_free_gb:
+    # Streaming restore from local/Drive archive or packing directly to Drive needs ~1.1x unpacked size
+    # rather than ~2.0x (unpacked + local compressed copy + build scratch).
+    pack_off_nvme = bool(pack_archive) and str(pack_archive).startswith(("/content/drive", "/mnt/gdrive"))
+    restore_local = bool(from_archive) and not str(from_archive).startswith(("http://", "https://"))
+    eff_min_free_gb = max(4.0, spec.min_free_gb * 0.62) if (restore_local or pack_off_nvme) else spec.min_free_gb
+    if free_gb < eff_min_free_gb:
         raise RuntimeError(
             f"Insufficient free NVMe space in {root}: {free_gb:.1f} GB available, "
-            f"profile '{spec.name}' recommends >= {spec.min_free_gb:.1f} GB."
+            f"profile '{spec.name}' requires >= {eff_min_free_gb:.1f} GB."
         )
 
     t0 = time.perf_counter()
